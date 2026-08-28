@@ -4,9 +4,11 @@
  * Both bedrock-runtime and bedrock-mantle expose `/anthropic/v1/messages` which
  * accept and return native Anthropic Messages, including streaming SSE, thinking
  * blocks, tool use, vision, and prompt caching. For Claude models we therefore
- * forward the request body essentially unchanged — rewriting ONLY the `model`
- * field to the resolved invocation id — and relay the response byte-for-byte.
- * No intermediate representation is involved.
+ * forward the request body nearly unchanged — rewriting the `model` field to the
+ * resolved invocation id and stripping the handful of Claude Code ↔
+ * Anthropic-public-API extensions the passthrough targets reject (see
+ * `withModel` / `stripUnsupportedToolFields`) — and relay the response
+ * byte-for-byte. No intermediate representation is involved.
  */
 import { BadRequestError } from "../errors.ts";
 import { type HeaderReader, buildAnthropicHeaders, postJson } from "../http/upstream.ts";
@@ -18,16 +20,97 @@ import {
   relayHeadersFrom,
 } from "./relay.ts";
 
-/** Rewrite only the `model` field of a parsed Anthropic request body. */
+/**
+ * Top-level request fields the native-Anthropic passthrough targets reject.
+ *
+ * These are Claude Code ↔ Anthropic-public-API extensions that Bedrock's
+ * `/anthropic/v1/messages` route (and the external Anthropic-compatible
+ * providers) do not accept, failing with `400 <field>: Extra inputs are not
+ * permitted`:
+ *   - `context_management` — Anthropic's server-side context-editing/compaction
+ *     config; unsupported upstream, dropping it just leaves context unmanaged
+ *     server-side (Claude Code still manages the window client-side).
+ *
+ * Same rationale as the `anthropic-beta` header drop: unconditional removal
+ * rather than a maintained allowlist, since none of the passthrough targets
+ * implement these and the set drifts as Claude Code evolves. Add new offenders
+ * here as they surface.
+ */
+const UNSUPPORTED_TOP_LEVEL_FIELDS = ["context_management"] as const;
+
+/**
+ * Strip request fields the upstream native-Anthropic route rejects but that are
+ * safe to omit.
+ *
+ * Two shapes are cleaned:
+ *   - top-level extension fields (see `UNSUPPORTED_TOP_LEVEL_FIELDS`);
+ *   - `defer_loading` (deferred/lazy tool loading) — a Claude Code tool-schema
+ *     field Bedrock rejects as `tools.N.custom.defer_loading`. Claude Code has
+ *     placed it both at the tool top level and nested under `custom` across
+ *     versions, so we remove both. Dropping it only disables a loading hint; the
+ *     tool itself is forwarded unchanged.
+ *
+ * Mirrors the header-side `anthropic-beta` drop: these are Claude Code ↔
+ * Anthropic-public-API niceties that the passthrough targets do not implement.
+ */
+function stripUnsupportedFields(body: Record<string, unknown>): Record<string, unknown> {
+  let next = body;
+
+  // Top-level extension fields.
+  for (const field of UNSUPPORTED_TOP_LEVEL_FIELDS) {
+    if (field in next) {
+      const { [field]: _dropped, ...rest } = next;
+      next = rest;
+    }
+  }
+
+  // Per-tool `defer_loading` (top level and nested under `custom`).
+  const tools = next.tools;
+  if (Array.isArray(tools)) {
+    let toolsChanged = false;
+    const sanitized = tools.map((tool) => {
+      if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return tool;
+      let t = tool as Record<string, unknown>;
+
+      if ("defer_loading" in t) {
+        const { defer_loading: _dropped, ...rest } = t;
+        t = rest;
+        toolsChanged = true;
+      }
+
+      const custom = t.custom;
+      if (
+        typeof custom === "object" &&
+        custom !== null &&
+        !Array.isArray(custom) &&
+        "defer_loading" in (custom as Record<string, unknown>)
+      ) {
+        const { defer_loading: _dropped, ...customRest } = custom as Record<string, unknown>;
+        t = { ...t, custom: customRest };
+        toolsChanged = true;
+      }
+
+      return t;
+    });
+    if (toolsChanged) next = { ...next, tools: sanitized };
+  }
+
+  return next;
+}
+
+/**
+ * Rewrite the `model` field and strip request fields the passthrough targets
+ * reject (see `stripUnsupportedFields`).
+ */
 function withModel(body: Record<string, unknown>, invocationId: string): Record<string, unknown> {
-  return { ...body, model: invocationId };
+  return { ...stripUnsupportedFields(body), model: invocationId };
 }
 
 /**
  * Handle a `/v1/messages` request for a Claude model via passthrough.
  *
  * @param route     Resolved passthrough target (must be translationPath "passthrough").
- * @param inbound   Inbound request headers (for anthropic-version / anthropic-beta).
+ * @param inbound   Inbound request headers (for anthropic-version).
  * @param bearer    Outbound Bedrock bearer credential.
  * @param parsed    The inbound request body, already parsed once by the caller.
  * @returns A Response mirroring the upstream (JSON or SSE stream) to relay to the client.

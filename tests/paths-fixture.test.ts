@@ -216,6 +216,64 @@ describe("Path P (passthrough) fixture round-trips", () => {
     }
   });
 
+  test("drops anthropic-beta and strips context_management + tool defer_loading on the outbound request", async () => {
+    // Inbound carries an anthropic-beta header + a tools array with defer_loading
+    // both at the tool top level and nested under `custom` — the two shapes
+    // Claude Code has used. Bedrock's native Anthropic route rejects both.
+    const inboundWithBeta = {
+      get: (n: string) => {
+        if (n === "anthropic-version") return "2023-06-01";
+        if (n === "anthropic-beta")
+          return "fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07";
+        return null;
+      },
+    };
+    const reqWithTools = {
+      ...textReq,
+      context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+      tools: [
+        {
+          name: "get_weather",
+          defer_loading: true,
+          input_schema: { type: "object", properties: {} },
+          custom: { defer_loading: false, extra: "keep" },
+        },
+        { type: "bash_20250825", name: "Bash" },
+      ],
+    };
+    const mock = installFetchMock({ text: readFixtureText("anthropic-text.json") });
+    try {
+      const res = await handlePassthroughMessages(
+        passthroughRoute(),
+        inboundWithBeta,
+        "tok",
+        reqWithTools,
+      );
+      expect(res.status).toBe(200);
+
+      // Header: anthropic-beta must NOT be forwarded upstream.
+      expect(mock.requests[0]?.headers["anthropic-beta"]).toBeUndefined();
+      // anthropic-version is still forwarded.
+      expect(mock.requests[0]?.headers["anthropic-version"]).toBe("2023-06-01");
+
+      // Body: defer_loading stripped in both positions; everything else intact.
+      const sent = JSON.parse(mock.requests[0]?.body ?? "{}") as Record<string, unknown>;
+      // Top-level context_management must be stripped.
+      expect("context_management" in sent).toBe(false);
+      const tools = sent.tools as Array<Record<string, unknown>>;
+      const first = tools[0] ?? {};
+      expect("defer_loading" in first).toBe(false);
+      const custom = (first.custom ?? {}) as Record<string, unknown>;
+      expect("defer_loading" in custom).toBe(false);
+      expect(custom.extra).toBe("keep");
+      expect(first.name).toBe("get_weather");
+      // Untouched tool (server-tool brick) passes through unchanged.
+      expect(tools[1]).toEqual({ type: "bash_20250825", name: "Bash" });
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("streaming relays the native Anthropic SSE verbatim", async () => {
     const bytes = new TextEncoder().encode(readFixtureText("anthropic-stream.sse"));
     const mock = installFetchMock({ stream: bytes, chunks: 4 });

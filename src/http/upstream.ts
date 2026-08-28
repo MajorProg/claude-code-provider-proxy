@@ -19,7 +19,20 @@ export interface HeaderReader {
  * Used for `bedrock.mantle.*` Claude models via Mantle's `/anthropic/v1/messages`
  * (`x-api-key`) and for external native-Anthropic providers (DeepSeek/Alibaba use
  * `x-api-key`; z.ai uses `bearer`). Forwards `anthropic-version` (default
- * 2023-06-01) and `anthropic-beta` verbatim when present (DESIGN §6.1).
+ * 2023-06-01).
+ *
+ * `anthropic-beta` is deliberately NOT forwarded. It is a Claude Code ↔
+ * Anthropic-public-API contract; none of the Path P targets are the Anthropic
+ * public API. Bedrock's native `/anthropic/v1/messages` route strictly
+ * validates beta flags and rejects unknown ones with `400 invalid beta flag`
+ * (Claude Code sends 20+ that Bedrock does not recognise), and the external
+ * Anthropic-compatible providers (z.ai/DeepSeek/Alibaba/Moonshot) implement
+ * their own subsets rather than Anthropic's beta set. All the features these
+ * flags gate (thinking, tool use, vision, prompt caching) are enabled
+ * server-side on the passthrough path without the header, so dropping it is
+ * both necessary (to stop the 400s) and lossless. A blocklist/allowlist of
+ * flag names would drift as Claude Code and providers change; unconditional
+ * drop keeps this free of a hardcoded, maintained flag catalog.
  *
  * @param authStyle "x-api-key" (default) or "bearer" (Authorization: Bearer).
  */
@@ -37,8 +50,6 @@ export function buildAnthropicHeaders(
   } else {
     headers["x-api-key"] = bearerToken;
   }
-  const beta = inbound.get("anthropic-beta");
-  if (beta) headers["anthropic-beta"] = beta;
   return headers;
 }
 
