@@ -30,13 +30,16 @@ import {
  *   - `context_management` — Anthropic's server-side context-editing/compaction
  *     config; unsupported upstream, dropping it just leaves context unmanaged
  *     server-side (Claude Code still manages the window client-side).
+ *   - `output_config` — Anthropic structured-output/format config; unsupported
+ *     upstream (rejected as `output_config.format`), dropping it falls back to
+ *     normal free-form output.
  *
  * Same rationale as the `anthropic-beta` header drop: unconditional removal
  * rather than a maintained allowlist, since none of the passthrough targets
  * implement these and the set drifts as Claude Code evolves. Add new offenders
  * here as they surface.
  */
-const UNSUPPORTED_TOP_LEVEL_FIELDS = ["context_management"] as const;
+const UNSUPPORTED_TOP_LEVEL_FIELDS = ["context_management", "output_config"] as const;
 
 /**
  * Strip request fields the upstream native-Anthropic route rejects but that are

@@ -231,6 +231,7 @@ describe("Path P (passthrough) fixture round-trips", () => {
     const reqWithTools = {
       ...textReq,
       context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+      output_config: { format: { type: "json_schema", schema: {} } },
       tools: [
         {
           name: "get_weather",
@@ -260,6 +261,7 @@ describe("Path P (passthrough) fixture round-trips", () => {
       const sent = JSON.parse(mock.requests[0]?.body ?? "{}") as Record<string, unknown>;
       // Top-level context_management must be stripped.
       expect("context_management" in sent).toBe(false);
+      expect("output_config" in sent).toBe(false);
       const tools = sent.tools as Array<Record<string, unknown>>;
       const first = tools[0] ?? {};
       expect("defer_loading" in first).toBe(false);
