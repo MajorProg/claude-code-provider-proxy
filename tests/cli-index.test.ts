@@ -17,6 +17,7 @@ import {
   pidAlive,
   portValue,
   readPid,
+  resolveBindIp,
 } from "../src/cli/index.ts";
 
 let dir: string;
@@ -111,6 +112,37 @@ describe("claudeModels", () => {
       sonnetModel: "bedrock.mantle.eu.anthropic.claude-sonnet-5",
       haikuModel: "bedrock.mantle.eu.anthropic.claude-haiku-4-5",
     });
+  });
+});
+
+describe("resolveBindIp", () => {
+  const saved = process.env.BIND_IP;
+  afterEach(() => {
+    if (saved === undefined) Reflect.deleteProperty(process.env, "BIND_IP");
+    else process.env.BIND_IP = saved;
+  });
+
+  test("an existing .env BIND_IP is returned AND mirrored into process.env", () => {
+    // Regression: a first-run setup wrote BIND_IP to .env but never exported it,
+    // so the docker-compose child (which interpolates ${BIND_IP} from the env)
+    // failed until a second run. resolveBindIp must populate process.env too.
+    const envPath = join(dir, ".env");
+    writeFileSync(envPath, "BIND_IP=192.168.1.50\nPORT=8787\n");
+    Reflect.deleteProperty(process.env, "BIND_IP");
+
+    const result = resolveBindIp(envPath);
+
+    expect(result).toBe("192.168.1.50");
+    expect(process.env.BIND_IP).toBe("192.168.1.50");
+  });
+
+  test("trims surrounding whitespace before exporting", () => {
+    const envPath = join(dir, ".env");
+    writeFileSync(envPath, "BIND_IP=  10.0.0.7  \n");
+    Reflect.deleteProperty(process.env, "BIND_IP");
+
+    expect(resolveBindIp(envPath)).toBe("10.0.0.7");
+    expect(process.env.BIND_IP).toBe("10.0.0.7");
   });
 });
 

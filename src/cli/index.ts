@@ -143,14 +143,18 @@ export function claudeModels(envPath: string): {
  * verify it and warn (don't block) on a stale/virtual/absent value. Returns the
  * effective BIND_IP, or null if none could be established.
  */
-function resolveBindIp(envPath: string): string | null {
+export function resolveBindIp(envPath: string): string | null {
   const current = getEnvValue(envPath, "BIND_IP");
   if (current && current.trim() !== "") {
-    const v = verifyBindIp(current.trim());
+    const value = current.trim();
+    const v = verifyBindIp(value);
     if (!v.ok) {
       warn(`BIND_IP=${current} looks unsafe (${v.reason}); keeping it but verify your network.`);
     }
-    return current.trim();
+    // Mirror into this process's env so a child spawned later in the SAME run
+    // (e.g. `docker compose`) sees it even if it was only just written to .env.
+    process.env.BIND_IP = value;
+    return value;
   }
   const derived = deriveBindIp();
   if (!derived) {
@@ -158,6 +162,10 @@ function resolveBindIp(envPath: string): string | null {
     return null;
   }
   setEnvValue(envPath, "BIND_IP", derived);
+  // Persisting to .env is not enough: the just-written value is not in this
+  // process's environment, and Docker Compose interpolates ${BIND_IP} from the
+  // environment. Export it so the first setup/up run works without a re-run.
+  process.env.BIND_IP = derived;
   ok(`Auto-derived BIND_IP=${derived} (written to .env).`);
   return derived;
 }

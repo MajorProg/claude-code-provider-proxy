@@ -4,18 +4,22 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-bun-fbf0df.svg)](https://bun.sh)
 
-An **Anthropic-Messages-mode proxy** that lets [Claude Code](https://code.claude.com)
-drive **any** AWS Bedrock model — Claude *and* non-Claude (Qwen, GLM, GPT-OSS,
-DeepSeek, Nova, Llama, Mistral, Kimi, …) — behind a single Anthropic-compliant
-endpoint, plus external non-Bedrock providers (DeepSeek, z.ai, Gemini, Alibaba,
-EUrouter, Mistral, Moonshot) through the same interface.
+An **Anthropic-Messages-mode proxy for [Claude Code](https://code.claude.com)**:
+it lets Claude Code drive **any** model from **any** provider behind a single
+Anthropic-compliant endpoint. Point Claude Code at the proxy once, then use
+Claude, Qwen, GLM, GPT-OSS, DeepSeek, Nova, Llama, Mistral, Gemini, Kimi, and
+more — served from **AWS Bedrock** (Claude *and* non-Claude models) and from
+**external providers** (DeepSeek, z.ai, Gemini, Alibaba, EUrouter, Mistral,
+Moonshot). Bedrock and external providers are first-class peers; the proxy
+translates each request to whatever wire format the chosen model needs.
 
-- **One endpoint, any model** — Claude Code always speaks the Anthropic
-  Messages API; the proxy translates outbound per model.
+- **One endpoint, any model, any provider** — Claude Code always speaks the
+  Anthropic Messages API; the proxy translates outbound per model, whether the
+  model lives on Bedrock or an external provider.
 - **No hardcoded model catalog** — providers, regions, and models are
   discovered at runtime, so new releases show up without a code change.
-- **Streaming + tool use** across all three translation paths, verified
-  against live upstreams.
+- **Streaming + tool use** across every provider, verified against live
+  upstreams.
 - **Cross-platform Bun CLI** to set up, run (local or Docker), and inspect the
   proxy on macOS, Linux, and Windows.
 - **LAN-only by default** — never binds `0.0.0.0`; secrets are never baked
@@ -42,17 +46,28 @@ per-provider facts.
 ## Why this exists
 
 Claude Code speaks exactly one wire protocol: the **Anthropic Messages API**
-(`POST /v1/messages`). AWS Bedrock exposes models through two backends with
-different formats:
+(`POST /v1/messages`). That's great if you only ever use Anthropic's own models
+— but the models you want may live elsewhere: on AWS Bedrock, or behind an
+external provider's API, each with its own request/response format.
 
-- **Converse** (`bedrock-runtime`) — Bedrock-native schema + binary event stream.
-- **Mantle** (`bedrock-mantle`) — OpenAI `/chat/completions`, plus a native
-  Anthropic route.
+This proxy sits in front of Claude Code and bridges that gap. Inbound it always
+speaks the Anthropic Messages format; outbound it translates each request to
+whatever the chosen model needs, then streams the response back as Anthropic
+SSE. Claude Code doesn't know or care where the model runs — it just sees one
+Anthropic-compliant endpoint.
 
-This proxy exposes the Anthropic Messages format inbound and translates to
-whichever backend/format each model requires outbound. Claude models are passed
-through to Bedrock's native Anthropic route (near-zero translation); non-Claude
-models are translated via Converse or Mantle's OpenAI route.
+Under the hood the proxy picks one of three outbound paths per model, chosen by
+the model's canonical id (not by guessing from its name):
+
+- **Native Anthropic passthrough** — for Claude models (on Bedrock's Mantle
+  backend) and for external Anthropic-compatible providers (e.g. DeepSeek,
+  z.ai). The body is relayed almost unchanged; near-zero translation.
+- **Bedrock Converse** — for any model addressed via Bedrock's `bedrock-runtime`
+  Converse API (Bedrock-native schema + binary event stream).
+- **OpenAI Chat Completions** — for non-Claude models on Bedrock's Mantle
+  backend and for external OpenAI-compatible providers (e.g. Gemini, Mistral).
+
+You never choose a path directly — you pick a model, and the proxy routes it.
 
 ---
 
@@ -145,11 +160,27 @@ Set these environment variables (or the equivalent in your Claude Code settings)
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
     "ANTHROPIC_AUTH_TOKEN": "<your PROXY_INBOUND_KEY>",
     "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_MODEL": "bedrock.converse.global.anthropic.claude-sonnet-5",
-    "ANTHROPIC_SMALL_FAST_MODEL": "bedrock.mantle.us.qwen.qwen3-coder-30b-a3b-v1:0"
+    "ANTHROPIC_MODEL": "bedrock.mantle.eu.anthropic.claude-sonnet-5",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "bedrock.mantle.eu.anthropic.claude-sonnet-5",
+    "ANTHROPIC_SMALL_FAST_MODEL": "bedrock.mantle.eu.anthropic.claude-haiku-4-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "bedrock.mantle.eu.anthropic.claude-haiku-4-5"
   }
 }
 ```
+
+The four model ids above are illustrative — use any discovered canonical id from
+any provider (see [Canonical model IDs](#canonical-model-ids)); `bun run cli
+status` and the registry at `/` list what's available. The example uses Claude
+on Bedrock via the native Anthropic passthrough
+(`bedrock.mantle.<region>.anthropic.*`), but you could just as well point these
+at a non-Claude Bedrock model or an external provider.
+
+- `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` — the primary and
+  small/fast models Claude Code uses.
+- `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` — the
+  Sonnet/Haiku aliases Claude Code's auto-mode classifier resolves. Pin these to
+  concrete canonical ids so auto-mode resolves cleanly rather than falling back
+  to Anthropic's default names.
 
 ### Two mandatory gotchas
 
@@ -170,27 +201,38 @@ Models are addressed with a provider-agnostic canonical ID:
 
 | Segment | Values | Meaning |
 |---|---|---|
-| `provider` | `bedrock`, or an external provider key (e.g. `deepseek`, `gemini`) | outbound driver + credential |
-| `backend` | `converse`, `mantle`, `anthropic`, `openai` | translation path |
+| `provider` | `bedrock`, or an external provider key (e.g. `deepseek`, `gemini`) | which provider serves the model (drives credential + outbound driver) |
+| `backend` | `converse`, `mantle`, `anthropic`, `openai` | which wire format / translation path is used |
 | `profilePrefix` | `global`, `us`, `eu` | region + inference-profile family (`global` for single-endpoint externals) |
 | `nativeModelId` | provider's real model id | may contain dots/colons |
 
 Examples:
 
 ```
-bedrock.converse.global.anthropic.claude-sonnet-5
-bedrock.mantle.us.qwen.qwen3-coder-30b-a3b-v1:0
-bedrock.converse.eu.amazon.nova-lite-v1:0
-deepseek.anthropic.global.deepseek-chat
+bedrock.mantle.eu.anthropic.claude-sonnet-5      # Claude on Bedrock, native Anthropic passthrough
+bedrock.converse.global.anthropic.claude-sonnet-5 # same Claude model, via Bedrock Converse
+bedrock.mantle.us.qwen.qwen3-coder-30b-a3b-v1:0  # non-Claude on Bedrock, OpenAI-format translation
+bedrock.converse.eu.amazon.nova-lite-v1:0        # Bedrock Nova, via Converse
+deepseek.anthropic.global.deepseek-chat          # external provider, native Anthropic passthrough
+gemini.openai.global.gemini-2.5-pro              # external provider, OpenAI-format translation
 ```
 
-- **Claude models** (`anthropic.*`) route to Bedrock's native Anthropic route on
-  the Mantle backend (passthrough); on the Converse backend they use the Converse
-  API.
-- **Non-Claude** route to Converse (`/model/{id}/converse`) or Mantle
-  (`/v1/chat/completions`) with full translation.
+You pick a model id; the proxy reads its `provider` + `backend` and routes it —
+you never choose a translation path by hand. In practice:
+
+- **Claude models** are served over the **native Anthropic route** with almost
+  no translation — whether that's Bedrock's Mantle backend
+  (`bedrock.mantle.<region>.anthropic.*`) or an external Anthropic-compatible
+  provider (`<provider>.anthropic.global.*`). The same Claude model can also be
+  addressed via Bedrock **Converse** (`bedrock.converse.*.anthropic.*`) if you
+  prefer that backend.
+- **Non-Claude models** are translated to the format their backend expects —
+  Bedrock **Converse** (`/model/{id}/converse`) or the **OpenAI Chat
+  Completions** format used by Bedrock Mantle and external OpenAI-compatible
+  providers (`/v1/chat/completions`).
 - `global.*` resolves to the configured **primary region**; `us`/`eu` select that
-  region's endpoint host and inference-profile family.
+  region's endpoint host and inference-profile family. External providers are
+  single-endpoint, so they use `global`.
 
 Model availability is **discovered at runtime** per region — no model list is
 hardcoded. New models appear automatically once the upstream lists them.
@@ -253,6 +295,12 @@ Re-capture the hermetic fixtures when an upstream contract changes:
 ---
 
 ## Architecture
+
+Claude Code sends Anthropic Messages to the proxy; the proxy authenticates the
+request, resolves the canonical model id to a provider + backend, translates (or
+passes through) to that upstream, and streams the reply back as Anthropic SSE.
+Bedrock and external providers are handled the same way — the only difference is
+which credential and wire format each target needs.
 
 ```mermaid
 graph LR
