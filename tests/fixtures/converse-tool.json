@@ -1,0 +1,19 @@
+{
+  "metrics": { "latencyMs": 453 },
+  "output": {
+    "message": {
+      "content": [
+        {
+          "toolUse": {
+            "input": { "city": "Berlin" },
+            "name": "get_weather",
+            "toolUseId": "tooluse_EdwRnt6MstrxaeIW0o3cjy"
+          }
+        }
+      ],
+      "role": "assistant"
+    }
+  },
+  "stopReason": "tool_use",
+  "usage": { "inputTokens": 398, "outputTokens": 16, "serverToolUsage": {}, "totalTokens": 414 }
+}

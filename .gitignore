@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local config with real secrets
+config.local.json
+config.local.jsonc
+.env
+.env.*
+!.env.example
+
+# Logs / temp
+*.log
+/tmp/
+logs/
+
+# OS
+.DS_Store
+
+# Editor/tooling local settings
+.kiro/
+.ktools/
+.claude/settings.local.json

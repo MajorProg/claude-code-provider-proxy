@@ -1,0 +1,6 @@
+{
+  "metrics": { "latencyMs": 436 },
+  "output": { "message": { "content": [{ "text": "Hello fixture" }], "role": "assistant" } },
+  "stopReason": "end_turn",
+  "usage": { "inputTokens": 6, "outputTokens": 3, "serverToolUsage": {}, "totalTokens": 9 }
+}

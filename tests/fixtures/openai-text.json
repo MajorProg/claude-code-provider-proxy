@@ -1,0 +1,21 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": " hello fixture",
+        "reasoning": " The user asks: \"Reply with exactly: hello fixture\"\n\nThis is a very straightforward request. I need to respond with exactly that text, with no additional characters, formatting, or explanation. The phrase is \"hello fixture\".\n\nLet me verify:\n- \"exactly\" means verbatim\n- The text is: hello fixture\n- No punctuation, no extra spaces, no newlines before or after\n\nSo my response should be just: hello fixture",
+        "refusal": null,
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1787930427,
+  "id": "chatcmpl-d66e7859-b416-4b1e-bd8c-a4bcc966a27a",
+  "model": "moonshotai.kimi-k2-thinking",
+  "object": "chat.completion",
+  "service_tier": "default",
+  "usage": { "completion_tokens": 94, "prompt_tokens": 13, "total_tokens": 107 }
+}

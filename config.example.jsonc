@@ -1,0 +1,110 @@
+{
+  // claude-code-llm-proxy configuration (DESIGN §10)
+  // Copy to config.local.jsonc and fill in secrets, or use ${ENV} interpolation.
+  "server": { "host": "127.0.0.1", "port": 8787 },
+
+  // Inbound auth: keys Claude Code presents via ANTHROPIC_AUTH_TOKEN (DESIGN §8.1)
+  "inboundAuth": {
+    "keys": ["${PROXY_INBOUND_KEY}"]
+  },
+
+  // "global.*" canonical ids resolve to this region; also the region with latest models
+  "primaryRegion": "us",
+
+  // global | regional | auto  (DESIGN §7.3)
+  "profilePreference": "global",
+
+  // Catalog refresh cadence (DESIGN §7.4)
+  "refreshIntervalMinutes": 60,
+
+  // Optional: retry Claude on Mantle if runtime rejects (DESIGN §5.4). Default off.
+  "claudeFallbackToMantle": false,
+
+  // Region families -> concrete AWS regions (DESIGN §5.2, §10)
+  "regions": [
+    { "key": "us", "awsRegion": "us-east-1" },
+    { "key": "eu", "awsRegion": "eu-west-1" }
+  ],
+
+  // Provider drivers + real outbound credentials (DESIGN §8.2)
+  "providers": {
+    "bedrock": {
+      "credential": "${BEDROCK_API_KEY}",
+      "hosts": {
+        "converse": "bedrock-runtime.{region}.amazonaws.com",
+        "mantle": "bedrock-mantle.{region}.api.aws",
+        "control": "bedrock.{region}.amazonaws.com"
+      }
+    }
+
+    // External (non-Bedrock) providers. Each is keyed by provider id and
+    // discriminated by "type":
+    //   - "anthropic": native Anthropic Messages endpoint (passthrough path).
+    //   - "openai":    OpenAI Chat Completions endpoint (mantle translation).
+    // "auth" is the outbound header style ("x-api-key" or "bearer").
+    // "baseUrl" omits the trailing /v1/messages or /chat/completions.
+    // "countTokens": true only if the upstream supports Anthropic count_tokens.
+    // "modelsUrl" is an OpenAI-style /models discovery endpoint — model IDs are
+    // fetched from it at RUNTIME (no model ids in source or config), then
+    // addressable as <provider>.<backend>.global.<model>.
+    //
+    // For providers with per-workspace/per-region hosts (e.g. Alibaba), set
+    // "hostTemplate" ({workspaceId}/{region} placeholders) + "workspaceId" +
+    // "region" + "basePath" instead of "baseUrl".
+    //
+    // ,"deepseek": {
+    //   "type": "anthropic",
+    //   "credential": "${DEEPSEEK_API_KEY}",
+    //   "auth": "x-api-key",
+    //   "baseUrl": "https://api.deepseek.com/anthropic",
+    //   "countTokens": true,
+    //   "modelsUrl": "https://api.deepseek.com/v1/models"
+    // }
+    //
+    // OpenAI-compatible router (EU data residency). type "openai" → the proxy
+    // translates Anthropic <-> OpenAI and calls {baseUrl}/chat/completions:
+    // ,"eurouter": {
+    //   "type": "openai",
+    //   "credential": "${EUROUTER_API_KEY}",
+    //   "auth": "bearer",
+    //   "baseUrl": "https://api.eurouter.ai/v1",
+    //   "countTokens": false,
+    //   "modelsUrl": "https://api.eurouter.ai/v1/models"
+    // }
+    //
+    // Mistral (OpenAI-compatible):
+    // ,"mistral": {
+    //   "type": "openai",
+    //   "credential": "${MISTRAL_API_KEY}",
+    //   "auth": "bearer",
+    //   "baseUrl": "https://api.mistral.ai/v1",
+    //   "countTokens": false,
+    //   "modelsUrl": "https://api.mistral.ai/v1/models"
+    // }
+    //
+    // Moonshot / Kimi (native Anthropic endpoint, bearer; no count_tokens):
+    // ,"moonshot": {
+    //   "type": "anthropic",
+    //   "credential": "${MOONSHOT_API_KEY}",
+    //   "auth": "bearer",
+    //   "baseUrl": "https://api.moonshot.ai/anthropic",
+    //   "countTokens": false,
+    //   "modelsUrl": "https://api.moonshot.ai/v1/models"
+    // }
+  },
+
+  // Optional request/response logging (disabled by default). When enabled,
+  // captures deduped system prompts and per-turn session files (with token
+  // usage), viewable at /logs. The logs directory should be git-ignored.
+  "logging": {
+    "enabled": true,
+    "dir": "./logs",
+    "systemDir": "system",
+    "sessionDir": "sessions"
+  },
+
+  // Built-in chat test page at /chat (enabled by default for a local pod). The
+  // browser calls the server-side /api/chat endpoint — NO credential is ever
+  // placed in the HTML. Localhost-only.
+  "chatPage": { "enabled": true }
+}

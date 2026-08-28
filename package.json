@@ -1,0 +1,27 @@
+{
+  "name": "claude-code-llm-proxy",
+  "version": "0.1.0",
+  "description": "Anthropic-Messages-mode proxy that enables AWS Bedrock (Converse + Mantle) and future providers behind an Anthropic-compliant endpoint for Claude Code.",
+  "type": "module",
+  "module": "src/server.ts",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch run src/server.ts",
+    "cli": "bun run src/cli/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:unit": "bun test",
+    "test:live": "RUN_LIVE=1 bun test",
+    "test:capture": "bun run scripts/capture-fixtures.ts",
+    "lint": "biome check src",
+    "format": "biome check --write src tests"
+  },
+  "dependencies": {
+    "aws4fetch": "1.0.20"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@types/bun": "1.1.14",
+    "typescript": "5.7.2"
+  }
+}

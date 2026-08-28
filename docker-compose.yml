@@ -1,0 +1,62 @@
+# docker-compose for local Docker Desktop.
+# Launch/stop via the Bun CLI: `bun run cli up --docker` / `bun run cli down --docker`
+# (or `./bootstrap.sh up --docker` if Bun isn't installed yet).
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: claude-code-llm-proxy:local
+    container_name: claude-code-llm-proxy
+    restart: unless-stopped
+    # Run as the host user so the bind-mounted config file (rewritten by the
+    # Config UI) and ./logs are writable. Set HOST_UID/HOST_GID in .env to your
+    # `id -u`/`id -g` (defaults to 1000:1000). Named HOST_UID (not UID) because
+    # UID is a read-only variable in bash and cannot be exported.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # Publish ONLY on the host LAN IP (BIND_IP), never 0.0.0.0. Binding the
+    # published port to a specific host address means Docker listens on that one
+    # interface only — the proxy is reachable on the LAN (and localhost, added
+    # below) but NOT on any other interface (VPN, public), so it cannot be
+    # accidentally internet-exposed. Set BIND_IP to your LAN IPv4 in .env.
+    # Two mappings: the LAN IP for other devices, and 127.0.0.1 for local use.
+    ports:
+      - "${BIND_IP:?set BIND_IP to your host LAN IP in .env}:${PORT:-8787}:8787"
+      - "127.0.0.1:${PORT:-8787}:8787"
+    environment:
+      # Server binding inside the container (0.0.0.0 so the port maps out).
+      HOST: "0.0.0.0"
+      PORT: "8787"
+      CONFIG_PATH: "/app/config.local.jsonc"
+      # Interpolated into config.local.jsonc at load time (DESIGN §10).
+      PROXY_INBOUND_KEY: "${PROXY_INBOUND_KEY:?set PROXY_INBOUND_KEY in .env}"
+      BEDROCK_API_KEY: "${BEDROCK_API_KEY:?set BEDROCK_API_KEY in .env}"
+      # External provider credentials (interpolated into config.local.jsonc).
+      # Optional — only needed when the corresponding provider is configured.
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      ZAI_API_KEY: "${ZAI_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      DASHSCOPE_API_KEY_INTL: "${DASHSCOPE_API_KEY_INTL:-}"
+      DASHSCOPE_API_KEY_EU: "${DASHSCOPE_API_KEY_EU:-}"
+      DASHSCOPE_WORKSPACE_ID_EU: "${DASHSCOPE_WORKSPACE_ID_EU:-}"
+      EUROUTER_API_KEY: "${EUROUTER_API_KEY:-}"
+      MISTRAL_API_KEY: "${MISTRAL_API_KEY:-}"
+      MOONSHOT_API_KEY: "${MOONSHOT_API_KEY:-}"
+      # Optional: local-dev only. When the config credential is "dev", the proxy
+      # mints short-lived per-region tokens from these AWS creds. Leave unset in
+      # production (a long-term BEDROCK_API_KEY needs none of these).
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+    volumes:
+      # Mounted read-write so the built-in Config UI can save + hot-reload.
+      - ./config.local.jsonc:/app/config.local.jsonc:rw
+      # Persist captured prompts/sessions (viewer at /logs, exports at /api/logs/export/*).
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "bun", "-e", "await fetch('http://127.0.0.1:8787/api/hello',{method:'HEAD'})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

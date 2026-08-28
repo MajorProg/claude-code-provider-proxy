@@ -1,0 +1,19 @@
+{
+  "model": "claude-sonnet-5",
+  "id": "msg_bdrk_hius565ofwy4og7sru4z3wbnur7iuogsgjpbpmfbuo7zir74g3qa",
+  "type": "message",
+  "role": "assistant",
+  "content": [{ "type": "text", "text": "hello fixture" }],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 19,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": { "ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0 },
+    "output_tokens": 7,
+    "output_tokens_details": { "thinking_tokens": 0 },
+    "service_tier": "standard"
+  }
+}

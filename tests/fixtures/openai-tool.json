@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "tool_calls",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": null,
+        "reasoning": " The user is asking for the weather in Berlin and explicitly says \"use the tool\". I need to call the get_weather function with \"Berlin\" as the city parameter.",
+        "refusal": null,
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": { "arguments": "{\"city\": \"Berlin\"}", "name": "get_weather" },
+            "id": "chatcmpl-tool-91db172850fbf455",
+            "type": "function"
+          }
+        ]
+      }
+    }
+  ],
+  "created": 1787930428,
+  "id": "chatcmpl-c20e6299-8ed1-4e7a-9859-cdeed88f69b7",
+  "model": "moonshotai.kimi-k2-thinking",
+  "object": "chat.completion",
+  "service_tier": "default",
+  "usage": { "completion_tokens": 58, "prompt_tokens": 66, "total_tokens": 124 }
+}
