@@ -88,6 +88,28 @@ describe("claudeModels", () => {
     expect(claudeModels(env)).toEqual({
       mainModel: "bedrock.converse.global.anthropic.claude-x",
       fastModel: "bedrock.mantle.us.qwen.q",
+      sonnetModel: "bedrock.converse.global.anthropic.claude-x",
+      haikuModel: "bedrock.mantle.us.qwen.q",
+    });
+  });
+
+  test("sonnetModel/haikuModel use ANTHROPIC_DEFAULT_SONNET_MODEL / _HAIKU_MODEL when set", () => {
+    const env = join(dir, ".env");
+    writeFileSync(
+      env,
+      [
+        "ANTHROPIC_MODEL=bedrock.converse.global.anthropic.claude-x",
+        "ANTHROPIC_SMALL_FAST_MODEL=bedrock.mantle.us.qwen.q",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL= bedrock.mantle.eu.anthropic.claude-sonnet-5 ",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL=bedrock.mantle.eu.anthropic.claude-haiku-4-5",
+        "",
+      ].join("\n"),
+    );
+    expect(claudeModels(env)).toEqual({
+      mainModel: "bedrock.converse.global.anthropic.claude-x",
+      fastModel: "bedrock.mantle.us.qwen.q",
+      sonnetModel: "bedrock.mantle.eu.anthropic.claude-sonnet-5",
+      haikuModel: "bedrock.mantle.eu.anthropic.claude-haiku-4-5",
     });
   });
 });

@@ -8,6 +8,16 @@
  *
  * The base URL is always 127.0.0.1: Claude Code runs on the same host as the
  * proxy in both local and Docker run modes.
+ *
+ * Also pins ANTHROPIC_DEFAULT_SONNET_MODEL / ANTHROPIC_DEFAULT_HAIKU_MODEL to
+ * the same canonical proxy ids as ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL.
+ * Without these, Claude Code's auto-mode permission classifier calls the bare
+ * upstream alias "claude-sonnet-5" directly (see docs.claude.com/en/permission
+ * -modes, "the classifier runs on Claude Sonnet 5 by default"), which the
+ * proxy rejects as an invalid canonical id (`Invalid canonical model id:
+ * "claude-sonnet-5"`) — surfacing as "auto mode cannot determine the safety of
+ * <tool>". Setting these vars makes the `sonnet`/`haiku` aliases the
+ * classifier resolves against resolve to a canonical id the proxy accepts.
  */
 import {
   chmodSync,
@@ -27,6 +37,10 @@ export interface ClaudeSettingsInput {
   authToken: string;
   mainModel: string;
   fastModel: string;
+  /** Pins the `sonnet` alias — also what the auto-mode classifier resolves against. */
+  sonnetModel: string;
+  /** Pins the `haiku` alias (background-task model). */
+  haikuModel: string;
 }
 
 /** Standard Claude Code settings path: ~/.claude/settings.json */
@@ -98,6 +112,8 @@ export function writeClaudeSettings(input: ClaudeSettingsInput): {
     ANTHROPIC_API_KEY: "",
     ANTHROPIC_MODEL: input.mainModel,
     ANTHROPIC_SMALL_FAST_MODEL: input.fastModel,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: input.sonnetModel,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: input.haikuModel,
   };
 
   // Written owner-only (0o600): the file holds ANTHROPIC_AUTH_TOKEN. Atomic

@@ -55,7 +55,9 @@ import {
 const DEFAULT_PORT = "8787";
 // NOTE: No model ids are hardcoded in src/ (AGENTS.md rule #3). The default
 // Claude Code model ids live in .env.example (ANTHROPIC_MODEL /
-// ANTHROPIC_SMALL_FAST_MODEL) and are read from .env at runtime.
+// ANTHROPIC_SMALL_FAST_MODEL, plus ANTHROPIC_DEFAULT_SONNET_MODEL /
+// ANTHROPIC_DEFAULT_HAIKU_MODEL for the auto-mode classifier) and are read
+// from .env at runtime.
 
 type Mode = "local" | "docker";
 
@@ -109,8 +111,19 @@ export function portValue(envPath: string): string {
 /**
  * Read the Claude Code model ids from .env. These are client-facing defaults,
  * kept out of src/ per AGENTS.md rule #3 — .env.example ships sensible values.
+ *
+ * sonnetModel/haikuModel pin ANTHROPIC_DEFAULT_SONNET_MODEL / _HAIKU_MODEL to
+ * the same canonical ids as mainModel/fastModel. Without them, Claude Code's
+ * auto-mode classifier calls the bare alias "claude-sonnet-5" directly, which
+ * the proxy rejects as an invalid canonical id — fall back to mainModel/
+ * fastModel when unset so existing .env files keep working.
  */
-export function claudeModels(envPath: string): { mainModel: string; fastModel: string } {
+export function claudeModels(envPath: string): {
+  mainModel: string;
+  fastModel: string;
+  sonnetModel: string;
+  haikuModel: string;
+} {
   const mainModel = getEnvValue(envPath, "ANTHROPIC_MODEL")?.trim();
   const fastModel = getEnvValue(envPath, "ANTHROPIC_SMALL_FAST_MODEL")?.trim();
   if (!mainModel || !fastModel) {
@@ -119,7 +132,9 @@ export function claudeModels(envPath: string): { mainModel: string; fastModel: s
         "Re-copy from .env.example (it ships defaults), then re-run.",
     );
   }
-  return { mainModel, fastModel };
+  const sonnetModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_SONNET_MODEL")?.trim() || mainModel;
+  const haikuModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_HAIKU_MODEL")?.trim() || fastModel;
+  return { mainModel, fastModel, sonnetModel, haikuModel };
 }
 
 // --- BIND_IP resolution (shared by up/status/doctor) ----------------------
@@ -279,6 +294,8 @@ function cmdSetup(root: string, mode: Mode, rotate: boolean): void {
     authToken: token,
     mainModel: models.mainModel,
     fastModel: models.fastModel,
+    sonnetModel: models.sonnetModel,
+    haikuModel: models.haikuModel,
   });
 
   if (mode === "docker") {
@@ -369,6 +386,8 @@ function cmdConfigClaude(root: string): void {
     authToken: token,
     mainModel: models.mainModel,
     fastModel: models.fastModel,
+    sonnetModel: models.sonnetModel,
+    haikuModel: models.haikuModel,
   });
 }
 
