@@ -1,5 +1,5 @@
 {
-  // claude-code-llm-proxy configuration (DESIGN §10)
+  // claude-code-provider-proxy configuration (DESIGN §10)
   // Copy to config.local.jsonc and fill in secrets, or use ${ENV} interpolation.
   "server": { "host": "127.0.0.1", "port": 8787 },
 

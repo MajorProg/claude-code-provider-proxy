@@ -196,7 +196,7 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
   };}`;
 
   return renderShell({
-    title: "claude-code-llm-proxy — config",
+    title: "claude-code-provider-proxy — config",
     active: "config",
     chatEnabled,
     xData: "configPage()",

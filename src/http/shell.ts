@@ -79,7 +79,7 @@ export function renderShell(opts: ShellOptions): string {
 </head>
 <body class="h-full bg-slate-50 text-slate-800 dark:bg-slate-900 dark:text-slate-100" x-data="${opts.xData}" x-cloak>
   <header class="flex items-center gap-2 px-4 py-2 border-b border-slate-200 dark:border-slate-700 sticky top-0 bg-slate-50/90 dark:bg-slate-900/90 backdrop-blur z-10">
-    <span class="font-semibold text-indigo-600 dark:text-indigo-400 mr-2">claude-code-llm-proxy</span>
+    <span class="font-semibold text-indigo-600 dark:text-indigo-400 mr-2">claude-code-provider-proxy</span>
     <nav class="flex gap-1">
       ${navLink("/", "Registry", "registry", opts.active)}
       ${chatTab}

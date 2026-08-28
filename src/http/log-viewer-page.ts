@@ -124,7 +124,7 @@ export function renderLogViewerHtml(chatEnabled: boolean): string {
   };}`;
 
   return renderShell({
-    title: "claude-code-llm-proxy — logs",
+    title: "claude-code-provider-proxy — logs",
     active: "logs",
     chatEnabled,
     xData: "logs()",

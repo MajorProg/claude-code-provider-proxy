@@ -7,8 +7,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: claude-code-llm-proxy:local
-    container_name: claude-code-llm-proxy
+    image: claude-code-provider-proxy:local
+    container_name: claude-code-provider-proxy
     restart: unless-stopped
     # Run as the host user so the bind-mounted config file (rewritten by the
     # Config UI) and ./logs are writable. Set HOST_UID/HOST_GID in .env to your

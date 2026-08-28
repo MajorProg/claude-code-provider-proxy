@@ -120,7 +120,7 @@ export function renderChatPageHtml(): string {
   };}`;
 
   return renderShell({
-    title: "claude-code-llm-proxy — chat",
+    title: "claude-code-provider-proxy — chat",
     active: "chat",
     chatEnabled: true,
     xData: "chat()",

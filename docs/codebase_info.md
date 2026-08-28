@@ -1,6 +1,6 @@
 # Codebase Information
 
-> **What this is:** `claude-code-llm-proxy` is an Anthropic-Messages-mode
+> **What this is:** `claude-code-provider-proxy` is an Anthropic-Messages-mode
 > HTTP proxy that lets [Claude Code](https://code.claude.com) drive **any** AWS
 > Bedrock model (Claude *and* non-Claude) — plus external non-Bedrock providers
 > — behind a single Anthropic-compliant endpoint. It exposes the Anthropic
@@ -44,7 +44,7 @@ were encountered that would create documentation gaps.
 
 ```mermaid
 graph TD
-    ROOT["claude-code-llm-proxy/"]
+    ROOT["claude-code-provider-proxy/"]
     ROOT --> SRC["src/ — application source"]
     ROOT --> TESTS["tests/ — bun:test suites (hermetic + live)"]
     ROOT --> SCRIPTS["scripts/ — capture-fixtures.ts (one-off fixture capture)"]

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "claude-code-llm-proxy",
+      "name": "claude-code-provider-proxy",
       "dependencies": {
         "aws4fetch": "1.0.20",
       },

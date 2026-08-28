@@ -10,7 +10,7 @@ three translation paths, and the core design patterns.
 ```mermaid
 graph LR
     CC["Claude Code<br/>(Anthropic Messages client)"]
-    subgraph PROXY["claude-code-llm-proxy"]
+    subgraph PROXY["claude-code-provider-proxy"]
         direction TB
         RT["Route table<br/>(createFetchHandler)"]
         LOG["Structured logger"]

@@ -1048,7 +1048,7 @@ async function main(): Promise<void> {
   });
 
   console.log(
-    `claude-code-llm-proxy listening on http://${server.hostname}:${server.port} (registry at /)`,
+    `claude-code-provider-proxy listening on http://${server.hostname}:${server.port} (registry at /)`,
   );
 }
 

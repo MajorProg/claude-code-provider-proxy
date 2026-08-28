@@ -184,7 +184,7 @@ export function renderRegistryHtml(snapshot: RegistrySnapshot, chatEnabled: bool
   };}`;
 
   return renderShell({
-    title: "claude-code-llm-proxy — registry",
+    title: "claude-code-provider-proxy — registry",
     active: "registry",
     chatEnabled,
     xData: "registry()",

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * claude-code-llm-proxy — unified cross-platform control CLI.
+ * claude-code-provider-proxy — unified cross-platform control CLI.
  *
  * Supersedes proxy.sh / start.sh / stop.sh with a single Bun program that runs
  * on Windows, macOS, and Linux, in two run modes:
@@ -420,7 +420,7 @@ function cmdDoctor(root: string, mode: Mode): void {
 function usage(): void {
   info(
     [
-      "claude-code-llm-proxy CLI",
+      "claude-code-provider-proxy CLI",
       "",
       "  bun run cli <command> [--local|--docker] [--rotate]",
       "",

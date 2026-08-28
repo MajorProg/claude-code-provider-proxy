@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to `claude-code-llm-proxy`. This guide covers
+Thanks for contributing to `claude-code-provider-proxy`. This guide covers
 development setup, the repo's standards, and the contribution workflow.
 Agent-oriented guidance lives in [`AGENTS.md`](AGENTS.md); a navigable code
 summary is in [`docs/index.md`](docs/index.md).

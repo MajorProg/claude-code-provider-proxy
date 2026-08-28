@@ -1,4 +1,4 @@
-# Code Summary Index — `claude-code-llm-proxy`
+# Code Summary Index — `claude-code-provider-proxy`
 
 > **For AI assistants:** This is the primary knowledge-base entry point. Load
 > **this file first**. It summarizes each document and tells you which to open

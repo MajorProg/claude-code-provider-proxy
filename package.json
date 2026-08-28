@@ -1,5 +1,5 @@
 {
-  "name": "claude-code-llm-proxy",
+  "name": "claude-code-provider-proxy",
   "version": "0.1.0",
   "description": "Anthropic-Messages-mode proxy that enables AWS Bedrock (Converse + Mantle) and future providers behind an Anthropic-compliant endpoint for Claude Code.",
   "type": "module",

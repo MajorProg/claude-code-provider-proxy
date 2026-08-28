@@ -1,4 +1,8 @@
-# claude-code-llm-proxy
+# claude-code-provider-proxy
+
+[![CI](https://github.com/MajorProg/claude-code-provider-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/MajorProg/claude-code-provider-proxy/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Runtime: Bun](https://img.shields.io/badge/runtime-bun-fbf0df.svg)](https://bun.sh)
 
 An **Anthropic-Messages-mode proxy** that lets [Claude Code](https://code.claude.com)
 drive **any** AWS Bedrock model — Claude *and* non-Claude (Qwen, GLM, GPT-OSS,
@@ -6,15 +10,32 @@ DeepSeek, Nova, Llama, Mistral, Kimi, …) — behind a single Anthropic-complia
 endpoint, plus external non-Bedrock providers (DeepSeek, z.ai, Gemini, Alibaba,
 EUrouter, Mistral, Moonshot) through the same interface.
 
-> **Status:** functional and verified against live AWS Bedrock. All three
-> translation paths work end-to-end (Claude via Mantle native Anthropic
-> passthrough; any Converse model via Anthropic⇄Converse; Mantle non-Claude via
-> Anthropic⇄OpenAI), non-streaming and streaming, including tool use. Inbound
-> auth, runtime model discovery (no hardcoded catalog), the registry page, and
-> the full HTTP surface (`/v1/messages`, `/v1/messages/count_tokens`,
-> `/v1/models`) are complete. See [`docs/index.md`](docs/index.md) for a
-> navigable code summary, and [`AGENTS.md`](AGENTS.md) for the binding project
-> rules and live-verified per-provider facts.
+- **One endpoint, any model** — Claude Code always speaks the Anthropic
+  Messages API; the proxy translates outbound per model.
+- **No hardcoded model catalog** — providers, regions, and models are
+  discovered at runtime, so new releases show up without a code change.
+- **Streaming + tool use** across all three translation paths, verified
+  against live upstreams.
+- **Cross-platform Bun CLI** to set up, run (local or Docker), and inspect the
+  proxy on macOS, Linux, and Windows.
+- **LAN-only by default** — never binds `0.0.0.0`; secrets are never baked
+  into config on disk.
+
+See [`docs/index.md`](docs/index.md) for a navigable code summary, and
+[`AGENTS.md`](AGENTS.md) for the binding project rules and live-verified
+per-provider facts.
+
+## Table of contents
+
+- [Why this exists](#why-this-exists)
+- [Quick start](#quick-start)
+- [Configure Claude Code](#configure-claude-code)
+- [Canonical model IDs](#canonical-model-ids)
+- [Configuration](#configuration-configlocaljsonc)
+- [Local development](#local-development-without-docker)
+- [Architecture](#architecture)
+- [Contributing](#contributing)
+- [License](#license)
 
 ---
 
@@ -33,8 +54,6 @@ whichever backend/format each model requires outbound. Claude models are passed
 through to Bedrock's native Anthropic route (near-zero translation); non-Claude
 models are translated via Converse or Mantle's OpenAI route.
 
-See [`docs/index.md`](docs/index.md) for a navigable code summary.
-
 ---
 
 ## Quick start
@@ -50,6 +69,9 @@ The proxy runs two ways — pick either. A single **cross-platform Bun CLI**
 One-time, from clone to a configured Claude Code:
 
 ```bash
+git clone https://github.com/MajorProg/claude-code-provider-proxy.git
+cd claude-code-provider-proxy
+
 # If Bun isn't installed yet, use the bootstrap shim (installs Bun, then the CLI):
 ./bootstrap.sh setup            # macOS/Linux
 #   .\bootstrap.ps1 setup       # Windows (PowerShell)
@@ -228,10 +250,6 @@ Tests run in two complementary lanes:
 Re-capture the hermetic fixtures when an upstream contract changes:
 `bun run test:capture` (needs live credentials).
 
-Contributor guidance (setup, standards, workflow) is in
-[`CONTRIBUTING.md`](CONTRIBUTING.md); agent-oriented guidance is in
-[`AGENTS.md`](AGENTS.md).
-
 ---
 
 ## Architecture
@@ -252,6 +270,14 @@ graph LR
 Full contracts, translation tables, streaming grammar, and per-provider verified
 facts are in [`AGENTS.md`](AGENTS.md). A navigable code summary is in
 [`docs/`](docs/index.md).
+
+---
+
+## Contributing
+
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for
+development setup, coding standards, testing, and the contribution workflow;
+[`AGENTS.md`](AGENTS.md) has agent-oriented and per-provider guidance.
 
 ---
 
