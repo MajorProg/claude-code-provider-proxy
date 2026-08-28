@@ -91,6 +91,7 @@ describe("claudeModels", () => {
       fastModel: "bedrock.mantle.us.qwen.q",
       sonnetModel: "bedrock.converse.global.anthropic.claude-x",
       haikuModel: "bedrock.mantle.us.qwen.q",
+      maxContextTokens: undefined,
     });
   });
 
@@ -111,7 +112,36 @@ describe("claudeModels", () => {
       fastModel: "bedrock.mantle.us.qwen.q",
       sonnetModel: "bedrock.mantle.eu.anthropic.claude-sonnet-5",
       haikuModel: "bedrock.mantle.eu.anthropic.claude-haiku-4-5",
+      maxContextTokens: undefined,
     });
+  });
+
+  test("reads CLAUDE_CODE_MAX_CONTEXT_TOKENS when set (trimmed)", () => {
+    const env = join(dir, ".env");
+    writeFileSync(
+      env,
+      [
+        "ANTHROPIC_MODEL=zai.anthropic.global.glm-5.3",
+        "ANTHROPIC_SMALL_FAST_MODEL=zai.anthropic.global.glm-5.3-flash",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS= 1000000 ",
+        "",
+      ].join("\n"),
+    );
+    expect(claudeModels(env).maxContextTokens).toBe("1000000");
+  });
+
+  test("maxContextTokens is undefined when the key is absent or blank", () => {
+    const env = join(dir, ".env");
+    writeFileSync(
+      env,
+      [
+        "ANTHROPIC_MODEL=zai.anthropic.global.glm-5.3",
+        "ANTHROPIC_SMALL_FAST_MODEL=zai.anthropic.global.glm-5.3-flash",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS=",
+        "",
+      ].join("\n"),
+    );
+    expect(claudeModels(env).maxContextTokens).toBeUndefined();
   });
 });
 

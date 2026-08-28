@@ -123,6 +123,7 @@ export function claudeModels(envPath: string): {
   fastModel: string;
   sonnetModel: string;
   haikuModel: string;
+  maxContextTokens: string | undefined;
 } {
   const mainModel = getEnvValue(envPath, "ANTHROPIC_MODEL")?.trim();
   const fastModel = getEnvValue(envPath, "ANTHROPIC_SMALL_FAST_MODEL")?.trim();
@@ -134,7 +135,11 @@ export function claudeModels(envPath: string): {
   }
   const sonnetModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_SONNET_MODEL")?.trim() || mainModel;
   const haikuModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_HAIKU_MODEL")?.trim() || fastModel;
-  return { mainModel, fastModel, sonnetModel, haikuModel };
+  // Optional: propagated verbatim into Claude Code's env so it knows the real
+  // context window of a proxied non-Claude model (else it assumes 200k + warns).
+  const maxContextTokens =
+    getEnvValue(envPath, "CLAUDE_CODE_MAX_CONTEXT_TOKENS")?.trim() || undefined;
+  return { mainModel, fastModel, sonnetModel, haikuModel, maxContextTokens };
 }
 
 // --- BIND_IP resolution (shared by up/status/doctor) ----------------------
@@ -304,6 +309,7 @@ function cmdSetup(root: string, mode: Mode, rotate: boolean): void {
     fastModel: models.fastModel,
     sonnetModel: models.sonnetModel,
     haikuModel: models.haikuModel,
+    ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
   });
 
   if (mode === "docker") {
@@ -396,6 +402,7 @@ function cmdConfigClaude(root: string): void {
     fastModel: models.fastModel,
     sonnetModel: models.sonnetModel,
     haikuModel: models.haikuModel,
+    ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
   });
 }
 

@@ -41,6 +41,13 @@ export interface ClaudeSettingsInput {
   sonnetModel: string;
   /** Pins the `haiku` alias (background-task model). */
   haikuModel: string;
+  /**
+   * Optional max context window (tokens) for the selected model. Claude Code
+   * only knows the window of Anthropic's own models; for any proxied non-Claude
+   * model it assumes 200k and warns. Setting this teaches it the real window so
+   * auto-compaction doesn't trim prematurely. Omitted when unset in .env.
+   */
+  maxContextTokens?: string;
 }
 
 /** Standard Claude Code settings path: ~/.claude/settings.json */
@@ -114,6 +121,9 @@ export function writeClaudeSettings(input: ClaudeSettingsInput): {
     ANTHROPIC_SMALL_FAST_MODEL: input.fastModel,
     ANTHROPIC_DEFAULT_SONNET_MODEL: input.sonnetModel,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: input.haikuModel,
+    // Only written when set in .env — for non-Claude proxied models this
+    // teaches Claude Code the real context window (else it assumes 200k + warns).
+    ...(input.maxContextTokens ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: input.maxContextTokens } : {}),
   };
 
   // Written owner-only (0o600): the file holds ANTHROPIC_AUTH_TOKEN. Atomic
