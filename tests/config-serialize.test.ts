@@ -93,3 +93,88 @@ describe("serializeConfig ${ENV} preservation", () => {
     expect(providers.bedrock?.credential).toBe("${BEDROCK_API_KEY}");
   });
 });
+
+describe("serializeConfig bedrock optionality", () => {
+  function rawWithoutBedrock() {
+    const raw = {
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["k"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        zai: {
+          type: "anthropic",
+          credential: "zai-key",
+          auth: "bearer",
+          baseUrl: "https://api.z.ai/api/anthropic",
+          countTokens: true,
+          modelsUrl: "https://api.z.ai/api/paas/v4/models",
+        },
+      },
+    };
+    return validateConfig(raw);
+  }
+
+  test("a config with no bedrock block serializes with NO providers.bedrock key", () => {
+    const out = serializeConfig(rawWithoutBedrock(), { ZAI_API_KEY: "zai-key" });
+    const providers = out.providers as Record<string, unknown>;
+    expect("bedrock" in providers).toBe(false);
+    expect(providers.zai).toBeDefined();
+  });
+
+  test('an empty bedrock credential round-trips as "" (never a strict ${VAR} ref)', () => {
+    // With BEDROCK_API_KEY unset in env, an empty credential must stay "" —
+    // restoring "${BEDROCK_API_KEY}" would fail the NEXT boot (bare ref, unset
+    // var). buildEnvRefMap skips empty env values, so this holds.
+    const raw = {
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["k"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        bedrock: {
+          credential: "",
+          hosts: {
+            converse: "bedrock-runtime.{region}.amazonaws.com",
+            mantle: "bedrock-mantle.{region}.api.aws",
+          },
+        },
+      },
+    };
+    const out = serializeConfig(validateConfig(raw), {});
+    const providers = out.providers as Record<string, Record<string, unknown> | undefined>;
+    expect(providers.bedrock?.credential).toBe("");
+  });
+
+  test("a real env-backed bedrock key still restores the strict ref", () => {
+    const raw = {
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["k"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        bedrock: {
+          credential: "bedrock-api-key-realpayload",
+          hosts: {
+            converse: "bedrock-runtime.{region}.amazonaws.com",
+            mantle: "bedrock-mantle.{region}.api.aws",
+          },
+        },
+      },
+    };
+    const out = serializeConfig(validateConfig(raw), {
+      BEDROCK_API_KEY: "bedrock-api-key-realpayload",
+    });
+    const providers = out.providers as Record<string, Record<string, unknown> | undefined>;
+    expect(providers.bedrock?.credential).toBe("${BEDROCK_API_KEY}");
+  });
+});

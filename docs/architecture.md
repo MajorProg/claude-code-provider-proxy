@@ -240,8 +240,8 @@ See [`data_models.md`](data_models.md) for the full IR type definitions.
 
 ## Runtime model discovery
 
-No model list is hardcoded. `CatalogManager.start()` performs fail-fast initial
-discovery for the primary region, then refreshes on a timer.
+No model list is hardcoded. `CatalogManager.start()` performs initial discovery
+(never fatal), then refreshes on a timer.
 
 ```mermaid
 graph TB
@@ -260,9 +260,14 @@ graph TB
 
 - Discovery is authenticated with the same Bedrock bearer token used for
   inference (control-plane accepts it), obtained through the per-region-cached
-  token provider.
-- Primary-region discovery failure is **fatal** (fail fast); non-primary and
-  external-provider failures are logged and skipped (best-effort).
+  token provider. When Bedrock is disabled (`bedrock-mode.ts`: absent block,
+  empty/placeholder credential, or `dev` without AWS creds) the discovery
+  client is `null` — zero Bedrock network calls.
+- **No discovery failure is fatal.** Every region (including the primary) and
+  every external provider gets a `SourceStatus` (`ok|error|skipped|disabled`)
+  on the immutable `Catalog`, surfaced via `/status.json` and
+  `/api/config/status`. Requests for a disabled provider get a 404
+  `ProviderDisabledError`.
 - A refresh failure retains the previous catalog. The refresh timer is
   `unref()`'d so it never keeps the process alive on its own.
 
@@ -281,7 +286,7 @@ graph TB
 | **Passthrough / relay** | `paths/passthrough.ts` + `relayHeadersFrom` | Preserves upstream bodies and SSE byte-for-byte (Claude Code retry logic matches upstream wording). |
 | **Transparent tee** | `logging/capture.ts` | Observability without altering or blocking the client response. |
 | **Leveled structured logging** | `logging/logger.ts` | Correlation id + route + status + latency as `key=value` fields; identifiers only, never secrets or bodies. |
-| **Fail fast, degrade gracefully** | primary vs non-primary discovery | Startup guarantees a usable primary region; extras are best-effort. |
+| **Fail fast on config, degrade gracefully at runtime** | strict `validateConfig`/`loadConfig` vs non-fatal discovery | Config errors fail loudly before boot; any discovery failure (Bedrock region or external provider) degrades to that source's absence with a surfaced `SourceStatus` instead of crashing the proxy. |
 
 ---
 

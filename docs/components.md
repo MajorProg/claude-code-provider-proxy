@@ -113,13 +113,18 @@ matchers are documented in [`interfaces.md`](interfaces.md#http-api-inbound).
 
 ### `config.ts`
 Full configuration lifecycle: load JSONC (comments stripped), interpolate
-`${ENV}` references, validate shape (fail fast), and serialize back to disk with
-secrets restored to `${ENV}` form. Also computes region/host derivations.
+`${ENV}` references (bare refs fail fast on unset/empty; `${ENV:-default}`
+supplies a bash-like default — empty allowed, meaning "configured but inactive
+until the env var is set"), validate shape (fail fast), and serialize back to
+disk with secrets restored to `${ENV}` form. Also computes region/host
+derivations. `providers.bedrock` is optional (absent/empty credential =
+Bedrock disabled).
 
 Key exports: `loadConfig`, `saveConfig`, `serializeConfig`, `validateConfig`,
 `interpolateEnv`, `hostForRegion`, `awsRegionForPrefix`, `awsRegionForKey`,
-`externalProviderOrigin`. Types: `ProxyConfig`, `BedrockProviderConfig`,
-`ExternalProviderConfig`, `RegionKey`, `ProfilePreference`, `LoggingConfig`.
+`externalProviderOrigin`, `DEFAULT_BEDROCK_HOSTS`. Types: `ProxyConfig`,
+`BedrockProviderConfig`, `ExternalProviderConfig`, `RegionKey`,
+`ProfilePreference`, `LoggingConfig`.
 
 ### `errors.ts`
 Error taxonomy. `ProxyError` base carries `status` + `type`, accepts an

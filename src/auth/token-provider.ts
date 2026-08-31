@@ -17,7 +17,13 @@ import {
   resolveBedrockCredential,
 } from "./bedrock-token.ts";
 
-const DEV_SENTINELS = new Set(["", "dev", "DEV"]);
+/**
+ * Credential values that select dev mode (mint short-lived tokens from AWS_*
+ * env creds) instead of treating the value as a long-term API key. Exported as
+ * THE single definition — src/server.ts and src/auth/bedrock-mode.ts consume
+ * it; do not duplicate the set elsewhere.
+ */
+export const BEDROCK_DEV_SENTINELS: ReadonlySet<string> = new Set(["", "dev", "DEV"]);
 
 /** Dev-token lifetime and the refresh skew (re-mint this early before expiry). */
 const DEV_TOKEN_TTL_SECONDS = 3600;
@@ -27,7 +33,7 @@ export function createBedrockTokenProvider(
   configuredCredential: string,
   env: Record<string, string | undefined> = Bun.env,
 ): RegionTokenProvider {
-  const useDev = DEV_SENTINELS.has(configuredCredential);
+  const useDev = BEDROCK_DEV_SENTINELS.has(configuredCredential);
 
   if (!useDev) {
     const key = resolveBedrockCredential(configuredCredential);

@@ -5,7 +5,7 @@
  */
 import type { ProxyConfig } from "../config.ts";
 import { formatCanonicalId } from "../model/canonical-id.ts";
-import type { Catalog, DiscoveredModel } from "../model/catalog.ts";
+import type { Catalog, DiscoveredModel, SourceStatus } from "../model/catalog.ts";
 import { jsonForScript, renderShell } from "./shell.ts";
 
 export interface RegistrySnapshot {
@@ -13,6 +13,8 @@ export interface RegistrySnapshot {
   primaryRegion: string;
   profilePreference: string;
   regions: { key: string; awsRegion: string }[];
+  /** Per-source discovery outcomes (bedrock regions + external providers). */
+  sources: readonly SourceStatus[];
   counts: {
     total: number;
     byBackend: Record<string, number>;
@@ -70,6 +72,7 @@ export function buildRegistrySnapshot(config: ProxyConfig, catalog: Catalog): Re
     primaryRegion: config.primaryRegion,
     profilePreference: config.profilePreference,
     regions: config.regions.map((r) => ({ key: r.key, awsRegion: r.awsRegion })),
+    sources: catalog.sources,
     counts: {
       total: catalog.models.length,
       byBackend,
@@ -90,6 +93,15 @@ function card(binding: string, label: string): string {
 
 export function renderRegistryHtml(snapshot: RegistrySnapshot, chatEnabled: boolean): string {
   const body = `
+  <div x-show="problems().length" x-cloak
+    class="mb-4 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/30 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+    <div class="font-semibold mb-1">Discovery problems</div>
+    <ul class="list-disc list-inside space-y-0.5">
+      <template x-for="p in problems()" :key="p">
+        <li class="font-mono text-xs" x-text="p"></li>
+      </template>
+    </ul>
+  </div>
   <div class="flex items-center justify-between mb-4">
     <div class="text-sm text-slate-500">
       provider <b class="text-slate-700 dark:text-slate-200" x-text="snap.providers.join(', ')"></b> ·
@@ -170,6 +182,16 @@ export function renderRegistryHtml(snapshot: RegistrySnapshot, chatEnabled: bool
       this.loading=false;
     },
     backends(){return [...new Set(this.snap.models.map(m=>m.backend))].sort();},
+    problems(){
+      const srcs=this.snap.sources||[];
+      const out=[];
+      if(this.snap.counts.total===0) out.push('no models discovered — set a provider key (see /config)');
+      for(const s of srcs){
+        if(s.state==='error') out.push(s.source+': '+(s.detail||'discovery failed'));
+        else if(s.state==='disabled') out.push(s.source+': disabled');
+      }
+      return out;
+    },
     backendCounts(){const e=Object.entries(this.snap.counts.byBackend||{});return e.length?e.map(([k,v])=>k+':'+v).join(' · '):'—';},
     regionCounts(){const e=Object.entries(this.snap.counts.byRegion||{});return e.length?e.map(([k,v])=>k+':'+v).join(' · '):'—';},
     filtered(){

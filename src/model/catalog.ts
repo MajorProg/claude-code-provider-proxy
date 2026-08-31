@@ -1,3 +1,4 @@
+import { credentialState } from "../auth/bedrock-mode.ts";
 /**
  * Runtime model discovery + catalog + profile resolver (DESIGN §7).
  *
@@ -17,12 +18,25 @@ import {
   awsRegionForKey,
   hostForRegion,
 } from "../config.ts";
-import { ModelNotFoundError } from "../errors.ts";
+import { ConfigError, ModelNotFoundError } from "../errors.ts";
 import { errorMessage, logger } from "../logging/logger.ts";
 import { type Backend, isAnthropic } from "./canonical-id.ts";
 
 /** Timeout for a single discovery HTTP request (bounds startup/refresh hangs). */
 const DISCOVERY_TIMEOUT_MS = 15_000;
+
+/**
+ * Outcome of one discovery source — either a Bedrock region
+ * (`bedrock:<regionKey>`, or `bedrock` when disabled) or an external provider
+ * key. Carried on the immutable Catalog snapshot so status endpoints render
+ * the same view the discovery loop produced, replaced atomically on refresh.
+ */
+export interface SourceStatus {
+  readonly source: string;
+  readonly state: "ok" | "error" | "skipped" | "disabled";
+  /** Human-readable detail (error message / skip reason). Absent when ok. */
+  readonly detail?: string;
+}
 
 /** A model discovered in a specific region + backend. */
 export interface DiscoveredModel {
@@ -96,7 +110,12 @@ export function createHttpDiscoveryClient(
   config: ProxyConfig,
   tokenProvider: RegionTokenProvider,
 ): DiscoveryClient {
-  const { hosts } = config.providers.bedrock;
+  const hosts = config.providers.bedrock?.hosts;
+  if (!hosts) {
+    // Only reachable when Bedrock is enabled (buildRuntime checks first);
+    // kept as a hard guard so a future caller can't dereference undefined.
+    throw new ConfigError("Bedrock discovery requires a configured providers.bedrock block");
+  }
 
   async function getJson<T>(url: string, awsRegion: string): Promise<T> {
     const token = await tokenProvider(awsRegion);
@@ -205,15 +224,33 @@ export function buildRegionCatalog(
  * like Bedrock discovery. Each model becomes a single `global`-prefix entry
  * addressable as `<provider>.<backend>.global.<nativeModelId>`.
  *
- * A provider whose discovery fails is skipped with a warning (best-effort);
- * external providers are never the fail-fast primary region.
+ * A provider whose credential is unset/placeholder is skipped WITHOUT a
+ * network call (`skipped` status) — that is the "configured but inactive"
+ * state of `"${VAR:-}"` defaults. A provider whose discovery fails gets an
+ * `error` status; neither ever fails the caller (best-effort).
  */
-export async function discoverExternalCatalog(config: ProxyConfig): Promise<DiscoveredModel[]> {
+export async function discoverExternalCatalog(config: ProxyConfig): Promise<{
+  models: DiscoveredModel[];
+  statuses: SourceStatus[];
+}> {
   const out: DiscoveredModel[] = [];
+  const statuses: SourceStatus[] = [];
   const entries = Object.entries(config.providers.external);
   await Promise.all(
     entries.map(async ([providerKey, provider]) => {
       const backend: Backend = provider.type === "anthropic" ? "anthropic" : "openai";
+      const credState = credentialState(provider.credential);
+      if (credState === "empty" || credState === "placeholder") {
+        logger.warn("external provider credential unset, skipping discovery", {
+          provider: providerKey,
+        });
+        statuses.push({
+          source: providerKey,
+          state: "skipped",
+          detail: "credential unset or placeholder — set the provider API key to activate",
+        });
+        return;
+      }
       // The modelsUrl is an OpenAI-style /models endpoint, which by convention
       // authenticates with a bearer token — even for providers whose message
       // path uses x-api-key (e.g. Alibaba's compatible-mode /models rejects
@@ -231,6 +268,11 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<Disc
           logger.error("provider discovery returned non-ok, skipping", {
             provider: providerKey,
             status: res.status,
+          });
+          statuses.push({
+            source: providerKey,
+            state: "error",
+            detail: `discovery returned HTTP ${res.status}`,
           });
           return;
         }
@@ -253,6 +295,7 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<Disc
             streaming: true,
           });
         }
+        statuses.push({ source: providerKey, state: "ok" });
       } catch (err) {
         // A provider dropping out of discovery is a capability-loss event
         // (its models silently vanish from the catalog) — log at error.
@@ -260,10 +303,15 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<Disc
           provider: providerKey,
           message: errorMessage(err),
         });
+        statuses.push({
+          source: providerKey,
+          state: "error",
+          detail: errorMessage(err),
+        });
       }
     }),
   );
-  return out;
+  return { models: out, statuses };
 }
 
 /** Key used to look up a discovered model. */
@@ -282,9 +330,12 @@ function catalogKey(
 export class Catalog {
   private readonly byKey: Map<string, DiscoveredModel>;
   readonly models: readonly DiscoveredModel[];
+  /** Per-source discovery outcomes (Bedrock regions + external providers). */
+  readonly sources: readonly SourceStatus[];
 
-  constructor(models: DiscoveredModel[]) {
+  constructor(models: DiscoveredModel[], sources: readonly SourceStatus[] = []) {
     this.models = models;
+    this.sources = sources;
     this.byKey = new Map();
     for (const m of models) {
       this.byKey.set(catalogKey(m.regionKey, m.backend, m.nativeModelId), m);
@@ -329,47 +380,69 @@ export function resolveInvocationId(model: DiscoveredModel, preference: ProfileP
 }
 
 /**
- * Discover all configured regions and build a Catalog.
- * @throws when the primary region fails (fail fast, DESIGN §7.4).
+ * Discover all configured sources and build a Catalog.
+ *
+ * NEVER throws for discovery failures — Bedrock is optional and any region
+ * (including the primary) failing degrades to that region's models being
+ * absent, with an `error` SourceStatus surfaced to /status.json and
+ * /api/config/status. A crash here would put the container in a restart loop
+ * and take the (still-working) external providers and the config UI down
+ * with it. `client === null` means Bedrock is disabled: no region discovery
+ * happens at all (zero network calls).
  */
 export async function discoverCatalog(
   config: ProxyConfig,
-  client: DiscoveryClient,
+  client: DiscoveryClient | null,
 ): Promise<Catalog> {
-  // Discover all regions concurrently: total latency becomes max(region) rather
-  // than sum(region). Primary-region failure is still fatal (fail-fast);
-  // non-primary failures are logged and skipped (best-effort).
-  const perRegion = await Promise.all(
-    config.regions.map(async (region): Promise<DiscoveredModel[]> => {
-      const awsRegion = awsRegionForKey(config, region.key);
-      try {
-        const [fm, ip, mm] = await Promise.all([
-          client.listFoundationModels(awsRegion),
-          client.listInferenceProfiles(awsRegion),
-          client.listMantleModels(awsRegion),
-        ]);
-        return buildRegionCatalog(region.key, awsRegion, fm, ip, mm);
-      } catch (err) {
-        if (region.key === config.primaryRegion) {
-          throw new Error(`Discovery failed for primary region "${awsRegion}"`, {
-            cause: err,
+  const sources: SourceStatus[] = [];
+  const all: DiscoveredModel[] = [];
+
+  if (client === null) {
+    sources.push({ source: "bedrock", state: "disabled" });
+  } else {
+    // Discover all regions concurrently: total latency becomes max(region)
+    // rather than sum(region). Failures (any region, incl. primary) are
+    // logged and skipped (best-effort).
+    const perRegion = await Promise.all(
+      config.regions.map(async (region): Promise<DiscoveredModel[]> => {
+        const awsRegion = awsRegionForKey(config, region.key);
+        try {
+          const [fm, ip, mm] = await Promise.all([
+            client.listFoundationModels(awsRegion),
+            client.listInferenceProfiles(awsRegion),
+            client.listMantleModels(awsRegion),
+          ]);
+          return buildRegionCatalog(region.key, awsRegion, fm, ip, mm);
+        } catch (err) {
+          // A region dropping out means its models vanish from the catalog —
+          // capability loss, log at error (but don't fail startup).
+          logger.error("region discovery failed, skipping", {
+            region: awsRegion,
+            message: errorMessage(err),
           });
+          sources.push({
+            source: `bedrock:${region.key}`,
+            state: "error",
+            detail: errorMessage(err),
+          });
+          return [];
         }
-        // A non-primary region dropping out means its models vanish from the
-        // catalog — capability loss, log at error (but don't fail startup).
-        logger.error("region discovery failed, skipping (non-primary)", {
-          region: awsRegion,
-          message: errorMessage(err),
-        });
-        return [];
+      }),
+    );
+    all.push(...perRegion.flat());
+    for (const region of config.regions) {
+      if (!sources.some((s) => s.source === `bedrock:${region.key}`)) {
+        sources.push({ source: `bedrock:${region.key}`, state: "ok" });
       }
-    }),
-  );
-  const all: DiscoveredModel[] = perRegion.flat();
+    }
+  }
+
   // Discover external (non-Bedrock) provider models at runtime from each
   // provider's configured discovery endpoint (DESIGN §7 — no hardcoded ids).
-  all.push(...(await discoverExternalCatalog(config)));
-  return new Catalog(all);
+  const external = await discoverExternalCatalog(config);
+  all.push(...external.models);
+  sources.push(...external.statuses);
+  return new Catalog(all, sources);
 }
 
 /**
@@ -387,13 +460,17 @@ export class CatalogManager {
   private constructor(
     initial: Catalog,
     private readonly config: ProxyConfig,
-    private readonly client: DiscoveryClient,
+    private readonly client: DiscoveryClient | null,
   ) {
     this.catalog = initial;
   }
 
-  /** Perform initial discovery (fail-fast) and return a started manager. */
-  static async start(config: ProxyConfig, client: DiscoveryClient): Promise<CatalogManager> {
+  /**
+   * Perform initial discovery and return a started manager. Discovery
+   * failures never throw (see discoverCatalog); `client === null` means
+   * Bedrock is disabled and only external providers are discovered.
+   */
+  static async start(config: ProxyConfig, client: DiscoveryClient | null): Promise<CatalogManager> {
     const initial = await discoverCatalog(config, client);
     const mgr = new CatalogManager(initial, config, client);
     mgr.scheduleRefresh();

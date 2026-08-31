@@ -20,6 +20,12 @@ export interface RegionConfig {
 
 export interface BedrockProviderConfig {
   readonly type: "bedrock";
+  /**
+   * Bedrock API key ("bedrock-api-key-…" long-term) or the "dev" sentinel
+   * (mint short-lived tokens from AWS_* env creds). May be EMPTY: an empty or
+   * placeholder credential means Bedrock is disabled — the proxy boots and
+   * serves external providers only (see src/auth/bedrock-mode.ts).
+   */
   readonly credential: string;
   readonly hosts: {
     readonly converse: string;
@@ -28,6 +34,21 @@ export interface BedrockProviderConfig {
     readonly control: string;
   };
 }
+
+/**
+ * Standard Bedrock endpoint host templates. Shared by config validation (the
+ * optional `hosts.control` default) and the Config UI's "Enable Bedrock"
+ * action, so the endpoints are defined exactly once.
+ */
+export const DEFAULT_BEDROCK_HOSTS: Readonly<{
+  converse: string;
+  mantle: string;
+  control: string;
+}> = {
+  converse: "bedrock-runtime.{region}.amazonaws.com",
+  mantle: "bedrock-mantle.{region}.api.aws",
+  control: "bedrock.{region}.amazonaws.com",
+};
 
 /** Header auth style for an external (non-Bedrock) provider. */
 export type ProviderAuthStyle = "x-api-key" | "bearer";
@@ -39,7 +60,10 @@ export type ProviderAuthStyle = "x-api-key" | "bearer";
  *   - type "openai"    -> OpenAI Chat Completions (mantle translation path)
  *
  * Single-endpoint providers set a flat `baseUrl`. The credential is the static
- * provider API key (${ENV}-interpolated); no region minting.
+ * provider API key (${ENV}-interpolated); no region minting. It may be EMPTY
+ * (e.g. `"${ZAI_API_KEY:-}"` before the env var is set) — an empty or
+ * placeholder credential means the provider is skipped at discovery time with
+ * a warning until the key is set.
  */
 export interface ExternalProviderConfig {
   readonly type: "anthropic" | "openai";
@@ -113,7 +137,11 @@ export interface ProxyConfig {
   readonly claudeFallbackToMantle: boolean;
   readonly regions: readonly RegionConfig[];
   readonly providers: {
-    readonly bedrock: BedrockProviderConfig;
+    /**
+     * Optional: an absent block, or one with an empty/placeholder credential,
+     * disables Bedrock — the proxy runs on external providers only.
+     */
+    readonly bedrock?: BedrockProviderConfig;
     /** Additional non-Bedrock providers, keyed by provider id (e.g. "deepseek"). */
     readonly external: Readonly<Record<string, ExternalProviderConfig>>;
   };
@@ -188,17 +216,32 @@ function stripJsonComments(text: string): string {
 }
 
 /**
- * Replace ${ENV_VAR} tokens with values from `env`.
- * Throws if a referenced variable is unset (fail fast, DESIGN §10).
+ * Matches ${VAR} and ${VAR:-default} references (bash-like). The default may be
+ * empty (`${VAR:-}`); it cannot itself contain `}` (the regex stops at the
+ * first one).
+ */
+const ENV_REF = /\$\{([A-Z0-9_]+)(?::-([^}]*))?\}/g;
+
+/**
+ * Replace ${ENV_VAR} / ${ENV_VAR:-default} tokens with values from `env`.
+ *
+ * - Bare ${VAR} fails fast when unset OR empty (DESIGN §10).
+ * - ${VAR:-default} substitutes the literal default instead — the default may
+ *   be empty, which expresses "configured but inactive until the env var is
+ *   set" (empty provider credentials are skipped at discovery time).
+ *
+ * Env values are runtime data, so they are escaped for the surrounding JSON
+ * string; default text is file-source and inserted verbatim.
  */
 function interpolateEnv(text: string, env: Record<string, string | undefined>): string {
-  return text.replace(/\$\{([A-Z0-9_]+)\}/g, (_match, name: string) => {
+  return text.replace(ENV_REF, (_match, name: string, fallback: string | undefined) => {
     const value = env[name];
-    if (value === undefined || value === "") {
-      throw new ConfigError(`Config references unset environment variable: \${${name}}`);
+    if (value !== undefined && value !== "") {
+      // Escape characters that would break the surrounding JSON string.
+      return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     }
-    // Escape characters that would break the surrounding JSON string.
-    return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    if (fallback !== undefined) return fallback;
+    throw new ConfigError(`Config references unset environment variable: \${${name}}`);
   });
 }
 
@@ -217,6 +260,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 function assertNonEmptyString(value: unknown, path: string): string {
   assert(typeof value === "string" && value.length > 0, `${path} must be a non-empty string`);
+  return value;
+}
+
+/**
+ * Assert `value` is a string (possibly empty) and return it narrowed. Used for
+ * credentials that may legitimately be empty — "provider disabled until the
+ * key is set" — where emptiness is a runtime skip decision, not a config error.
+ */
+function assertString(value: unknown, path: string): string {
+  assert(typeof value === "string", `${path} must be a string`);
   return value;
 }
 
@@ -293,7 +346,8 @@ function validateRegions(raw: unknown, primaryRegion: RegionKey): RegionConfig[]
 
 function validateBedrockProvider(raw: unknown): BedrockProviderConfig {
   assert(isRecord(raw), "config.providers.bedrock must be an object");
-  const credential = assertNonEmptyString(raw.credential, "config.providers.bedrock.credential");
+  // Credential may be empty (=> Bedrock disabled; see BedrockProviderConfig).
+  const credential = assertString(raw.credential, "config.providers.bedrock.credential");
   assert(isRecord(raw.hosts), "config.providers.bedrock.hosts must be an object");
   const converse = raw.hosts.converse;
   const mantle = raw.hosts.mantle;
@@ -306,7 +360,7 @@ function validateBedrockProvider(raw: unknown): BedrockProviderConfig {
     "config.providers.bedrock.hosts.mantle must be a string containing {region}",
   );
   // Control-plane host is optional; default to the standard Bedrock endpoint.
-  const control = raw.hosts.control ?? "bedrock.{region}.amazonaws.com";
+  const control = raw.hosts.control ?? DEFAULT_BEDROCK_HOSTS.control;
   assert(
     typeof control === "string" && control.includes("{region}"),
     "config.providers.bedrock.hosts.control must be a string containing {region}",
@@ -325,7 +379,7 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     VALID_EXTERNAL_TYPES.includes(ptype as (typeof VALID_EXTERNAL_TYPES)[number]),
     `${where}.type must be one of ${VALID_EXTERNAL_TYPES.join(", ")}`,
   );
-  const credential = assertNonEmptyString(raw.credential, `${where}.credential`);
+  const credential = assertString(raw.credential, `${where}.credential`);
   const auth = raw.auth;
   assert(
     VALID_AUTH_STYLES.includes(auth as ProviderAuthStyle),
@@ -436,7 +490,11 @@ export function validateConfig(raw: unknown): ProxyConfig {
   const regions = validateRegions(raw.regions, primaryRegion);
 
   assert(isRecord(raw.providers), "config.providers must be an object");
-  const bedrock = validateBedrockProvider(raw.providers.bedrock);
+  // An absent bedrock block disables Bedrock (external providers only).
+  const bedrock =
+    raw.providers.bedrock === undefined
+      ? undefined
+      : validateBedrockProvider(raw.providers.bedrock);
   const external = validateExternalProviders(raw.providers);
 
   const config: ProxyConfig = {
@@ -447,7 +505,7 @@ export function validateConfig(raw: unknown): ProxyConfig {
     refreshIntervalMinutes: raw.refreshIntervalMinutes,
     claudeFallbackToMantle: raw.claudeFallbackToMantle,
     regions,
-    providers: { bedrock, external },
+    providers: { ...(bedrock ? { bedrock } : {}), external },
     logging: validateLogging(raw.logging),
     chatPage: { enabled: isRecord(raw.chatPage) && raw.chatPage.enabled === true },
   };
@@ -568,8 +626,13 @@ export function serializeConfig(
   const exact = (s: string): string => (refs.length ? restoreExact(s, refs) : s);
   const embed = (s: string): string => (refs.length ? restoreEmbedded(s, refs) : s);
 
-  const providers: Record<string, unknown> = {
-    bedrock: {
+  // Bedrock is optional: an absent block serializes with no `bedrock` key, and
+  // a present-with-empty credential round-trips as "" (never as a strict
+  // `${VAR}` ref — buildEnvRefMap skips empty env values, so the next boot of
+  // a key-less setup still loads).
+  const providers: Record<string, unknown> = {};
+  if (config.providers.bedrock) {
+    providers.bedrock = {
       type: "bedrock",
       credential: exact(config.providers.bedrock.credential),
       hosts: {
@@ -577,8 +640,8 @@ export function serializeConfig(
         mantle: config.providers.bedrock.hosts.mantle,
         control: config.providers.bedrock.hosts.control,
       },
-    },
-  };
+    };
+  }
   for (const [key, p] of Object.entries(config.providers.external)) {
     providers[key] = {
       type: p.type,

@@ -165,6 +165,36 @@ describe("validateConfig", () => {
     };
     expect(() => validateConfig(bad)).toThrow(ConfigError);
   });
+
+  test("accepts a config with no bedrock provider (external-only)", () => {
+    const raw = structuredClone(VALID_RAW);
+    (raw.providers as { bedrock?: unknown }).bedrock = undefined;
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.bedrock).toBeUndefined();
+  });
+
+  test("accepts an empty bedrock credential (bedrock disabled)", () => {
+    const raw = structuredClone(VALID_RAW);
+    raw.providers.bedrock.credential = "";
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.bedrock?.credential).toBe("");
+  });
+
+  test("accepts an empty external credential (provider skipped until key set)", () => {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      credential: "",
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      countTokens: true,
+      modelsUrl: "https://api.z.ai/api/paas/v4/models",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.credential).toBe("");
+  });
 });
 
 describe("region + host helpers", () => {
@@ -194,14 +224,20 @@ describe("loadConfig (JSONC + env interpolation)", () => {
       BEDROCK_API_KEY: "bedrock-api-key-abc",
     });
     expect(cfg.inboundAuth.keys[0]).toBe("inbound-123");
-    expect(cfg.providers.bedrock.credential).toBe("bedrock-api-key-abc");
+    expect(cfg.providers.bedrock?.credential).toBe("bedrock-api-key-abc");
     expect(cfg.primaryRegion).toBe("us");
   });
 
+  test("example config loads with NO provider keys (bedrock + zai skipped, not fatal)", async () => {
+    // The fresh-clone path: only the inbound key exists. ${VAR:-} defaults make
+    // the unset provider keys resolve empty instead of failing the config.
+    const cfg = await loadConfig("config.example.jsonc", { PROXY_INBOUND_KEY: "inbound-123" });
+    expect(cfg.providers.bedrock?.credential).toBe("");
+    expect(cfg.providers.external.zai?.credential).toBe("");
+  });
+
   test("fails fast when a referenced env var is unset", async () => {
-    await expect(loadConfig("config.example.jsonc", { PROXY_INBOUND_KEY: "x" })).rejects.toThrow(
-      ConfigError,
-    );
+    await expect(loadConfig("config.example.jsonc", {})).rejects.toThrow(ConfigError);
   });
 
   test("missing file throws ConfigError", async () => {

@@ -10,24 +10,26 @@ Key runtime processes, end to end.
 sequenceDiagram
     participant M as main()
     participant CFG as loadConfig
-    participant BR as buildRuntime
-    participant TP as createBedrockTokenProvider
+    participant BM as resolveBedrockMode
     participant DC as createHttpDiscoveryClient
     participant CM as CatalogManager.start
 
-    M->>CFG: load JSONC + interpolate ${ENV} + validate
+    M->>CFG: load JSONC + interpolate ${ENV}/${ENV:-default} + validate
     CFG-->>M: ProxyConfig
     M->>BR: buildRuntime(config)
-    BR->>TP: token provider (long-term key or dev minter)
-    BR->>DC: discovery client (uses token provider)
-    BR->>CM: initial discovery (fail-fast on primary region)
+    BR->>BM: usable credential? (empty/placeholder/dev-without-AWS => disabled)
+    BR->>DC: discovery client (null when Bedrock disabled)
+    BR->>CM: initial discovery (never fatal; per-source SourceStatus)
     CM-->>BR: CatalogManager (refresh scheduled, unref'd timer)
-    BR-->>M: Runtime {config, tokenProvider, catalogManager, logStore}
+    BR-->>M: Runtime {config, tokenProvider|null, catalogManager, logStore}
     M->>M: Bun.serve(...) on HOST:PORT
 ```
 
-Primary-region discovery failure aborts startup. Non-primary and external
-provider discovery failures are logged and skipped.
+No discovery failure aborts startup — a failing Bedrock region (including the
+primary) or external provider is logged, marked `error`/`skipped` in the
+Catalog's `sources`, and its models are absent. Bedrock disabled means
+`tokenProvider` is `null` and no Bedrock endpoint is called; `bedrock.*`
+requests get a 404 `ProviderDisabledError`.
 
 ---
 

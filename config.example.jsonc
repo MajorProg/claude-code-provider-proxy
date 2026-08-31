@@ -26,16 +26,21 @@
     { "key": "eu", "awsRegion": "eu-west-1" }
   ],
 
-  // Provider drivers + real outbound credentials (DESIGN §8.2)
+  // Provider drivers + real outbound credentials (DESIGN §8.2).
+  //
+  // Bedrock is OPTIONAL: "${VAR:-default}" interpolation means an UNSET or
+  // EMPTY env var resolves to the (empty) default instead of failing the
+  // config — an empty/placeholder credential disables Bedrock and the proxy
+  // runs on external providers only. Set BEDROCK_API_KEY in .env to enable it.
   "providers": {
     "bedrock": {
-      "credential": "${BEDROCK_API_KEY}",
+      "credential": "${BEDROCK_API_KEY:-}",
       "hosts": {
         "converse": "bedrock-runtime.{region}.amazonaws.com",
         "mantle": "bedrock-mantle.{region}.api.aws",
         "control": "bedrock.{region}.amazonaws.com"
       }
-    }
+    },
 
     // External (non-Bedrock) providers. Each is keyed by provider id and
     // discriminated by "type":
@@ -48,18 +53,29 @@
     // fetched from it at RUNTIME (no model ids in source or config), then
     // addressable as <provider>.<backend>.global.<model>.
     //
+    // Active by default below: a provider whose "${VAR:-}" credential resolves
+    // empty is simply SKIPPED (with a warning) until its key is set in .env —
+    // so dropping e.g. ZAI_API_KEY into .env is all it takes to activate z.ai.
+    //
     // For providers with per-workspace/per-region hosts (e.g. Alibaba), set
     // "hostTemplate" ({workspaceId}/{region} placeholders) + "workspaceId" +
     // "region" + "basePath" instead of "baseUrl".
-    //
-    // ,"deepseek": {
-    //   "type": "anthropic",
-    //   "credential": "${DEEPSEEK_API_KEY}",
-    //   "auth": "x-api-key",
-    //   "baseUrl": "https://api.deepseek.com/anthropic",
-    //   "countTokens": true,
-    //   "modelsUrl": "https://api.deepseek.com/v1/models"
-    // }
+    "zai": {
+      "type": "anthropic",
+      "credential": "${ZAI_API_KEY:-}",
+      "auth": "bearer",
+      "baseUrl": "https://api.z.ai/api/anthropic",
+      "countTokens": true,
+      "modelsUrl": "https://api.z.ai/api/paas/v4/models"
+    },
+    "deepseek": {
+      "type": "anthropic",
+      "credential": "${DEEPSEEK_API_KEY:-}",
+      "auth": "x-api-key",
+      "baseUrl": "https://api.deepseek.com/anthropic",
+      "countTokens": true,
+      "modelsUrl": "https://api.deepseek.com/v1/models"
+    }
     //
     // OpenAI-compatible router (EU data residency). type "openai" → the proxy
     // translates Anthropic <-> OpenAI and calls {baseUrl}/chat/completions:

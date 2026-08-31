@@ -6,7 +6,7 @@
  * operate on a temp project root.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -67,6 +67,32 @@ describe("ensureConfigFiles", () => {
   test("throws when config.example.jsonc is missing (after .env is created)", () => {
     rmSync(paths.configExample, { force: true });
     expect(() => ensureConfigFiles(paths)).toThrow(/config\.example\.jsonc not found/);
+  });
+
+  test("removes an EMPTY directory Docker created at the config path and copies the example", () => {
+    // The bind-mount gotcha: `docker compose up` with a missing host file
+    // creates a directory at the bind source. An empty one is safe to replace.
+    writeFileSync(paths.env, "PROXY_INBOUND_KEY=ccpp_existing\n"); // .env already present
+    mkdirSync(paths.config);
+    const { createdEnv } = ensureConfigFiles(paths);
+    expect(createdEnv).toBe(false);
+    expect(existsSync(paths.config)).toBe(true);
+    expect(readFileSync(paths.config, "utf8")).toContain("primaryRegion");
+  });
+
+  test("removes an empty directory at the .env path too", () => {
+    mkdirSync(paths.env);
+    ensureConfigFiles(paths);
+    expect(readFileSync(paths.env, "utf8")).toContain("PROXY_INBOUND_KEY");
+  });
+
+  test("throws with remediation when the Docker-created directory is non-empty", () => {
+    mkdirSync(paths.config);
+    writeFileSync(join(paths.config, "stray.txt"), "operator data — do not delete silently");
+    expect(() => ensureConfigFiles(paths)).toThrow(/NON-EMPTY directory/);
+    expect(() => ensureConfigFiles(paths)).toThrow(/docker compose down/);
+    // The directory and its contents must be untouched.
+    expect(existsSync(join(paths.config, "stray.txt"))).toBe(true);
   });
 });
 

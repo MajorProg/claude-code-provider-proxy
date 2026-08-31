@@ -5,6 +5,7 @@
  * resolved invocation id, and translation path, using the live catalog for
  * model resolution and the config for host/region derivation.
  */
+import { bedrockDisabledReason, isCredentialSet } from "./auth/bedrock-mode.ts";
 import {
   type ProxyConfig,
   type RegionKey,
@@ -12,7 +13,7 @@ import {
   externalProviderOrigin,
   hostForRegion,
 } from "./config.ts";
-import { ModelNotFoundError, UnsupportedProviderError } from "./errors.ts";
+import { ModelNotFoundError, ProviderDisabledError, UnsupportedProviderError } from "./errors.ts";
 import { type CanonicalId, isAnthropic } from "./model/canonical-id.ts";
 import { type Catalog, resolveInvocationId } from "./model/catalog.ts";
 
@@ -73,6 +74,14 @@ function makeRoute(
 function routeExternal(config: ProxyConfig, id: CanonicalId): RouteTarget {
   const provider = config.providers.external[id.provider];
   if (!provider) throw new UnsupportedProviderError(id.provider);
+  // Configured but inactive (empty/placeholder credential, e.g. "${VAR:-}"
+  // before the env var is set) — a distinct, actionable error.
+  if (!isCredentialSet(provider.credential)) {
+    throw new ProviderDisabledError(
+      id.provider,
+      "credential is unset or a placeholder; set the provider API key and reload",
+    );
+  }
   const origin = externalProviderOrigin(provider);
 
   if (provider.type === "anthropic") {
@@ -103,9 +112,11 @@ function routeExternal(config: ProxyConfig, id: CanonicalId): RouteTarget {
 
 /** Resolve a `bedrock.converse.*` target (Path C — Converse translation). */
 function routeConverse(config: ProxyConfig, catalog: Catalog, id: CanonicalId): RouteTarget {
+  const bedrock = config.providers.bedrock;
+  if (!bedrock) throw new ProviderDisabledError("bedrock", "no providers.bedrock block configured");
   const awsRegion = awsRegionForPrefix(config, id.profilePrefix);
   const regionKey = regionKeyForPrefix(config, id.profilePrefix);
-  const origin = `https://${hostForRegion(config.providers.bedrock.hosts.converse, awsRegion)}`;
+  const origin = `https://${hostForRegion(bedrock.hosts.converse, awsRegion)}`;
 
   // The converse backend ALWAYS uses the Converse API (Path C), for Claude and
   // non-Claude alike. Converse serves the full Claude catalog, and the backend
@@ -134,8 +145,10 @@ function routeConverse(config: ProxyConfig, catalog: Catalog, id: CanonicalId): 
 
 /** Resolve a `bedrock.mantle.*` target (Path P for Claude, Path M otherwise). */
 function routeMantle(config: ProxyConfig, id: CanonicalId): RouteTarget {
+  const bedrock = config.providers.bedrock;
+  if (!bedrock) throw new ProviderDisabledError("bedrock", "no providers.bedrock block configured");
   const awsRegion = awsRegionForPrefix(config, id.profilePrefix);
-  const origin = `https://${hostForRegion(config.providers.bedrock.hosts.mantle, awsRegion)}`;
+  const origin = `https://${hostForRegion(bedrock.hosts.mantle, awsRegion)}`;
 
   if (isAnthropic(id.nativeModelId)) {
     // Path P — native Anthropic passthrough on Mantle. Bare native id works.
@@ -169,12 +182,20 @@ function routeMantle(config: ProxyConfig, id: CanonicalId): RouteTarget {
  * the per-backend resolvers.
  *
  * @throws UnsupportedProviderError when the provider is not configured.
+ * @throws ProviderDisabledError when the provider is configured but inactive
+ *   (no usable credential — e.g. Bedrock without a key, or an external
+ *   provider whose `${VAR:-}` credential is still unset).
  * @throws ModelNotFoundError when the model is not in the catalog for the
  *   target region/backend, or cannot be invoked there.
  */
 export function route(config: ProxyConfig, catalog: Catalog, id: CanonicalId): RouteTarget {
   // External providers are driven by config provider `type`, not the model string.
   if (id.provider !== "bedrock") return routeExternal(config, id);
+  // Bedrock guard BEFORE the per-backend resolvers: routeMantle does not
+  // consult the catalog, so a disabled Bedrock would otherwise only fail
+  // later (at auth resolution) with a confusing error.
+  const disabledReason = bedrockDisabledReason(config.providers.bedrock?.credential);
+  if (disabledReason !== undefined) throw new ProviderDisabledError("bedrock", disabledReason);
   if (id.backend === "converse") return routeConverse(config, catalog, id);
   return routeMantle(config, id); // backend === "mantle"
 }

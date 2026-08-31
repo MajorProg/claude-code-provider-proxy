@@ -80,6 +80,18 @@ export class UnsupportedProviderError extends ProxyError {
   }
 }
 
+/**
+ * 404 — the request named a configured provider that is currently disabled
+ * (no usable credential). Distinct from UnsupportedProviderError: "known
+ * provider, not active" vs "unknown provider". The message carries the reason
+ * (e.g. "credential is unset") so the operator can act on it.
+ */
+export class ProviderDisabledError extends ProxyError {
+  constructor(provider: string, reason: string) {
+    super(404, "not_found_error", `Provider "${provider}" is disabled: ${reason}`);
+  }
+}
+
 /** 502 — the upstream provider returned an error we could not translate. */
 export class UpstreamError extends ProxyError {
   /** Raw upstream body, preserved unmodified for relay (DESIGN §9.1). */

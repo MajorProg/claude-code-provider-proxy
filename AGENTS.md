@@ -14,7 +14,10 @@ An Anthropic-Messages-mode HTTP proxy (Bun + strict TypeScript) that lets Claude
 Code drive any AWS Bedrock model — Claude and non-Claude — plus external
 providers, behind one Anthropic-compliant endpoint. Inbound is the Anthropic
 Messages API; outbound is translated per model. Model availability is
-**discovered at runtime** — there is no hardcoded model catalog.
+**discovered at runtime** — there is no hardcoded model catalog. **Bedrock is
+optional**: with no (or a placeholder) Bedrock credential the proxy runs on
+external providers only; no discovery failure is fatal (see Custom
+Instructions).
 
 ---
 
@@ -94,11 +97,23 @@ bootstrap.sh / .ps1    Tiny shims: install Bun if missing, then run the Bun CLI
   explicit `.ts` import extensions and `import type` for type-only imports.
   Strict flags include `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`.
 - **Docker/compose**: the port is published only on `${BIND_IP}` (LAN) +
-  `127.0.0.1`, never `0.0.0.0`. Compose requires `BIND_IP` (the CLI auto-derives
-  and writes it). In `--local` mode `BIND_IP` becomes the server `HOST` bind.
-- **Config**: `config.local.jsonc` (JSONC) with `${ENV}` interpolation; secrets
-  are restored to `${ENV}` form on UI save. `.env`, `config.local.jsonc`, and
-  AWS creds are git-ignored.
+  `127.0.0.1`, never `0.0.0.0`. Compose requires `BIND_IP` and
+  `PROXY_INBOUND_KEY` (both `:?`-gated); `BEDROCK_API_KEY` is optional
+  (`:-`-gated, empty disables Bedrock). In `--local` mode `BIND_IP` becomes the
+  server `HOST` bind.
+- **Config**: `config.local.jsonc` (JSONC) with `${ENV}` interpolation — bare
+  `${VAR}` fails fast when unset/empty, `${VAR:-default}` (bash-like, empty
+  default allowed) is the "configured but inactive until the env var is set"
+  form; secrets are restored to `${ENV}` form on UI save. `.env`,
+  `config.local.jsonc`, and AWS creds are git-ignored.
+- **Bedrock is optional** (`src/auth/bedrock-mode.ts`): an absent
+  `providers.bedrock` block, an empty/placeholder (`REPLACE_ME`) credential, or
+  `dev` without AWS env creds ⇒ Bedrock disabled (external providers only); the
+  decision is never fatal. Discovery failures (any region, incl. primary) are
+  non-fatal — each source gets a `SourceStatus` (`ok|error|skipped|disabled`)
+  on the immutable `Catalog`, surfaced in `/status.json` + `/api/config/status`
+  + `doctor`. Requests for a disabled provider get a clean 404
+  `ProviderDisabledError`; `Runtime.tokenProvider` is `| null` when disabled.
 - **Declarative route table**: `server.ts` matches requests against a `ROUTES`
   array (`{method, match, requiresAuth, requiresCsrf?, handler}` with
   `exact()`/`prefix()` matchers), so auth + CSRF policy is data-driven per route,
@@ -307,3 +322,7 @@ config; the proxy never needs to mint keys in production.
    handler under `src/paths/`.
 4. Add tests (live where possible), and record verified specifics in this file's
    "Verified provider facts" table.
+
+## Steering
+
+See [Steering](.ktools/steering/) for project guidelines.

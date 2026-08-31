@@ -41,6 +41,23 @@ export function getEnvValue(envPath: string, key: string): string | undefined {
 }
 
 /**
+ * Read every `KEY=VALUE` pair from a .env file into a plain record (comment
+ * lines ignored; last occurrence wins). Used by `doctor` to build the env the
+ * server process would see (process env overlaid with .env).
+ */
+export function readEnvFile(envPath: string): Record<string, string> {
+  if (!existsSync(envPath)) return {};
+  const out: Record<string, string> = {};
+  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    const key = m?.[1];
+    const value = m?.[2];
+    if (key !== undefined && value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/**
  * Set a single key in a .env file, preserving comments/order/other keys.
  * Rewrites the last matching line, or appends the key if it does not exist.
  */

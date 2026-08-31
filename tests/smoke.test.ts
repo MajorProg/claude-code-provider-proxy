@@ -13,6 +13,7 @@
  */
 import { describe, expect, test } from "bun:test";
 
+import * as auth_bedrockMode from "../src/auth/bedrock-mode.ts";
 import * as auth_bedrockToken from "../src/auth/bedrock-token.ts";
 import * as auth_inbound from "../src/auth/inbound.ts";
 import * as auth_tokenProvider from "../src/auth/token-provider.ts";
@@ -51,6 +52,7 @@ import * as stream_openaiSse from "../src/stream/openai-sse.ts";
 describe("module import smoke", () => {
   test("every src module imports without a side-effecting entrypoint", () => {
     const modules = {
+      "auth/bedrock-mode": auth_bedrockMode,
       "auth/bedrock-token": auth_bedrockToken,
       "auth/inbound": auth_inbound,
       "auth/token-provider": auth_tokenProvider,

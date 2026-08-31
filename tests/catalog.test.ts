@@ -87,7 +87,7 @@ describeLive("live discovery (real Bedrock endpoints)", () => {
     }
   });
 
-  test("discoverCatalog builds a cross-region catalog (us + eu), fail-fast primary", async () => {
+  test("discoverCatalog builds a cross-region catalog (us + eu) with per-source statuses", async () => {
     const catalog = await discoverCatalog(CONFIG, client);
     expect(catalog).toBeInstanceOf(Catalog);
     expect(catalog.models.length).toBeGreaterThan(0);
@@ -96,6 +96,11 @@ describeLive("live discovery (real Bedrock endpoints)", () => {
     const regions = new Set(catalog.models.map((m) => m.regionKey));
     expect(regions.has("us")).toBe(true);
     expect(regions.has("eu")).toBe(true);
+
+    // Discovery is non-fatal by contract: every source reports a status, and
+    // both live regions must have discovered ok.
+    expect(catalog.sources).toContainEqual({ source: "bedrock:us", state: "ok" });
+    expect(catalog.sources).toContainEqual({ source: "bedrock:eu", state: "ok" });
 
     // Look up a known-present model by exact native id via the catalog index.
     const anyMantleUs = catalog.models.find((m) => m.regionKey === "us" && m.backend === "mantle");

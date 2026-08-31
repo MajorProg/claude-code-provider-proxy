@@ -1,4 +1,3 @@
-import { generateShortLivedBedrockToken } from "./auth/bedrock-token.ts";
 /**
  * HTTP server entrypoint (DESIGN §9).
  *
@@ -19,8 +18,10 @@ import { generateShortLivedBedrockToken } from "./auth/bedrock-token.ts";
  * /api/chat) require the inbound key. LAN-only bind is an additional mitigation,
  * not the access control itself.
  */
+import { credentialState, resolveBedrockMode } from "./auth/bedrock-mode.ts";
+import { generateShortLivedBedrockToken } from "./auth/bedrock-token.ts";
 import { authenticateInbound } from "./auth/inbound.ts";
-import { createBedrockTokenProvider } from "./auth/token-provider.ts";
+import { BEDROCK_DEV_SENTINELS } from "./auth/token-provider.ts";
 import {
   type ProxyConfig,
   loadConfig,
@@ -28,7 +29,13 @@ import {
   serializeConfig,
   validateConfig,
 } from "./config.ts";
-import { BadRequestError, ProxyError, UnauthorizedError, UpstreamError } from "./errors.ts";
+import {
+  BadRequestError,
+  ProviderDisabledError,
+  ProxyError,
+  UnauthorizedError,
+  UpstreamError,
+} from "./errors.ts";
 import { renderChatPageHtml } from "./http/chat-page.ts";
 import { renderConfigPageHtml } from "./http/config-page.ts";
 import { renderLogViewerHtml } from "./http/log-viewer-page.ts";
@@ -54,10 +61,6 @@ const CONFIG_PATH = Bun.env.CONFIG_PATH ?? "config.local.jsonc";
 
 /** Default max_tokens for the built-in chat test page when the body omits it. */
 const DEFAULT_CHAT_MAX_TOKENS = 1024;
-
-/** Bedrock credential values that select dev-mode (SigV4 minting) rather than a
- *  configured long-term key. Mirrors DEV_SENTINELS in token-provider.ts. */
-const DEV_CREDENTIAL_SENTINELS = new Set(["", "dev", "DEV"]);
 
 /** Parse the bind port from env with a NaN/range guard (fail fast, not a silent NaN). */
 function resolvePort(): number {
@@ -85,10 +88,43 @@ function truncateForLog(body: string): string {
     : body;
 }
 
+/**
+ * True when an error is a client-driven abort — the inbound request's
+ * `AbortSignal` fired because Claude Code closed the connection mid-flight
+ * (e.g. the user hit Esc, or a streaming turn was cancelled). This propagates
+ * through the upstream fetch as a `DOMException` named "AbortError". It is not
+ * a proxy fault: there is no client left to receive a response, so it must be
+ * logged quietly rather than dumped as an unhandled error with a full stack.
+ * A structural `name` check (not `instanceof DOMException`) keeps this robust
+ * across the different Error/DOMException shapes Bun surfaces for aborts.
+ */
+function isClientDisconnect(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "name" in err &&
+    (err as { name: unknown }).name === "AbortError"
+  );
+}
+
 function errorResponse(
   err: unknown,
   ctx?: { requestId?: string; method?: string; path?: string },
 ): Response {
+  // A client disconnect (inbound request aborted) is expected, not a failure.
+  // The socket is already gone, so the returned Response is never delivered;
+  // log at info without a stack and return a benign 499-style body.
+  if (isClientDisconnect(err)) {
+    logger.info("request aborted by client", {
+      requestId: ctx?.requestId,
+      method: ctx?.method,
+      path: ctx?.path,
+    });
+    return Response.json(
+      { type: "error", error: { type: "api_error", message: "Client closed request" } },
+      { status: 499 },
+    );
+  }
   if (err instanceof ProxyError) {
     const base = {
       requestId: ctx?.requestId,
@@ -218,18 +254,23 @@ function modelFromBody(parsed: JsonObject): string {
  * Bedrock uses the region-aware token provider; external providers use their
  * static config API key + configured header style. Shared by the inference and
  * count-tokens dispatchers (identical logic in both before this extraction).
+ * `tokenProvider` is null when Bedrock is disabled — unreachable for external
+ * targets, and a clean ProviderDisabledError for bedrock ones.
  */
 async function resolveOutboundAuth(
   config: ProxyConfig,
-  tokenProvider: RegionTokenProvider,
+  tokenProvider: RegionTokenProvider | null,
   target: ReturnType<typeof route>,
 ): Promise<{ bearer: string; authStyle: "x-api-key" | "bearer" }> {
   const externalProvider = config.providers.external[target.provider];
-  const bearer = externalProvider
-    ? externalProvider.credential
-    : await tokenProvider(target.awsRegion);
-  const authStyle: "x-api-key" | "bearer" = externalProvider?.auth ?? "x-api-key";
-  return { bearer, authStyle };
+  if (externalProvider) {
+    return { bearer: externalProvider.credential, authStyle: externalProvider.auth };
+  }
+  // Defense-in-depth: route() already rejects bedrock targets when disabled.
+  if (!tokenProvider) {
+    throw new ProviderDisabledError("bedrock", "no usable Bedrock credential configured");
+  }
+  return { bearer: await tokenProvider(target.awsRegion), authStyle: "x-api-key" };
 }
 
 /**
@@ -256,7 +297,7 @@ function maybeCaptureTurn(
 async function runInference(
   config: ProxyConfig,
   catalog: Catalog,
-  tokenProvider: RegionTokenProvider,
+  tokenProvider: RegionTokenProvider | null,
   parsed: JsonObject,
   inboundHeaders: { get(name: string): string | null },
   signal?: AbortSignal,
@@ -305,7 +346,7 @@ async function runInference(
 async function dispatchMessages(
   config: ProxyConfig,
   catalog: Catalog,
-  tokenProvider: RegionTokenProvider,
+  tokenProvider: RegionTokenProvider | null,
   store: LogStore,
   req: Request,
 ): Promise<Response> {
@@ -356,7 +397,7 @@ async function dispatchMessages(
 async function dispatchChat(
   config: ProxyConfig,
   catalog: Catalog,
-  tokenProvider: RegionTokenProvider,
+  tokenProvider: RegionTokenProvider | null,
   store: LogStore,
   req: Request,
 ): Promise<Response> {
@@ -450,11 +491,16 @@ function zipResponse(entries: { name: string; content: string }[], baseName: str
  * External providers: report their resolved credential (again, gated).
  */
 async function describeAuth(config: ProxyConfig): Promise<Response> {
-  const bedrockCred = config.providers.bedrock.credential;
+  const bedrockCred = config.providers.bedrock?.credential;
   const primaryAwsRegion = config.regions.find((r) => r.key === config.primaryRegion)?.awsRegion;
 
   let bedrock: Record<string, unknown>;
-  if (!DEV_CREDENTIAL_SENTINELS.has(bedrockCred)) {
+  // Disabled (absent block, empty/placeholder credential, or dev mode without
+  // AWS creds) is a first-class mode — surfaced, never a credential leak.
+  const mode = resolveBedrockMode(bedrockCred);
+  if (!mode.enabled) {
+    bedrock = { mode: "disabled", reason: mode.reason, region: primaryAwsRegion };
+  } else if (bedrockCred !== undefined && !BEDROCK_DEV_SENTINELS.has(bedrockCred)) {
     bedrock = { mode: "long-term-key", credential: bedrockCred, region: primaryAwsRegion };
   } else {
     const env = Bun.env;
@@ -499,7 +545,12 @@ async function describeAuth(config: ProxyConfig): Promise<Response> {
 
   const external: Record<string, unknown> = {};
   for (const [key, p] of Object.entries(config.providers.external)) {
-    external[key] = { type: p.type, auth: p.auth, credential: p.credential };
+    external[key] = {
+      type: p.type,
+      auth: p.auth,
+      credential: p.credential,
+      state: credentialState(p.credential),
+    };
   }
   return Response.json({ bedrock, external });
 }
@@ -508,7 +559,7 @@ async function describeAuth(config: ProxyConfig): Promise<Response> {
 async function dispatchCountTokens(
   config: ProxyConfig,
   catalog: Catalog,
-  tokenProvider: RegionTokenProvider,
+  tokenProvider: RegionTokenProvider | null,
   req: Request,
 ): Promise<Response> {
   authenticateInbound(req.headers, config.inboundAuth.keys);
@@ -528,19 +579,43 @@ async function dispatchCountTokens(
 /** Mutable runtime built from a config; swapped atomically on hot-reload. */
 export interface Runtime {
   config: ProxyConfig;
-  tokenProvider: RegionTokenProvider;
+  tokenProvider: RegionTokenProvider | null;
   catalogManager: CatalogManager;
   logStore: LogStore;
 }
 
-/** Build a Runtime (token provider + discovery + catalog + log store) from a config. */
+/**
+ * Build a Runtime (token provider + discovery + catalog + log store) from a
+ * config. Bedrock is optional: an unusable/absent credential disables it (no
+ * Bedrock discovery at all) and the proxy runs on external providers; a
+ * discovery failure degrades the catalog instead of throwing, so this only
+ * fails for genuinely fatal problems (unwritable log dir, invalid config).
+ */
 export async function buildRuntime(config: ProxyConfig): Promise<Runtime> {
-  const tokenProvider = createBedrockTokenProvider(config.providers.bedrock.credential);
-  const discoveryClient = createHttpDiscoveryClient(config, tokenProvider);
+  const mode = resolveBedrockMode(config.providers.bedrock?.credential);
+  if (!mode.enabled) {
+    logger.error("Bedrock provider disabled — running on external providers only", {
+      reason: mode.reason,
+    });
+  }
+  const discoveryClient = mode.enabled
+    ? createHttpDiscoveryClient(config, mode.tokenProvider)
+    : null;
   const catalogManager = await CatalogManager.start(config, discoveryClient);
+  if (catalogManager.current().models.length === 0) {
+    logger.error(
+      "No models discovered — serving an empty catalog. Set a provider key (e.g. in .env, " +
+        "then restart) or fix credentials via the config UI at /config",
+    );
+  }
   const logStore = new LogStore(config.logging);
   await logStore.verifyWritable();
-  return { config, tokenProvider, catalogManager, logStore };
+  return {
+    config,
+    tokenProvider: mode.enabled ? mode.tokenProvider : null,
+    catalogManager,
+    logStore,
+  };
 }
 
 /**
@@ -555,7 +630,7 @@ interface RouteContext {
   url: { searchParams: { get(name: string): string | null } };
   method: string;
   config: ProxyConfig;
-  tokenProvider: RegionTokenProvider;
+  tokenProvider: RegionTokenProvider | null;
   catalogManager: CatalogManager;
   logStore: LogStore;
   reloadRuntime: (rawConfig: unknown) => Promise<void>;
@@ -710,8 +785,14 @@ function handleConfigGet({ config }: RouteContext): Response {
 
 function handleConfigStatus({ config, catalogManager }: RouteContext): Response {
   const cat = catalogManager.current();
+  // Join the catalog's per-source discovery outcomes so the status view shows
+  // WHY a region/provider has no models (disabled / error / skipped), not just
+  // that it doesn't.
+  const sources = new Map(cat.sources.map((s) => [s.source, s]));
+  const bedrockMode = resolveBedrockMode(config.providers.bedrock?.credential);
   const regions = config.regions.map((r) => {
     const models = cat.models.filter((m) => m.provider === "bedrock" && m.regionKey === r.key);
+    const src = sources.get(`bedrock:${r.key}`);
     return {
       key: r.key,
       awsRegion: r.awsRegion,
@@ -719,19 +800,31 @@ function handleConfigStatus({ config, catalogManager }: RouteContext): Response 
       total: models.length,
       converse: models.filter((m) => m.backend === "converse").length,
       mantle: models.filter((m) => m.backend === "mantle").length,
+      ...(!bedrockMode.enabled ? { disabled: true } : {}),
+      ...(src?.detail ? { error: src.detail } : {}),
     };
   });
   const external = Object.entries(config.providers.external).map(([key, p]) => {
     const models = cat.models.filter((m) => m.provider === key);
+    const src = sources.get(key);
     return {
       key,
       type: p.type,
       baseUrl: p.baseUrl,
       active: models.length > 0,
       total: models.length,
+      state: (src?.state ?? "skipped") as "ok" | "error" | "skipped" | "disabled",
+      ...(src?.detail ? { detail: src.detail } : {}),
     };
   });
-  return Response.json({ regions, external, totalModels: cat.models.length });
+  return Response.json({
+    bedrock: bedrockMode.enabled
+      ? { enabled: true }
+      : { enabled: false, reason: bedrockMode.reason },
+    regions,
+    external,
+    totalModels: cat.models.length,
+  });
 }
 
 async function handleConfigSave({ req, reloadRuntime }: RouteContext): Promise<Response> {
@@ -991,9 +1084,14 @@ export function createFetchHandler(
 
 async function main(): Promise<void> {
   const initialConfig: ProxyConfig = await loadConfig(CONFIG_PATH);
-  console.log(
-    `Discovering models across regions: ${initialConfig.regions.map((r) => r.awsRegion).join(", ")}…`,
-  );
+  const bedrockMode = resolveBedrockMode(initialConfig.providers.bedrock?.credential);
+  if (bedrockMode.enabled) {
+    console.log(
+      `Discovering models across regions: ${initialConfig.regions.map((r) => r.awsRegion).join(", ")}…`,
+    );
+  } else {
+    console.log(`Bedrock disabled (${bedrockMode.reason}); discovering external providers only…`);
+  }
   // Single mutable reference, swapped atomically on reload (readers snapshot it).
   let runtime: Runtime = await buildRuntime(initialConfig);
   console.log(

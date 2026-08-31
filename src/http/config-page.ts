@@ -9,7 +9,8 @@
  * so a screenshot / screen-share does not leak them; the short-lived minted
  * SigV4 token is never sent to the browser (metadata only).
  */
-import { renderShell } from "./shell.ts";
+import { DEFAULT_BEDROCK_HOSTS } from "../config.ts";
+import { jsonForScript, renderShell } from "./shell.ts";
 
 export function renderConfigPageHtml(chatEnabled: boolean): string {
   const body = `
@@ -22,21 +23,21 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
       <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Provider status <span class="text-slate-400 normal-case" x-text="status.totalModels?('· '+status.totalModels+' models total'):''"></span></div>
       <div class="flex flex-wrap gap-3">
         <template x-for="r in status.regions" :key="r.key">
-          <div class="rounded-lg border px-4 py-2" :class="r.active?'border-emerald-400/60 bg-emerald-50 dark:bg-emerald-900/20':'border-rose-400/60 bg-rose-50 dark:bg-rose-900/20'">
+          <div class="rounded-lg border px-4 py-2" :class="tone(regionState(r))">
             <div class="flex items-center gap-2">
-              <span class="inline-block w-2 h-2 rounded-full" :class="r.active?'bg-emerald-500':'bg-rose-500'"></span>
+              <span class="inline-block w-2 h-2 rounded-full" :class="dot(regionState(r))"></span>
               <span class="font-medium" x-text="'bedrock · '+r.key+' → '+r.awsRegion"></span>
             </div>
-            <div class="text-xs text-slate-500" x-text="r.total+' models (converse '+r.converse+' / mantle '+r.mantle+')'"></div>
+            <div class="text-xs text-slate-500" x-text="regionDetail(r)"></div>
           </div>
         </template>
         <template x-for="e in (status.external||[])" :key="e.key">
-          <div class="rounded-lg border px-4 py-2" :class="e.active?'border-emerald-400/60 bg-emerald-50 dark:bg-emerald-900/20':'border-rose-400/60 bg-rose-50 dark:bg-rose-900/20'">
+          <div class="rounded-lg border px-4 py-2" :class="tone(externalState(e))">
             <div class="flex items-center gap-2">
-              <span class="inline-block w-2 h-2 rounded-full" :class="e.active?'bg-emerald-500':'bg-rose-500'"></span>
+              <span class="inline-block w-2 h-2 rounded-full" :class="dot(externalState(e))"></span>
               <span class="font-medium" x-text="e.key+' · '+e.type"></span>
             </div>
-            <div class="text-xs text-slate-500" x-text="e.total+' models · '+e.baseUrl"></div>
+            <div class="text-xs text-slate-500" x-text="externalDetail(e)"></div>
           </div>
         </template>
         <div x-show="status.regions.length===0" class="text-sm text-slate-400">loading…</div>
@@ -86,22 +87,30 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
         </template>
       </div>
 
-      <!-- Bedrock credential + effective auth (real minted token, not "dev") -->
+      <!-- Bedrock credential + effective auth (real minted token, not "dev").
+           The block is optional: absent means Bedrock is disabled. -->
+      <template x-if="cfg.providers.bedrock">
       <div class="rounded-lg border border-slate-200 dark:border-slate-700 p-3 space-y-2">
         <div class="flex items-center justify-between">
           <span class="text-xs uppercase tracking-wide text-slate-500">Bedrock credential</span>
-          <button @click="loadAuth()" class="text-xs px-2 py-1 rounded bg-slate-200 dark:bg-slate-700">↻ re-mint</button>
+          <div class="flex items-center gap-2">
+            <button @click="disableBedrock()" class="text-xs px-2 py-1 rounded bg-slate-200 dark:bg-slate-700">disable</button>
+            <button @click="loadAuth()" class="text-xs px-2 py-1 rounded bg-slate-200 dark:bg-slate-700">↻ re-mint</button>
+          </div>
         </div>
         <input :type="reveal.bedrock?'text':'password'" x-model="cfg.providers.bedrock.credential" spellcheck="false"
           class="w-full px-2 py-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm font-mono" />
         <label class="flex items-center gap-2 text-xs text-slate-500"><input type="checkbox" x-model="reveal.bedrock" /> reveal</label>
-        <span class="text-xs text-slate-400">Set a long-term Bedrock API key, or <code>dev</code> to mint short-lived SigV4 tokens from AWS env creds.</span>
+        <span class="text-xs text-slate-400">Set a long-term Bedrock API key, or <code>dev</code> to mint short-lived SigV4 tokens from AWS env creds. Leave empty to disable Bedrock (external providers only).</span>
         <template x-if="auth.bedrock">
           <div class="text-xs space-y-1">
             <div><span class="text-slate-500">mode:</span> <b x-text="auth.bedrock.mode"></b>
               <template x-if="auth.bedrock.region"><span class="text-slate-500"> · region <span x-text="auth.bedrock.region"></span></span></template>
               <template x-if="auth.bedrock.expiresInSeconds"><span class="text-slate-500"> · expires in <span x-text="auth.bedrock.expiresInSeconds"></span>s</span></template>
             </div>
+            <template x-if="auth.bedrock.mode==='disabled' && auth.bedrock.reason">
+              <div class="text-amber-600 dark:text-amber-400" x-text="auth.bedrock.reason"></div>
+            </template>
             <template x-if="auth.bedrock.awsPresent">
               <div class="text-slate-500">AWS env:
                 <span x-text="'ACCESS_KEY_ID '+(auth.bedrock.awsPresent.AWS_ACCESS_KEY_ID?'✓':'✗')"></span>,
@@ -117,6 +126,15 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
             </template>
           </div>
         </template>
+      </div>
+      </template>
+      <div x-show="cfg && !cfg.providers.bedrock"
+        class="rounded-lg border border-dashed border-slate-300 dark:border-slate-600 p-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <b class="text-sm">Bedrock disabled</b>
+          <div class="text-xs text-slate-500 mt-0.5">No providers.bedrock block configured — the proxy runs on external providers only.</div>
+        </div>
+        <button @click="enableBedrock()" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white text-sm">Enable Bedrock</button>
       </div>
 
       <!-- External (non-Bedrock) providers -->
@@ -177,6 +195,18 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
     externalKeys(){ return Object.keys(this.cfg.providers).filter(k=>k!=='bedrock'); },
     async loadStatus(){ try{ this.status=await (await window.adminFetch('/api/config/status')).json(); }catch(e){ console.error('config status load failed',e); } },
     async loadAuth(){ try{ this.auth=await (await window.adminFetch('/api/config/auth')).json(); }catch(e){ console.error('config auth load failed',e); } },
+    // Status-strip tones: ok=green, skipped/disabled=amber (actionable: set the
+    // key), error=rose (discovery failed — detail shown on the card).
+    tone(s){ return s==='ok' ? 'border-emerald-400/60 bg-emerald-50 dark:bg-emerald-900/20'
+      : (s==='skipped'||s==='disabled') ? 'border-amber-400/60 bg-amber-50 dark:bg-amber-900/20'
+      : 'border-rose-400/60 bg-rose-50 dark:bg-rose-900/20'; },
+    dot(s){ return s==='ok'?'bg-emerald-500':(s==='skipped'||s==='disabled')?'bg-amber-500':'bg-rose-500'; },
+    regionState(r){ return r.disabled?'disabled':(r.active?'ok':'error'); },
+    regionDetail(r){ return r.error ? r.awsRegion+' · '+r.error : r.total+' models (converse '+r.converse+' / mantle '+r.mantle+')'; },
+    externalState(e){ return e.active?'ok':(e.state==='skipped'?'skipped':'error'); },
+    externalDetail(e){ return (e.detail?e.detail+' · ':'')+e.total+' models · '+e.baseUrl; },
+    enableBedrock(){ this.cfg.providers.bedrock={type:'bedrock',credential:'',hosts:${jsonForScript(DEFAULT_BEDROCK_HOSTS)}}; },
+    disableBedrock(){ delete this.cfg.providers.bedrock; },
     addProvider(){
       const name=prompt('Provider id (e.g. deepseek, zai, gemini):'); if(!name)return;
       if(this.cfg.providers[name]){ this.msg='provider "'+name+'" already exists'; this.msgOk=false; return; }

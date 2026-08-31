@@ -34,11 +34,13 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { credentialState, resolveBedrockMode } from "../auth/bedrock-mode.ts";
+import { type ProxyConfig, loadConfig } from "../config.ts";
 import { deriveBindIp, verifyBindIp } from "./bind-ip.ts";
 import { bootstrapPaths, ensureAuthToken, ensureConfigFiles } from "./bootstrap.ts";
 import { writeClaudeSettings } from "./claude.ts";
 import { checkBun, checkDocker, ensureClaudeCode } from "./deps.ts";
-import { getEnvValue, setEnvValue } from "./env.ts";
+import { getEnvValue, readEnvFile, setEnvValue } from "./env.ts";
 import {
   bold,
   commandExists,
@@ -321,7 +323,16 @@ function cmdSetup(root: string, mode: Mode, rotate: boolean): void {
   }
 
   ok("Setup complete.");
-  if (createdEnv) warn("Set BEDROCK_API_KEY in .env before starting (long-term Bedrock key).");
+  if (createdEnv) {
+    info("Activate at least one provider in .env, then run up:");
+    info(
+      "  External (no AWS needed): set e.g. ZAI_API_KEY (or DEEPSEEK_API_KEY, …) — the matching provider activates automatically.",
+    );
+    info(
+      "  Bedrock: set BEDROCK_API_KEY (long-term key), or leave empty to skip Bedrock entirely.",
+    );
+    info("  The proxy also boots with no provider key at all; fix credentials later at /config.");
+  }
   info(`Next: ${bold(`bun run cli up --${mode}`)}`);
 }
 
@@ -406,7 +417,7 @@ function cmdConfigClaude(root: string): void {
   });
 }
 
-function cmdDoctor(root: string, mode: Mode): void {
+async function cmdDoctor(root: string, mode: Mode): Promise<void> {
   info(bold("Environment check:"));
   checkBun();
   checkDocker(false);
@@ -430,6 +441,39 @@ function cmdDoctor(root: string, mode: Mode): void {
     );
   }
   info(`  Run mode: ${mode}.`);
+
+  // Config + provider-state check: parse the config exactly like the server
+  // would (process env overlaid with .env) and classify every credential, so
+  // "why is provider X missing" is answerable without opening the logs.
+  if (!existsSync(paths.config)) return;
+  info(bold("Config check:"));
+  let config: ProxyConfig;
+  try {
+    const env = { ...process.env, ...readEnvFile(paths.env) };
+    config = await loadConfig(paths.config, env);
+    ok("  config.local.jsonc parses and validates.");
+    const bedrockMode = resolveBedrockMode(config.providers.bedrock?.credential, env);
+    if (bedrockMode.enabled) {
+      ok("  Bedrock: enabled.");
+    } else {
+      warn(`  Bedrock: disabled — ${bedrockMode.reason}`);
+    }
+  } catch (err) {
+    warn(`  config.local.jsonc INVALID: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  const externals = Object.entries(config.providers.external);
+  if (externals.length === 0) {
+    warn("  No external providers configured (see config.example.jsonc).");
+  }
+  for (const [key, p] of externals) {
+    const state = credentialState(p.credential);
+    if (state === "empty" || state === "placeholder") {
+      warn(`  ${key}: skipped — credential unset/placeholder.`);
+    } else {
+      ok(`  ${key}: credential set (${p.type}).`);
+    }
+  }
 }
 
 function usage(): void {
@@ -456,7 +500,7 @@ function usage(): void {
   );
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const root = projectRoot();
   if (args.command === "help" || args.command === "-h" || args.command === "--help") {
@@ -490,7 +534,7 @@ function main(): void {
       cmdConfigClaude(root);
       break;
     case "doctor":
-      cmdDoctor(root, mode);
+      await cmdDoctor(root, mode);
       break;
     default:
       warn(`Unknown command: ${args.command}`);
@@ -502,5 +546,8 @@ function main(): void {
 // Only run the CLI when executed directly (`bun run src/cli/index.ts ...`),
 // not when imported (e.g. by the module smoke test), mirroring server.ts.
 if (import.meta.main) {
-  main();
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
 }
