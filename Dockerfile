@@ -5,7 +5,7 @@
 # fully immutable base, additionally pin the digest, e.g.
 #   FROM oven/bun:1.3.13-alpine@sha256:<digest> AS base
 # (resolve the current digest with: docker buildx imagetools inspect oven/bun:1.3.13-alpine)
-FROM oven/bun:1.3.13-alpine AS base
+FROM oven/bun:1.4.0-alpine AS base
 WORKDIR /app
 
 # Install dependencies first (better layer caching).
