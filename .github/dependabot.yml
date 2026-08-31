@@ -1,0 +1,41 @@
+# Dependabot: automated dependency-update PRs against main.
+#
+#   npm            runtime + dev dependencies (aws4fetch, typescript,
+#                  @biomejs/biome) via bun.lock (Dependabot handles Bun's
+#                  text lockfile under the "npm" ecosystem).
+#   docker         the pinned base image in Dockerfile
+#                  (oven/bun:<version>-alpine@sha256:… — tag + digest bumps).
+#   github-actions action versions in .github/workflows/*.yml
+#                  (actions/checkout, oven-sh/setup-bun).
+#
+# CI (workflows/ci.yml) runs the full merge gate on every Dependabot PR, so a
+# bump only merges if format/typecheck/lint/hermetic tests stay green.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      # Off the Monday rush; solo repo, any quiet day works.
+      day: tuesday
+    commit-message:
+      prefix: "chore(deps)"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+    commit-message:
+      prefix: "chore(deps)"
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+    commit-message:
+      prefix: "chore(ci)"
+    open-pull-requests-limit: 3
