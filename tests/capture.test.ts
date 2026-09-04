@@ -7,7 +7,7 @@
  *
  * Covers Task 2 (F4): multi-block text+tool_use reassembly, usage/stop_reason
  * extraction, the 8 MiB truncation DoS-guard, and malformed tool-JSON
- * tolerance (fallback to the raw string). Hermetic — no network.
+ * tolerance (degrades to {} per G10/SEC-10). Hermetic — no network.
  */
 import { describe, expect, test } from "bun:test";
 import { AnthropicStreamAccumulator, summarizeTools } from "../src/logging/capture.ts";
@@ -104,8 +104,9 @@ describe("AnthropicStreamAccumulator", () => {
     const blocks = acc.content() as Array<{ type: string; input: unknown }>;
     expect(blocks).toHaveLength(1);
     expect(blocks[0]?.type).toBe("tool_use");
-    // Un-parseable JSON is preserved verbatim rather than dropped.
-    expect(blocks[0]?.input).toBe("{not valid json");
+    // G10/SEC-10: un-parseable/truncated JSON degrades to {} (input is always
+    // an object), never a raw string.
+    expect(blocks[0]?.input).toEqual({});
   });
 
   test("ignores non-JSON data lines without throwing", () => {
@@ -130,6 +131,21 @@ describe("AnthropicStreamAccumulator", () => {
     // Further pushes after truncation are ignored (no unbounded growth).
     acc.push(sse("content_block_delta", { index: 0, delta: { type: "text_delta", text: "more" } }));
 
+    const blocks = acc.content() as Array<{ type: string; text?: string }>;
+    const marker = blocks[blocks.length - 1];
+    expect(marker?.type).toBe("text");
+    expect(marker?.text).toContain("capture truncated");
+  });
+
+  test("PC10: an oversized raw buffer with no line terminator trips truncation", () => {
+    const acc = new AnthropicStreamAccumulator();
+    acc.push(sse("content_block_start", { index: 0, content_block: { type: "text" } }));
+    // A single "data:" line that never terminates (no newline) — decoded-delta
+    // accounting would NOT catch this; the raw-buffer guard must. Push > 8 MiB.
+    const chunk = `data: ${"z".repeat(1024 * 1024)}`; // ~1 MiB, no newline
+    for (let i = 0; i < 9; i++) acc.push(chunk);
+    // A subsequent well-formed delta is ignored (already truncated).
+    acc.push(sse("content_block_delta", { index: 0, delta: { type: "text_delta", text: "x" } }));
     const blocks = acc.content() as Array<{ type: string; text?: string }>;
     const marker = blocks[blocks.length - 1];
     expect(marker?.type).toBe("text");

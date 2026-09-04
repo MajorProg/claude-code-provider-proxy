@@ -143,8 +143,10 @@ describe("Path M (Mantle/OpenAI) fixture round-trips", () => {
       const json = (await res.json()) as Record<string, unknown>;
       expect(json.type).toBe("message");
       const content = json.content as Array<{ type: string; text?: string }>;
-      expect(content[0]?.type).toBe("text");
-      expect(content[0]?.text).toContain("hello fixture");
+      // This fixture was captured from a reasoning model, so a thinking block
+      // (R2) precedes the text block (R4 ordering). Assert on the text block.
+      const textBlock = content.find((b) => b.type === "text");
+      expect(textBlock?.text).toContain("hello fixture");
       expect(json.stop_reason).toBe("end_turn");
       const usage = json.usage as Record<string, number>;
       expect(usage.input_tokens).toBe(13);
@@ -193,6 +195,43 @@ describe("Path M (Mantle/OpenAI) fixture round-trips", () => {
       const sent = JSON.parse(mock.requests[0]?.body ?? "{}") as Record<string, unknown>;
       expect(sent.stream).toBe(true);
       expect(sent.stream_options).toEqual({ include_usage: true });
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("R1: streaming reasoning -> thinking block emitted FIRST (real fixture)", async () => {
+    const bytes = new TextEncoder().encode(readFixtureText("openai-reasoning-stream.sse"));
+    const mock = installFetchMock({ stream: bytes, chunks: 9 });
+    try {
+      const res = await handleMantleMessages(mantleRoute(), "tok", { ...textReq, stream: true });
+      const sse = await res.text();
+      // A thinking block is opened and fed thinking_delta(s).
+      expect(sse).toContain('"content_block":{"type":"thinking"');
+      expect(sse).toContain('"type":"thinking_delta"');
+      // No fabricated signature for unsigned OpenAI-origin reasoning.
+      expect(sse).not.toContain("signature_delta");
+      // Ordering: the thinking block_start precedes any text block_start.
+      const thinkAt = sse.indexOf('"content_block":{"type":"thinking"');
+      const textAt = sse.indexOf('"content_block":{"type":"text"');
+      expect(thinkAt).toBeGreaterThanOrEqual(0);
+      if (textAt >= 0) expect(thinkAt).toBeLessThan(textAt);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("R2: non-streaming reasoning -> thinking block first (real fixture)", async () => {
+    const mock = installFetchMock({ text: readFixtureText("openai-reasoning-text.json") });
+    try {
+      const res = await handleMantleMessages(mantleRoute(), "tok", textReq);
+      const json = (await res.json()) as Record<string, unknown>;
+      const content = json.content as Array<{ type: string; thinking?: string }>;
+      expect(content[0]?.type).toBe("thinking");
+      expect(typeof content[0]?.thinking).toBe("string");
+      expect((content[0]?.thinking ?? "").length).toBeGreaterThan(0);
+      // Unsigned: no signature key fabricated.
+      expect(content[0] && "signature" in content[0]).toBe(false);
     } finally {
       mock.restore();
     }

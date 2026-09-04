@@ -15,12 +15,17 @@ import type { IRContentBlock, IRResponse, IRStopReason } from "../ir/types.ts";
 import { logger } from "../logging/logger.ts";
 import type { RouteTarget } from "../router.ts";
 import { openAiStreamToAnthropicSse } from "../stream/openai-sse.ts";
-import { normalizeForIrPaths } from "./normalize.ts";
+import { type SchemaDialect, normalizeForIrPaths, normalizeToolSchema } from "./normalize.ts";
 import {
   type JsonObject,
   assertUpstreamOk,
+  coerceToolInput,
   irToAnthropicResponse,
+  normalizeImageSource,
   parseUpstreamJson,
+  sanitizeToolCallId,
+  toolResultContentToString,
+  validateInboundBlock,
 } from "./relay.ts";
 
 /* ------------------------------------------------------------------ *
@@ -47,7 +52,10 @@ type AnthropicBlock =
   | { type: "text"; text: string }
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "tool_result"; tool_use_id: string; content: unknown; is_error?: boolean }
-  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string };
+    };
 interface AnthropicTool {
   name: string;
   description?: string;
@@ -101,29 +109,30 @@ interface OpenAIRequestBody {
 }
 interface OpenAIResponse {
   choices?: {
-    message?: { content?: string | null; tool_calls?: OpenAIToolCall[] };
+    message?: {
+      content?: string | null;
+      /** Reasoning text (Bedrock Mantle: `reasoning`; vLLM: `reasoning_content`). */
+      reasoning?: string | null;
+      reasoning_content?: string | null;
+      /** Structured refusal string (present on 2026 OpenAI-compat responses). */
+      refusal?: string | null;
+      tool_calls?: OpenAIToolCall[];
+    };
     finish_reason?: string;
   }[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    // OpenAI-compat prompt caching: cached_tokens is the subset of
+    // prompt_tokens served from cache (SR4). Surfaced as Anthropic
+    // cache_read_input_tokens.
+    prompt_tokens_details?: { cached_tokens?: number };
+  };
 }
 
 /* ------------------------------------------------------------------ *
  * Anthropic  ->  OpenAI request
  * ------------------------------------------------------------------ */
-
-function toolResultContentToString(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((b) =>
-        b && typeof b === "object" && "text" in b
-          ? String((b as { text: unknown }).text)
-          : JSON.stringify(b),
-      )
-      .join("");
-  }
-  return JSON.stringify(content);
-}
 
 /**
  * Convert one Anthropic message into one or more OpenAI messages.
@@ -141,7 +150,14 @@ function anthropicMessageToOpenAI(msg: AnthropicMessage): OpenAIMessage[] {
   const toolCalls: OpenAIToolCall[] = [];
   const toolMessages: OpenAIMessage[] = [];
 
-  for (const block of msg.content) {
+  for (const rawBlock of msg.content) {
+    // SEC-6: validate inbound (client-controlled) block shape -> 400 on unknown,
+    // rather than letting an unexpected type reach assertNever (500).
+    const type = validateInboundBlock(rawBlock, "message content block");
+    // thinking / redacted_thinking have no OpenAI Chat-Completions input form;
+    // drop them (they are assistant-reasoning artifacts, not user input).
+    if (type === "thinking" || type === "redacted_thinking") continue;
+    const block = rawBlock as AnthropicBlock;
     switch (block.type) {
       case "text":
         // Skip empty text blocks: some clients (e.g. Claude Code) emit
@@ -149,15 +165,23 @@ function anthropicMessageToOpenAI(msg: AnthropicMessage): OpenAIMessage[] {
         // OpenAI-compatible backends. Non-empty text is preserved verbatim.
         if (block.text.length > 0) textParts.push({ type: "text", text: block.text });
         break;
-      case "image":
-        textParts.push({
-          type: "image_url",
-          image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
-        });
+      case "image": {
+        const img = normalizeImageSource(block.source);
+        if (!img) break; // unrecognized image source — drop gracefully
+        // OpenAI image_url accepts a data: URI (base64) universally. A url-source
+        // image passes its URL through: real OpenAI + most external providers
+        // accept an http(s) URL, while Bedrock Mantle accepts data:/S3 URLs only
+        // (LIVE-VERIFIED: a plain http URL -> 400 "Only inline image data URLs
+        // and S3 URLs are supported"). We pass through rather than fetch-and-
+        // inline (server-side fetch of an arbitrary URL is an SSRF vector); an
+        // unsupported URL surfaces as a clean, relayed upstream 400.
+        const url = img.url !== undefined ? img.url : `data:${img.mediaType};base64,${img.data}`;
+        textParts.push({ type: "image_url", image_url: { url } });
         break;
+      }
       case "tool_use":
         toolCalls.push({
-          id: block.id,
+          id: sanitizeToolCallId(block.id),
           type: "function",
           function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
         });
@@ -165,13 +189,14 @@ function anthropicMessageToOpenAI(msg: AnthropicMessage): OpenAIMessage[] {
       case "tool_result":
         toolMessages.push({
           role: "tool",
-          tool_call_id: block.tool_use_id,
+          tool_call_id: sanitizeToolCallId(block.tool_use_id),
           content: toolResultContentToString(block.content),
         });
         break;
       default:
-        // Exhaustive over AnthropicBlock (compile error on a new variant;
-        // throw on an unexpected on-the-wire type).
+        // Unreachable: validateInboundBlock already rejected unknown types with
+        // a 400, and thinking/redacted_thinking are handled above. This throws
+        // (500) only on a genuine internal drift, which is the correct signal.
         assertNever(block, "AnthropicBlock.type");
     }
   }
@@ -186,19 +211,31 @@ function anthropicMessageToOpenAI(msg: AnthropicMessage): OpenAIMessage[] {
       assistantMsg.content = textParts.every((p) => p.type === "text")
         ? textParts.map((p) => (p as { text: string }).text).join("")
         : textParts;
+    } else {
+      // TC8: with tool_calls and no text, OpenAI expects content:null explicitly
+      // (not omitted or ""). Strict OpenAI-compatible backends validate this.
+      assistantMsg.content = null;
     }
     out.push(assistantMsg);
-  } else if (textParts.length > 0) {
-    // Collapse pure-text content to a string; keep parts array if images present.
-    const allText = textParts.every((p) => p.type === "text");
-    out.push({
-      role: msg.role,
-      content: allText ? textParts.map((p) => (p as { text: string }).text).join("") : textParts,
-    });
+    // Any tool_result blocks on an assistant turn (unusual) still follow it.
+    out.push(...toolMessages);
+  } else {
+    // User (or plain assistant) turn. G1: `role:"tool"` messages MUST immediately
+    // follow the preceding assistant `tool_calls` (OpenAI contract) — so tool
+    // results come FIRST, then any user text. Emitting the text message before
+    // the tool results would insert a `role:"user"` turn between the assistant
+    // tool_calls and its results, which strict OpenAI-compatible backends reject
+    // ("messages with role 'tool' must be a response to a preceding message with
+    // 'tool_calls'").
+    out.push(...toolMessages);
+    if (textParts.length > 0) {
+      const allText = textParts.every((p) => p.type === "text");
+      out.push({
+        role: msg.role,
+        content: allText ? textParts.map((p) => (p as { text: string }).text).join("") : textParts,
+      });
+    }
   }
-
-  // Tool results become their own role:"tool" messages, appended after.
-  out.push(...toolMessages);
 
   // A message with only tool_result blocks and nothing else still yields the
   // tool messages; if somehow empty, emit an empty user message to stay valid.
@@ -224,7 +261,11 @@ function anthropicToolChoiceToOpenAI(
 }
 
 /** Build the OpenAI request body from a parsed Anthropic request. */
-export function anthropicToOpenAIRequest(req: AnthropicRequest, model: string): OpenAIRequestBody {
+export function anthropicToOpenAIRequest(
+  req: AnthropicRequest,
+  model: string,
+  dialect: SchemaDialect = "openai",
+): OpenAIRequestBody {
   const normalized = normalizeForIrPaths(req as Record<string, unknown>);
   const messages: OpenAIMessage[] = [];
 
@@ -254,7 +295,7 @@ export function anthropicToOpenAIRequest(req: AnthropicRequest, model: string): 
       function: {
         name: t.name,
         ...(t.description ? { description: t.description } : {}),
-        parameters: t.input_schema,
+        parameters: normalizeToolSchema(t.input_schema, dialect),
       },
     }));
     const tc = anthropicToolChoiceToOpenAI(req.tool_choice);
@@ -277,9 +318,10 @@ export function mapOpenAIFinishReason(reason: string | undefined): IRStopReason 
     case "length":
       return "max_tokens";
     case "content_filter":
-      // No direct Anthropic stop_reason for a content filter; map to end_turn
-      // (closest forced-completion). Intentional CONFLATION — documented.
-      return "end_turn";
+      // Anthropic exposes a first-class `refusal` stop reason (2025/2026); map
+      // to it rather than conflating a filtered/refused response with a normal
+      // `end_turn`, so Claude Code can distinguish a refusal from a completion.
+      return "refusal";
     default:
       // A finish_reason the provider introduced that we don't yet map. Safe to
       // fall back to end_turn, but log it (undefined = normal completion).
@@ -290,26 +332,42 @@ export function mapOpenAIFinishReason(reason: string | undefined): IRStopReason 
   }
 }
 
-function openAIResponseToIr(res: OpenAIResponse): IRResponse {
+export function openAIResponseToIr(res: OpenAIResponse): IRResponse {
   const choice = res.choices?.[0];
   const message = choice?.message;
   const blocks: IRContentBlock[] = [];
 
+  // Reasoning -> thinking block, FIRST (R2 + R4 ordering: thinking -> text ->
+  // tool_use). `reasoning` (Bedrock Mantle) primary, `reasoning_content`
+  // (vLLM/DeepSeek-R1) fallback. Unsigned (OpenAI-origin) -> no signature.
+  const reasoning = message?.reasoning ?? message?.reasoning_content;
+  if (typeof reasoning === "string" && reasoning.length > 0) {
+    blocks.push({ type: "thinking", thinking: reasoning });
+  }
+
   if (typeof message?.content === "string" && message.content.length > 0) {
     blocks.push({ type: "text", text: message.content });
   }
+  // TC7: surface a structured refusal as visible text so the client sees WHY the
+  // model declined, rather than an empty/normal-looking turn. The stop reason is
+  // separately mapped to `refusal` via mapOpenAIFinishReason(content_filter).
+  if (typeof message?.refusal === "string" && message.refusal.length > 0) {
+    blocks.push({ type: "text", text: message.refusal });
+  }
   for (const call of message?.tool_calls ?? []) {
-    let input: unknown = {};
-    try {
-      input = call.function.arguments ? JSON.parse(call.function.arguments) : {};
-    } catch {
-      // Preserve the raw string if it is not valid JSON.
-      input = call.function.arguments;
-    }
-    blocks.push({ type: "tool_use", id: call.id, name: call.function.name, input });
+    // G10/SEC-10: tool_use.input MUST be a JSON object for the Anthropic client.
+    // Truncated or malformed arguments degrade to {} (never a raw string or a
+    // non-object), so a downstream consumer never has to defend against it.
+    blocks.push({
+      type: "tool_use",
+      id: call.id,
+      name: call.function.name,
+      input: coerceToolInput(call.function.arguments),
+    });
   }
 
   const usage = res.usage ?? {};
+  const cachedTokens = usage.prompt_tokens_details?.cached_tokens;
   return {
     role: "assistant",
     content: blocks,
@@ -317,6 +375,9 @@ function openAIResponseToIr(res: OpenAIResponse): IRResponse {
     usage: {
       inputTokens: usage.prompt_tokens ?? 0,
       outputTokens: usage.completion_tokens ?? 0,
+      // SR4: OpenAI-compat exposes cached prompt tokens (read hits) only; there
+      // is no cache-creation counter, so cacheWriteInputTokens stays unset.
+      ...(typeof cachedTokens === "number" ? { cacheReadInputTokens: cachedTokens } : {}),
     },
   };
 }
@@ -335,7 +396,11 @@ export async function handleMantleMessages(
   signal?: AbortSignal,
 ): Promise<Response> {
   const parsed = body as AnthropicRequest;
-  const openaiBody = anthropicToOpenAIRequest(parsed, route.invocationId);
+  const openaiBody = anthropicToOpenAIRequest(
+    parsed,
+    route.invocationId,
+    route.strictTools ? "openai-strict" : "openai",
+  );
   const headers = buildOpenAIHeaders(bearer);
   const opts = signal ? { signal } : {};
 
@@ -345,7 +410,13 @@ export async function handleMantleMessages(
       stream: true,
       stream_options: { include_usage: true },
     };
-    const upstream = await postJson(route.streamPath, headers, JSON.stringify(streamBody), opts);
+    const streamOpts = { ...opts, retryTransientStatus: false };
+    const upstream = await postJson(
+      route.streamPath,
+      headers,
+      JSON.stringify(streamBody),
+      streamOpts,
+    );
     await assertUpstreamOk(upstream, route, { requireBody: true });
     const body = upstream.body as ReadableStream<Uint8Array>;
     const sse = openAiStreamToAnthropicSse(body, parsed.model ?? route.invocationId);

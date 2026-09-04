@@ -15,6 +15,7 @@ import {
   type ProfilePreference,
   type ProxyConfig,
   type RegionKey,
+  assertSafeExternalOrigin,
   awsRegionForKey,
   hostForRegion,
 } from "../config.ts";
@@ -24,6 +25,59 @@ import { type Backend, isAnthropic } from "./canonical-id.ts";
 
 /** Timeout for a single discovery HTTP request (bounds startup/refresh hangs). */
 const DISCOVERY_TIMEOUT_MS = 15_000;
+
+/**
+ * PC9: ± jitter applied to each refresh period so multiple proxy instances (and
+ * successive refreshes) don't stampede every discovery source in a synchronized
+ * burst. A period of `base` becomes a uniform random in `[base·(1-r), base·(1+r)]`.
+ */
+const REFRESH_JITTER_RATIO = 0.15;
+
+/**
+ * PC9: per-source failure cooldown. A source that errors during discovery is
+ * skipped for a growing cooldown (base·2^consecutiveFailures, capped) before it
+ * is re-attempted, so a flapping/broken source is not re-hit at full cost every
+ * refresh cycle. Cleared on the first success.
+ */
+const SOURCE_COOLDOWN_BASE_MS = 60_000; // 1 min after the first failure
+const SOURCE_COOLDOWN_CAP_MS = 30 * 60_000; // capped at 30 min
+
+/** Compute a jittered interval in ms (PC9). Exported for deterministic testing. */
+export function jitteredInterval(baseMs: number, rand: () => number = Math.random): number {
+  const spread = baseMs * REFRESH_JITTER_RATIO;
+  return baseMs - spread + rand() * (2 * spread);
+}
+
+/**
+ * Tracks consecutive discovery failures per source and derives a cooldown
+ * window (PC9). `shouldSkip(source, now)` returns true while a failed source is
+ * still cooling down; `recordSuccess`/`recordFailure` update the state.
+ */
+export class SourceBackoff {
+  private readonly failures = new Map<string, { count: number; nextAttemptMs: number }>();
+
+  shouldSkip(source: string, nowMs: number = Date.now()): boolean {
+    const s = this.failures.get(source);
+    return s !== undefined && nowMs < s.nextAttemptMs;
+  }
+
+  recordSuccess(source: string): void {
+    this.failures.delete(source);
+  }
+
+  recordFailure(source: string, nowMs: number = Date.now()): void {
+    const prev = this.failures.get(source);
+    const count = (prev?.count ?? 0) + 1;
+    const cooldown = Math.min(SOURCE_COOLDOWN_BASE_MS * 2 ** (count - 1), SOURCE_COOLDOWN_CAP_MS);
+    this.failures.set(source, { count, nextAttemptMs: nowMs + cooldown });
+  }
+
+  /** The cooldown window (ms) a source with `count` consecutive failures gets. */
+  static cooldownMs(count: number): number {
+    if (count <= 0) return 0;
+    return Math.min(SOURCE_COOLDOWN_BASE_MS * 2 ** (count - 1), SOURCE_COOLDOWN_CAP_MS);
+  }
+}
 
 /**
  * Outcome of one discovery source — either a Bedrock region
@@ -229,7 +283,10 @@ export function buildRegionCatalog(
  * state of `"${VAR:-}"` defaults. A provider whose discovery fails gets an
  * `error` status; neither ever fails the caller (best-effort).
  */
-export async function discoverExternalCatalog(config: ProxyConfig): Promise<{
+export async function discoverExternalCatalog(
+  config: ProxyConfig,
+  backoff?: SourceBackoff,
+): Promise<{
   models: DiscoveredModel[];
   statuses: SourceStatus[];
 }> {
@@ -251,6 +308,16 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<{
         });
         return;
       }
+      // PC9: a source that keeps failing is put on a growing cooldown so we
+      // don't re-hit a broken/flapping endpoint at full cost every refresh.
+      if (backoff?.shouldSkip(providerKey)) {
+        statuses.push({
+          source: providerKey,
+          state: "skipped",
+          detail: "cooling down after a recent discovery failure (PC9 backoff)",
+        });
+        return;
+      }
       // The modelsUrl is an OpenAI-style /models endpoint, which by convention
       // authenticates with a bearer token — even for providers whose message
       // path uses x-api-key (e.g. Alibaba's compatible-mode /models rejects
@@ -260,6 +327,10 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<{
         authorization: `Bearer ${provider.credential}`,
       };
       try {
+        // SEC-9: block a credentialed discovery fetch to an internal/metadata
+        // host (the modelsUrl is operator-configured and may differ from the
+        // message-path origin, so it is guarded independently).
+        assertSafeExternalOrigin(provider.modelsUrl);
         const res = await fetch(provider.modelsUrl, {
           headers,
           signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
@@ -269,6 +340,7 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<{
             provider: providerKey,
             status: res.status,
           });
+          backoff?.recordFailure(providerKey);
           statuses.push({
             source: providerKey,
             state: "error",
@@ -295,6 +367,7 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<{
             streaming: true,
           });
         }
+        backoff?.recordSuccess(providerKey);
         statuses.push({ source: providerKey, state: "ok" });
       } catch (err) {
         // A provider dropping out of discovery is a capability-loss event
@@ -303,6 +376,7 @@ export async function discoverExternalCatalog(config: ProxyConfig): Promise<{
           provider: providerKey,
           message: errorMessage(err),
         });
+        backoff?.recordFailure(providerKey);
         statuses.push({
           source: providerKey,
           state: "error",
@@ -393,6 +467,7 @@ export function resolveInvocationId(model: DiscoveredModel, preference: ProfileP
 export async function discoverCatalog(
   config: ProxyConfig,
   client: DiscoveryClient | null,
+  backoff?: SourceBackoff,
 ): Promise<Catalog> {
   const sources: SourceStatus[] = [];
   const all: DiscoveredModel[] = [];
@@ -439,7 +514,7 @@ export async function discoverCatalog(
 
   // Discover external (non-Bedrock) provider models at runtime from each
   // provider's configured discovery endpoint (DESIGN §7 — no hardcoded ids).
-  const external = await discoverExternalCatalog(config);
+  const external = await discoverExternalCatalog(config, backoff);
   all.push(...external.models);
   sources.push(...external.statuses);
   return new Catalog(all, sources);
@@ -451,11 +526,13 @@ export async function discoverCatalog(
  */
 export class CatalogManager {
   private catalog: Catalog;
-  private timer: ReturnType<typeof setInterval> | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
   /** In-flight refresh, if any (single-flight guard). */
   private refreshing: Promise<void> | undefined;
   /** Set by stop(); a late-resolving refresh must not write into a dead manager. */
   private stopped = false;
+  /** PC9: per-source discovery cooldown state, persistent across refreshes. */
+  private readonly backoff = new SourceBackoff();
 
   private constructor(
     initial: Catalog,
@@ -482,10 +559,17 @@ export class CatalogManager {
   }
 
   private scheduleRefresh(): void {
-    const ms = this.config.refreshIntervalMinutes * 60_000;
-    this.timer = setInterval(() => {
-      void this.refresh();
-    }, ms);
+    // PC9: jittered self-rescheduling timer (not a fixed setInterval) so
+    // multiple proxy instances — and successive refreshes — do not fire in a
+    // synchronized burst against every discovery source at once. Each period is
+    // the configured interval ± REFRESH_JITTER_RATIO.
+    const baseMs = this.config.refreshIntervalMinutes * 60_000;
+    const next = jitteredInterval(baseMs);
+    this.timer = setTimeout(() => {
+      void this.refresh().finally(() => {
+        if (!this.stopped) this.scheduleRefresh();
+      });
+    }, next);
     // Do not keep the process alive solely for refresh.
     if (typeof this.timer === "object" && this.timer && "unref" in this.timer) {
       (this.timer as { unref: () => void }).unref();
@@ -503,7 +587,7 @@ export class CatalogManager {
     if (this.refreshing) return this.refreshing;
     this.refreshing = (async () => {
       try {
-        const next = await discoverCatalog(this.config, this.client);
+        const next = await discoverCatalog(this.config, this.client, this.backoff);
         if (!this.stopped) this.catalog = next;
       } catch (err) {
         // Refresh failure is a staleness/capability risk (catalog stops
@@ -521,7 +605,7 @@ export class CatalogManager {
 
   stop(): void {
     this.stopped = true;
-    if (this.timer) clearInterval(this.timer);
+    if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
   }
 }

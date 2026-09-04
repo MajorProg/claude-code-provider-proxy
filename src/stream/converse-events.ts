@@ -1,3 +1,4 @@
+import { readWithIdleTimeout } from "../http/upstream.ts";
 import { logger } from "../logging/logger.ts";
 /**
  * Bedrock ConverseStream -> Anthropic SSE bridge (DESIGN §6.4), Path C streaming.
@@ -20,6 +21,7 @@ import { logger } from "../logging/logger.ts";
  * synthetic pings during silent gaps.
  */
 import { mapConverseStopReason } from "../paths/converse.ts";
+import { estimateTokensFromChars } from "../paths/relay.ts";
 import { AnthropicSseEmitter } from "./anthropic-sse.ts";
 
 /** A decoded eventstream frame: its `:event-type` and parsed JSON payload. */
@@ -103,17 +105,52 @@ export class EventStreamDecoder {
       ho += nameLen;
       const valueType = buf[ho] as number;
       ho += 1;
-      // Header value types: 7 = string (2-byte length prefix). Others are rare
-      // in Converse event headers; handle string, skip minimally otherwise.
-      if (valueType === 7) {
-        const vlen = dv.getUint16(ho);
-        ho += 2;
-        const value = textDecoder.decode(buf.subarray(ho, ho + vlen));
-        ho += vlen;
-        if (name === ":event-type") return value;
-      } else {
-        // Unknown/unsupported header value type — cannot safely continue.
-        break;
+      // `vnd.amazon.eventstream` header value types. Headers appear in an
+      // arbitrary order and non-string types (timestamp/byte/bool/…) can precede
+      // `:event-type`, so we must advance past EVERY value type by its correct
+      // length — aborting on the first non-string header silently drops the
+      // whole frame (which could be a real contentBlockDelta / messageStop).
+      switch (valueType) {
+        case 0: // bool true  — 0-byte value
+        case 1: // bool false — 0-byte value
+          break;
+        case 2: // byte
+          ho += 1;
+          break;
+        case 3: // short
+          ho += 2;
+          break;
+        case 4: // integer
+          ho += 4;
+          break;
+        case 5: // long
+          ho += 8;
+          break;
+        case 6: {
+          // byte array — 2-byte length prefix + N bytes
+          const blen = dv.getUint16(ho);
+          ho += 2 + blen;
+          break;
+        }
+        case 7: {
+          // string — 2-byte length prefix + N bytes
+          const vlen = dv.getUint16(ho);
+          ho += 2;
+          const value = textDecoder.decode(buf.subarray(ho, ho + vlen));
+          ho += vlen;
+          if (name === ":event-type") return value;
+          break;
+        }
+        case 8: // timestamp — 8-byte epoch millis
+          ho += 8;
+          break;
+        case 9: // UUID — 16 bytes
+          ho += 16;
+          break;
+        default:
+          // Genuinely unknown value type: we cannot know its length, so we can
+          // no longer safely advance. Stop scanning this frame's headers.
+          return undefined;
       }
     }
     return undefined;
@@ -126,7 +163,13 @@ export class EventStreamDecoder {
 
 interface ContentBlockDelta {
   contentBlockIndex?: number;
-  delta?: { text?: string; toolUse?: { input?: string } };
+  delta?: {
+    text?: string;
+    toolUse?: { input?: string };
+    // C1: Converse streams Claude reasoning as reasoningContent deltas — a text
+    // fragment, then a trailing signature fragment.
+    reasoningContent?: { text?: string; signature?: string };
+  };
 }
 interface ContentBlockStart {
   contentBlockIndex?: number;
@@ -145,6 +188,7 @@ export function converseStreamToAnthropicSse(
   upstreamBody: ReadableStream<Uint8Array>,
   model: string,
   inputTokensSeed = 0,
+  requestStopSequences?: readonly string[],
 ): ReadableStream<Uint8Array> {
   const emitter = new AnthropicSseEmitter();
   const decoder = new EventStreamDecoder();
@@ -153,6 +197,11 @@ export function converseStreamToAnthropicSse(
   const blockIndexMap = new Map<number, number>();
   let outputTokens = 0;
   let inputTokens = inputTokensSeed;
+  // PC7: accumulate emitted output characters for a token estimate fallback if
+  // the Converse metadata usage frame never arrives.
+  let outputChars = 0;
+  let cacheReadTokens: number | undefined;
+  let cacheWriteTokens: number | undefined;
   let stopReason: ReturnType<typeof mapConverseStopReason> = "end_turn";
   let started = false;
 
@@ -171,15 +220,40 @@ export function converseStreamToAnthropicSse(
     });
     try {
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await readWithIdleTimeout(reader);
         if (done) break;
         if (!value) continue;
         for (const frame of decoder.push(value)) {
           handleFrame(frame);
+          // SR3: keep the emitter's best-effort cumulative usage current.
+          const runningOutput =
+            outputTokens > 0 ? outputTokens : estimateTokensFromChars(outputChars);
+          emitter.updateUsage(runningOutput, inputTokens > 0 ? inputTokens : undefined, {
+            ...(cacheReadTokens !== undefined ? { cacheReadInputTokens: cacheReadTokens } : {}),
+            ...(cacheWriteTokens !== undefined ? { cacheWriteInputTokens: cacheWriteTokens } : {}),
+          });
         }
       }
       ensureStarted();
-      emitter.finish(stopReason, { outputTokens, inputTokens });
+      const finalOutputTokens =
+        outputTokens > 0 ? outputTokens : estimateTokensFromChars(outputChars);
+      // SR9: Converse's messageStop reports stopReason only, not the matched
+      // sequence (verified live). Surface it only when unambiguous — a single
+      // configured stop sequence + stopReason "stop_sequence".
+      const matchedStopSequence =
+        stopReason === "stop_sequence" && requestStopSequences?.length === 1
+          ? requestStopSequences[0]
+          : undefined;
+      emitter.finish(
+        stopReason,
+        {
+          outputTokens: finalOutputTokens,
+          inputTokens,
+          ...(cacheReadTokens !== undefined ? { cacheReadInputTokens: cacheReadTokens } : {}),
+          ...(cacheWriteTokens !== undefined ? { cacheWriteInputTokens: cacheWriteTokens } : {}),
+        },
+        matchedStopSequence,
+      );
     } catch (err) {
       ensureStarted();
       await reader.cancel(err).catch(() => {});
@@ -214,7 +288,24 @@ export function converseStreamToAnthropicSse(
         ensureStarted();
         const p = frame.payload as ContentBlockDelta;
         const cbi = p.contentBlockIndex ?? 0;
-        if (p.delta?.text !== undefined) {
+        if (p.delta?.reasoningContent !== undefined) {
+          // C1: Converse reasoning delta -> Anthropic thinking block. Open a
+          // thinking block lazily for this converse index; append the text
+          // fragment and preserve the REAL signature verbatim when it arrives.
+          let idx = blockIndexMap.get(cbi);
+          if (idx === undefined) {
+            idx = emitter.startThinkingBlock();
+            blockIndexMap.set(cbi, idx);
+          }
+          const rc = p.delta.reasoningContent;
+          if (typeof rc.text === "string" && rc.text.length > 0) {
+            emitter.appendThinking(idx, rc.text);
+            outputChars += rc.text.length;
+          }
+          if (typeof rc.signature === "string" && rc.signature.length > 0) {
+            emitter.appendSignature(idx, rc.signature);
+          }
+        } else if (p.delta?.text !== undefined) {
           // Open a text block lazily if none exists for this converse index.
           let idx = blockIndexMap.get(cbi);
           if (idx === undefined) {
@@ -222,9 +313,11 @@ export function converseStreamToAnthropicSse(
             blockIndexMap.set(cbi, idx);
           }
           emitter.appendText(idx, p.delta.text);
+          outputChars += p.delta.text.length;
         } else if (p.delta?.toolUse?.input !== undefined) {
           const idx = blockIndexMap.get(cbi);
           if (idx !== undefined) emitter.appendToolInputJson(idx, p.delta.toolUse.input);
+          outputChars += p.delta.toolUse.input.length;
         }
         break;
       }
@@ -244,9 +337,22 @@ export function converseStreamToAnthropicSse(
         break;
       }
       case "metadata": {
-        const p = frame.payload as { usage?: { inputTokens?: number; outputTokens?: number } };
+        const p = frame.payload as {
+          usage?: {
+            inputTokens?: number;
+            outputTokens?: number;
+            cacheReadInputTokens?: number;
+            cacheWriteInputTokens?: number;
+          };
+        };
         if (typeof p.usage?.outputTokens === "number") outputTokens = p.usage.outputTokens;
         if (typeof p.usage?.inputTokens === "number") inputTokens = p.usage.inputTokens;
+        if (typeof p.usage?.cacheReadInputTokens === "number") {
+          cacheReadTokens = p.usage.cacheReadInputTokens;
+        }
+        if (typeof p.usage?.cacheWriteInputTokens === "number") {
+          cacheWriteTokens = p.usage.cacheWriteInputTokens;
+        }
         break;
       }
       default:

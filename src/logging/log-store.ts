@@ -108,6 +108,12 @@ export class LogStore {
   private readonly enabled: boolean;
   private readonly systemPath: string;
   private readonly sessionPath: string;
+  /**
+   * PC8 backstop (ms) on the streaming log-capture branch, from LoggingConfig.
+   * The log branch is a follower (cancelled when the client branch ends); this
+   * only caps a hung upstream whose client branch never ends.
+   */
+  readonly captureTimeoutMs: number;
   /** In-memory per-session sequence counters for stable turn ordering. */
   private readonly seq = new Map<string, number>();
   /** Per-system-prompt-hash write mutex: serializes read-modify-write of the
@@ -124,6 +130,7 @@ export class LogStore {
     this.enabled = config.enabled;
     this.systemPath = join(config.dir, config.systemDir);
     this.sessionPath = join(config.dir, config.sessionDir);
+    this.captureTimeoutMs = config.captureTimeoutMs;
   }
 
   isEnabled(): boolean {

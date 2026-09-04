@@ -44,7 +44,7 @@ describe("anthropicToConverseRequest", () => {
       ],
       messages: [{ role: "user", content: "x" }],
     } as never);
-    expect(body.system).toEqual([{ text: "ab" }]);
+    expect(body.system).toEqual([{ text: "a\n\nb" }]);
   });
 
   test("empty/absent system and empty inferenceConfig are omitted", () => {
@@ -282,6 +282,27 @@ describe("anthropicToOpenAIRequest", () => {
     expect(toolMsg).toEqual({ role: "tool", tool_call_id: "tc1", content: "42" });
   });
 
+  test("TC8: assistant tool_use with NO text sets content:null explicitly", () => {
+    const body = anthropicToOpenAIRequest(
+      {
+        model: "m",
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "tc1", name: "calc", input: { a: 1 } }],
+          },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "tc1", content: "42" }] },
+        ],
+      } as never,
+      "m",
+    );
+    const assistant = body.messages.find((m) => m.role === "assistant");
+    expect(assistant?.tool_calls).toHaveLength(1);
+    // content is present and explicitly null (not undefined/omitted, not "").
+    expect(assistant && "content" in assistant).toBe(true);
+    expect(assistant?.content).toBeNull();
+  });
+
   test("a message with only tool_result yields just the tool message", () => {
     const body = anthropicToOpenAIRequest(
       {
@@ -330,8 +351,8 @@ describe("anthropicToOpenAIRequest", () => {
       } as never,
       "m",
     );
-    // Mixed blocks: text concatenated, non-text contributes "".
-    expect(withText.messages[0]).toEqual({ role: "system", content: "xy" });
+    // TC5: text blocks join with \n\n; the non-text (image) block is dropped.
+    expect(withText.messages[0]).toEqual({ role: "system", content: "x\n\ny" });
 
     const emptySys = anthropicToOpenAIRequest(
       {
@@ -466,5 +487,90 @@ describe("anthropicToOpenAIRequest", () => {
     const user = body.messages.find((m) => m.role === "user");
     // Single non-empty text collapses to a plain string "kept".
     expect(user?.content).toBe("kept");
+  });
+});
+
+/* ------------------------------------------------------------- TC6 images --- */
+
+describe("TC6 image source handling", () => {
+  const base64Block = {
+    type: "image",
+    source: { type: "base64", media_type: "image/jpeg", data: "QUJD" },
+  };
+  const urlBlock = { type: "image", source: { type: "url", url: "https://x/img.png" } };
+
+  test("Converse: base64 image maps to image.source.bytes with the format", () => {
+    const body = anthropicToConverseRequest({
+      model: "m",
+      max_tokens: 8,
+      messages: [{ role: "user", content: [base64Block] }],
+    } as never);
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>;
+    const img = content.find((c) => "image" in c)?.image as Record<string, unknown>;
+    expect(img.format).toBe("jpeg");
+    expect((img.source as Record<string, unknown>).bytes).toBe("QUJD");
+  });
+
+  test("Converse: url image degrades to a placeholder text block (bytes-only backend)", () => {
+    const body = anthropicToConverseRequest({
+      model: "m",
+      max_tokens: 8,
+      messages: [{ role: "user", content: [urlBlock] }],
+    } as never);
+    const content = body.messages[0]?.content as Array<Record<string, unknown>>;
+    expect(
+      content.some((c) => typeof c.text === "string" && c.text.includes("image url omitted")),
+    ).toBe(true);
+    expect(content.some((c) => "image" in c)).toBe(false);
+  });
+
+  test("OpenAI: base64 image maps to a data: URI image_url", () => {
+    const body = anthropicToOpenAIRequest(
+      { model: "m", max_tokens: 8, messages: [{ role: "user", content: [base64Block] }] } as never,
+      "m",
+    );
+    const parts = body.messages[0]?.content as Array<Record<string, unknown>>;
+    const img = parts.find((p) => p.type === "image_url")?.image_url as { url: string };
+    expect(img.url).toBe("data:image/jpeg;base64,QUJD");
+  });
+
+  test("OpenAI: url image passes the URL straight through to image_url", () => {
+    const body = anthropicToOpenAIRequest(
+      { model: "m", max_tokens: 8, messages: [{ role: "user", content: [urlBlock] }] } as never,
+      "m",
+    );
+    const parts = body.messages[0]?.content as Array<Record<string, unknown>>;
+    const img = parts.find((p) => p.type === "image_url")?.image_url as { url: string };
+    expect(img.url).toBe("https://x/img.png");
+  });
+});
+
+describe("G3 tool-call id sanitization (request side)", () => {
+  test("tool_use id and matching tool_result id sanitize to the same valid id", () => {
+    const dirty = "toolu:01/A#b";
+    const body = anthropicToOpenAIRequest(
+      {
+        model: "m",
+        max_tokens: 8,
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: dirty, name: "t", input: {} }] },
+          {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: dirty, content: "ok" }],
+          },
+        ],
+      } as never,
+      "m",
+    );
+    // Find the assistant tool_call id and the tool message tool_call_id.
+    const asst = body.messages.find((m) => m.role === "assistant") as {
+      tool_calls?: Array<{ id: string }>;
+    };
+    const toolMsg = body.messages.find((m) => m.role === "tool") as { tool_call_id?: string };
+    const callId = asst.tool_calls?.[0]?.id;
+    expect(callId).toBe("toolu_01_A_b");
+    expect(callId ?? "").not.toMatch(/[^a-zA-Z0-9_-]/); // fully valid
+    // Crucially, both sides sanitized to the SAME id so the pairing survives.
+    expect(toolMsg.tool_call_id).toBe("toolu_01_A_b");
   });
 });

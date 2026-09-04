@@ -24,6 +24,7 @@ import { authenticateInbound } from "./auth/inbound.ts";
 import { BEDROCK_DEV_SENTINELS } from "./auth/token-provider.ts";
 import {
   type ProxyConfig,
+  externalProviderOrigin,
   loadConfig,
   saveConfig,
   serializeConfig,
@@ -40,6 +41,7 @@ import { renderChatPageHtml } from "./http/chat-page.ts";
 import { renderConfigPageHtml } from "./http/config-page.ts";
 import { renderLogViewerHtml } from "./http/log-viewer-page.ts";
 import { buildRegistrySnapshot, renderRegistryHtml } from "./http/registry-page.ts";
+import { preconnectOrigin } from "./http/upstream.ts";
 import { ZipLimitError, buildZip } from "./http/zip.ts";
 import { type CaptureContext, captureTurn, summarizeTools } from "./logging/capture.ts";
 import { LogStore } from "./logging/log-store.ts";
@@ -54,7 +56,12 @@ import {
 import { handleConverseMessages } from "./paths/converse.ts";
 import { handleMantleMessages } from "./paths/mantle.ts";
 import { handlePassthroughCountTokens, handlePassthroughMessages } from "./paths/passthrough.ts";
-import { type JsonObject, parseJsonObject } from "./paths/relay.ts";
+import {
+  type JsonObject,
+  assertInboundLimits,
+  parseJsonObject,
+  readBodyWithLimit,
+} from "./paths/relay.ts";
 import { route } from "./router.ts";
 
 const CONFIG_PATH = Bun.env.CONFIG_PATH ?? "config.local.jsonc";
@@ -107,7 +114,7 @@ function isClientDisconnect(err: unknown): boolean {
   );
 }
 
-function errorResponse(
+export function errorResponse(
   err: unknown,
   ctx?: { requestId?: string; method?: string; path?: string },
 ): Response {
@@ -154,15 +161,29 @@ function errorResponse(
     return Response.json(err.toAnthropicBody(), { status: err.status });
   }
   // Unexpected (non-ProxyError) errors — log at error with the full stack.
+  // SEC-7: never surface raw `err.message` to the client (it can leak internal
+  // paths, dependency names, or config detail). Emit a stable correlation id
+  // that appears in BOTH the log line and the client body, so an operator can
+  // find the full detail in logs without the client ever seeing it.
+  const errorId = crypto.randomUUID();
   logger.error("unhandled request error", {
     requestId: ctx?.requestId,
+    errorId,
     method: ctx?.method,
     path: ctx?.path,
     message: errorMessage(err),
   });
-  console.error(err); // full stack/cause for diagnosis
-  const message = err instanceof Error ? err.message : "Internal error";
-  return Response.json({ type: "error", error: { type: "api_error", message } }, { status: 500 });
+  console.error(errorId, err); // full stack/cause for diagnosis (server-side only)
+  return Response.json(
+    {
+      type: "error",
+      error: {
+        type: "api_error",
+        message: `Internal server error (reference: ${errorId})`,
+      },
+    },
+    { status: 500 },
+  );
 }
 
 /**
@@ -354,7 +375,8 @@ async function dispatchMessages(
   const requestedAt = new Date().toISOString();
   // Parse the inbound body ONCE here; thread the parsed object through
   // inference and capture (no re-parse in extractModel/safeParse/the handler).
-  const parsed = parseJsonObject(await req.text());
+  const parsed = parseJsonObject(await readBodyWithLimit(req));
+  assertInboundLimits(parsed, config.limits);
   const { response, canonicalId, target } = await runInference(
     config,
     catalog,
@@ -407,7 +429,7 @@ async function dispatchChat(
   const requestedAt = new Date().toISOString();
   // Parse at the trust boundary (uniform with dispatchMessages/CountTokens):
   // rejects non-object bodies with a clean 400 rather than a downstream cast.
-  const raw = parseJsonObject(await req.text(), "Chat body") as {
+  const raw = parseJsonObject(await readBodyWithLimit(req), "Chat body") as {
     model?: string;
     system?: unknown;
     messages?: unknown;
@@ -563,7 +585,8 @@ async function dispatchCountTokens(
   req: Request,
 ): Promise<Response> {
   authenticateInbound(req.headers, config.inboundAuth.keys);
-  const parsed = parseJsonObject(await req.text());
+  const parsed = parseJsonObject(await readBodyWithLimit(req));
+  assertInboundLimits(parsed, config.limits);
   const canonicalId = parseCanonicalId(modelFromBody(parsed));
   const target = route(config, catalog, canonicalId);
 
@@ -788,7 +811,7 @@ function handleConfigStatus({ config, catalogManager }: RouteContext): Response 
   // Join the catalog's per-source discovery outcomes so the status view shows
   // WHY a region/provider has no models (disabled / error / skipped), not just
   // that it doesn't.
-  const sources = new Map(cat.sources.map((s) => [s.source, s]));
+  const sources = new Map((cat.sources ?? []).map((s) => [s.source, s]));
   const bedrockMode = resolveBedrockMode(config.providers.bedrock?.credential);
   const regions = config.regions.map((r) => {
     const models = cat.models.filter((m) => m.provider === "bedrock" && m.regionKey === r.key);
@@ -847,6 +870,32 @@ async function handleConfigSave({ req, reloadRuntime }: RouteContext): Promise<R
  * the page route would lock out the operator, including over a Docker LAN).
  * The inference endpoints self-authenticate inside their dispatchers.
  */
+/**
+ * PC5: pre-connect the message-path upstream origins so the first real request
+ * finds a warm socket (Bun keep-alive then reuses it). Best-effort and cheap —
+ * `preconnectOrigin` swallows all failures. Warms the Bedrock runtime hosts
+ * (converse + mantle) for the primary region when Bedrock is enabled, plus each
+ * configured external provider origin (through the SSRF-guarded resolver, which
+ * refuses internal/metadata hosts). A malformed origin is skipped silently.
+ */
+function warmUpstreamConnections(config: ProxyConfig): void {
+  const bedrock = config.providers.bedrock;
+  if (bedrock && resolveBedrockMode(bedrock.credential).enabled) {
+    const awsRegion = config.regions.find((r) => r.key === config.primaryRegion)?.awsRegion;
+    if (awsRegion) {
+      preconnectOrigin(`https://${bedrock.hosts.converse.replace("{region}", awsRegion)}`);
+      preconnectOrigin(`https://${bedrock.hosts.mantle.replace("{region}", awsRegion)}`);
+    }
+  }
+  for (const provider of Object.values(config.providers.external)) {
+    try {
+      preconnectOrigin(externalProviderOrigin(provider));
+    } catch {
+      // externalProviderOrigin throws for blocked/invalid hosts — skip warming.
+    }
+  }
+}
+
 const ROUTES: Route[] = [
   // Connection-warming probe (DESIGN §9.4).
   {
@@ -854,7 +903,13 @@ const ROUTES: Route[] = [
     name: "hello",
     match: exact("/api/hello"),
     requiresAuth: false,
-    handler: () => new Response(null, { status: 204 }),
+    handler: ({ config }) => {
+      // PC5: also warm the proxy->upstream legs (not just the client->proxy
+      // one), so the first real message-path request finds a warm TCP/TLS
+      // socket. Best-effort; never blocks or fails the probe.
+      warmUpstreamConnections(config);
+      return new Response(null, { status: 204 });
+    },
   },
   // Public registry / discovery surface.
   {

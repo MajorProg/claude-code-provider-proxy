@@ -31,6 +31,7 @@ function store(): LogStore {
     dir: root,
     systemDir: "system",
     sessionDir: "sessions",
+    captureTimeoutMs: 120000,
   });
 }
 

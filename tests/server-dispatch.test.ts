@@ -11,7 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import { type ProxyConfig, validateConfig } from "../src/config.ts";
 import { Catalog, type DiscoveredModel } from "../src/model/catalog.ts";
-import { type Runtime, createFetchHandler } from "../src/server.ts";
+import { type Runtime, createFetchHandler, errorResponse } from "../src/server.ts";
 import { installFetchMock, readFixtureText } from "./helpers/fetch-mock.ts";
 
 const KEY = "ccpp-dispatch-key";
@@ -108,6 +108,27 @@ describe("POST /v1/messages end-to-end (Converse via fixture)", () => {
     }
   });
 
+  test("SEC-1: an oversized inbound body is rejected with 413 (before parse)", async () => {
+    const req = new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${KEY}`,
+        "content-type": "application/json",
+        "content-length": String(50 * 1024 * 1024), // 50 MiB > 25 MiB cap
+      },
+      body: JSON.stringify({
+        model: CID,
+        max_tokens: 8,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    const res = await handler()(req);
+    expect(res.status).toBe(413);
+    const json = (await res.json()) as { type: string; error?: { type: string } };
+    expect(json.type).toBe("error");
+    expect(json.error?.type).toBe("invalid_request_error");
+  });
+
   test("missing inbound key -> 401 (no upstream call)", async () => {
     const mock = installFetchMock({ text: "{}" });
     try {
@@ -181,5 +202,30 @@ describe("GET /v1/models", () => {
     const json = (await res.json()) as { data?: Array<{ id: string }> };
     const ids = (json.data ?? []).map((m) => m.id);
     expect(ids.some((id) => id.includes("nova-lite"))).toBe(true);
+  });
+});
+
+describe("errorResponse SEC-7 (generic message + stable id for unexpected errors)", () => {
+  test("does NOT leak a raw Error.message for a non-ProxyError; returns a reference id", async () => {
+    const secret = "connect ECONNREFUSED 10.0.0.5:5432 (internal db)";
+    const res = errorResponse(new Error(secret));
+    expect(res.status).toBe(500);
+    const json = (await res.json()) as { type: string; error: { type: string; message: string } };
+    expect(json.type).toBe("error");
+    expect(json.error.type).toBe("api_error");
+    // The internal detail must NOT appear in the client body.
+    expect(json.error.message).not.toContain(secret);
+    expect(json.error.message).not.toContain("ECONNREFUSED");
+    expect(json.error.message).not.toContain("10.0.0.5");
+    // A stable correlation id IS present so the operator can find it in logs.
+    expect(json.error.message).toMatch(/reference: [0-9a-f-]{36}/);
+  });
+
+  test("still surfaces a ProxyError's own (safe) message", async () => {
+    const { BadRequestError } = await import("../src/errors.ts");
+    const res = errorResponse(new BadRequestError("messages must be an array"));
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: { message: string } };
+    expect(json.error.message).toBe("messages must be an array");
   });
 });

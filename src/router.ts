@@ -41,6 +41,8 @@ export interface RouteTarget {
   readonly invocationId: string;
   /** True when this model is Claude / native-Anthropic. */
   readonly isAnthropic: boolean;
+  /** OpenAI strict function-calling opt-in (TC3); only set for external openai providers. */
+  readonly strictTools?: boolean;
 }
 
 /** Map a region-family profilePrefix to a catalog RegionKey. */
@@ -107,6 +109,7 @@ function routeExternal(config: ProxyConfig, id: CanonicalId): RouteTarget {
     path: `${origin}/chat/completions`,
     invocationId: id.nativeModelId,
     isAnthropic: false,
+    ...(provider.strictTools ? { strictTools: true } : {}),
   });
 }
 

@@ -26,6 +26,7 @@ function stubStore(enabled = true): { store: LogStore; rec: Recorded } {
   const rec: Recorded = { turns: [], systemHashes: 0 };
   const store = {
     isEnabled: () => enabled,
+    captureTimeoutMs: 120_000,
     recordSystemPrompt: async (_system: unknown) => {
       rec.systemHashes++;
       return "hash";
@@ -77,6 +78,36 @@ describe("captureTurn (streaming)", () => {
     expect(Array.isArray(turn?.responseContent)).toBe(true);
     // Usage was extracted from the SSE stream.
     expect(typeof turn?.usage.inputTokens).toBe("number");
+  });
+
+  test("PC8: cancelling the client branch stops the log branch promptly (no inbound signal)", async () => {
+    const { store, rec } = stubStore();
+    // A stream that emits one chunk then stalls forever (upstream never closes).
+    const stalling = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: message_start\ndata: {}\n\n"));
+        // never close / never enqueue again
+      },
+    });
+    const resp = new Response(stalling, {
+      headers: { "content-type": "text/event-stream; charset=utf-8" },
+    });
+    // No inbound signal — the ONLY thing that can stop the log branch here is
+    // the client-branch-ended follower wiring (PC8).
+    const out = captureTurn(store, ctx(), resp);
+    // Read one chunk from the client branch, then cancel it (client disconnect).
+    const reader = out.body?.getReader();
+    await reader?.read();
+    await reader?.cancel(new Error("client hung up"));
+
+    // The log-branch pump must complete promptly (records a partial turn OR
+    // bails) rather than hanging forever on the stalled upstream.
+    const start = Date.now();
+    while (rec.turns.length === 0 && Date.now() - start < 1000) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(rec.turns).toHaveLength(1); // partial turn recorded after follower cancel
   });
 
   test("no-op when the store is disabled (returns the same response object)", async () => {

@@ -117,14 +117,33 @@ function novaConverseModel(): string {
   return m.nativeModelId;
 }
 function mantleToolModel(): string {
+  // Prefer a NON-thinking, tool-capable chat model: thinking models (kimi,
+  // minimax, deepseek-*-thinking) can spend the entire max_tokens budget on the
+  // reasoning block and hit stop_reason=max_tokens BEFORE emitting the tool
+  // call, which is a model-behavior artifact, not a translation defect. gpt-oss
+  // / qwen / glm emit the tool_call promptly and deterministically.
+  const TOOL_CHAT = /gpt-oss|qwen|glm/i;
+  const THINKING = /kimi|minimax|thinking/i;
+  const VISION_OR_EMBED = /vision|voxtral|gemma|embed|palmyra/i;
   const m = catalog.models.find(
     (x) =>
       x.backend === "mantle" &&
       !x.isAnthropic &&
-      /glm|qwen|gpt-oss|deepseek|kimi/i.test(x.nativeModelId),
+      TOOL_CHAT.test(x.nativeModelId) &&
+      !THINKING.test(x.nativeModelId) &&
+      !VISION_OR_EMBED.test(x.nativeModelId),
   );
   return (
-    (m ?? catalog.models.find((x) => x.backend === "mantle" && !x.isAnthropic))?.nativeModelId ?? ""
+    (
+      m ??
+      catalog.models.find(
+        (x) =>
+          x.backend === "mantle" &&
+          !x.isAnthropic &&
+          !THINKING.test(x.nativeModelId) &&
+          !VISION_OR_EMBED.test(x.nativeModelId),
+      )
+    )?.nativeModelId ?? ""
   );
 }
 

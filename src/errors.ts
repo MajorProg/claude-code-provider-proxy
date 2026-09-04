@@ -62,6 +62,13 @@ export class BadRequestError extends ProxyError {
   }
 }
 
+/** 413 — inbound request body exceeds the configured size limit (SEC-1). */
+export class PayloadTooLargeError extends ProxyError {
+  constructor(message: string) {
+    super(413, "invalid_request_error", message);
+  }
+}
+
 /** 404 — model not present in the discovered catalog for the target region. */
 export class ModelNotFoundError extends ProxyError {
   constructor(message: string) {

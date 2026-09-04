@@ -13,6 +13,7 @@
 import { BadRequestError } from "../errors.ts";
 import { type HeaderReader, buildAnthropicHeaders, postJson } from "../http/upstream.ts";
 import type { RouteTarget } from "../router.ts";
+import { keepAliveTee } from "../stream/keepalive-tee.ts";
 import {
   type JsonObject,
   PASSTHROUGH_RELAY_HEADERS,
@@ -104,9 +105,27 @@ function stripUnsupportedFields(body: Record<string, unknown>): Record<string, u
 /**
  * Rewrite the `model` field and strip request fields the passthrough targets
  * reject (see `stripUnsupportedFields`).
+ *
+ * PC6: this is a near-verbatim path, so avoid redundant O(body) copies. We clone
+ * the caller's body AT MOST ONCE: `stripUnsupportedFields` already returns a
+ * fresh object only when it actually dropped a field (otherwise the original),
+ * so — to always set `model` without mutating the shared `parsed` body the
+ * logging tee reads (TC9) — we mutate the stripped object in place only when it
+ * is a fresh clone, and otherwise make the single shallow clone here.
  */
-function withModel(body: Record<string, unknown>, invocationId: string): Record<string, unknown> {
-  return { ...stripUnsupportedFields(body), model: invocationId };
+export function withModel(
+  body: Record<string, unknown>,
+  invocationId: string,
+): Record<string, unknown> {
+  const stripped = stripUnsupportedFields(body);
+  if (stripped !== body) {
+    // `stripped` is already a fresh, non-shared clone — safe to mutate in place.
+    stripped.model = invocationId;
+    return stripped;
+  }
+  // Nothing was stripped; make exactly one shallow clone to set `model` without
+  // touching the shared caller body.
+  return { ...body, model: invocationId };
 }
 
 /**
@@ -131,14 +150,27 @@ export async function handlePassthroughMessages(
   const headers = buildAnthropicHeaders(inbound, bearer, authStyle);
   const url = streaming ? route.streamPath : route.path;
 
-  const upstream = await postJson(url, headers, outboundBody, signal ? { signal } : {});
+  // PC2: never replay a streaming request body on a transient status (the
+  // upstream may already be generating); non-streaming keeps default retries.
+  const opts = {
+    ...(signal ? { signal } : {}),
+    ...(streaming ? { retryTransientStatus: false } : {}),
+  };
+  const upstream = await postJson(url, headers, outboundBody, opts);
 
   // Relay upstream errors with their body preserved (DESIGN §9.1).
   await assertUpstreamOk(upstream, route);
 
   // Relay response — including SSE — with upstream content-type + cache-control.
   const relayHeaders = relayHeadersFrom(upstream, PASSTHROUGH_RELAY_HEADERS);
-  return new Response(upstream.body, { status: upstream.status, headers: relayHeaders });
+  // P1: for a streaming passthrough, wrap the verbatim upstream body in a
+  // byte-preserving keep-alive idle-tee. Path P injects no synthetic pings of
+  // its own, so a long silent tool/thinking gap on a provider that doesn't ping
+  // would trip Claude Code's ~180s idle watchdog. The tee passes all bytes
+  // through unchanged and only interleaves standard `event: ping` frames into
+  // idle gaps. Non-streaming responses are returned as-is.
+  const relayBody = streaming && upstream.body ? keepAliveTee(upstream.body) : upstream.body;
+  return new Response(relayBody, { status: upstream.status, headers: relayHeaders });
 }
 
 /**

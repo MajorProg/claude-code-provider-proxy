@@ -40,6 +40,7 @@ model discovery** (no hardcoded catalog).
 | [`workflows.md`](workflows.md) | How a process runs end to end | Startup, inference (parse-body-once), Path C/M translation, streaming SSE, discovery/refresh, serialized config hot-reload, log capture (disconnect + timeout cancel), dev token minting, and the two test lanes. |
 | [`dependencies.md`](dependencies.md) | External deps & upstream services | `aws4fetch`, Bun built-ins, dev + test-infra tooling (capture-fixtures, fetch-mock, live helper), Bedrock + external provider matrix, deployment deps, dependency + mocking policy. |
 | [`threat_model.md`](threat_model.md) | Security review: trust boundaries, controls, accepted risks | Trust-boundary diagram, assets, controls in place, the two accepted-by-design exposures, out-of-scope non-goals, hardening steps for untrusted networks. |
+| [`improvements.md`](improvements.md) | Verified improvement backlog for the connector + streaming | **Part 1** — research-vs-code gap analysis for Path M (OpenAI⇄Anthropic): reasoning/thinking mapping (`reasoning_content`→`thinking`), block ordering, tool-call reconciliation/id-sanitization, Path P keep-alive (180s watchdog), Converse signed-thinking, confirmed non-issues. **Part 2** — a 4-agent deep audit adding streaming (SR), translation-correctness (TC), performance/cost (PC), and security/robustness (SEC) findings, with a cross-cutting synthesis and revised global priority. Each item has impact, confidence, code location, evidence, recommendation. |
 
 ---
 
@@ -58,6 +59,7 @@ model discovery** (no hardcoded catalog).
 | "How are tests structured? live vs hermetic? fixtures?" | `workflows.md` (testing lanes), `dependencies.md` (test infra) |
 | "What does it depend on?" / "which external providers?" | `dependencies.md` |
 | "What's the security model / trust boundary / accepted risks?" | `threat_model.md` (+ root `AGENTS.md`) |
+| "How can the OpenAI⇄Anthropic connector / streaming be improved?" | `improvements.md` |
 | "How do I run / operate the proxy (setup, start, modes)?" | `workflows.md` (operator lifecycle), `codebase_info.md` (CLI) |
 | "Binding project rules / provider-specific quirk (DeepSeek, Gemini, Alibaba, …)" | root [`AGENTS.md`](../AGENTS.md) "Custom Instructions" |
 

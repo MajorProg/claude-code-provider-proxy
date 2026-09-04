@@ -14,6 +14,7 @@ import { parseCanonicalId } from "../src/model/canonical-id.ts";
 import { type Catalog, CatalogManager, createHttpDiscoveryClient } from "../src/model/catalog.ts";
 import {
   anthropicToConverseRequest,
+  converseResponseToIr,
   handleConverseMessages,
   mapConverseStopReason,
 } from "../src/paths/converse.ts";
@@ -107,6 +108,26 @@ describe("anthropicToConverseRequest (pure mapping)", () => {
       toolResult: { toolUseId: "t1", content: [{ text: "sunny" }] },
     });
   });
+
+  test("TC4: consecutive same-role messages are merged into one alternating turn", () => {
+    const body = anthropicToConverseRequest({
+      model: "x",
+      max_tokens: 50,
+      messages: [
+        { role: "user", content: "a" },
+        { role: "user", content: "b" },
+        { role: "assistant", content: "c" },
+        { role: "assistant", content: "d" },
+        { role: "user", content: "e" },
+      ],
+    });
+    // Two user turns collapse to one, two assistant turns collapse to one, then
+    // the final user — strict alternation, no consecutive same-role.
+    expect(body.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(body.messages[0]?.content).toEqual([{ text: "a" }, { text: "b" }]);
+    expect(body.messages[1]?.content).toEqual([{ text: "c" }, { text: "d" }]);
+    expect(body.messages[2]?.content).toEqual([{ text: "e" }]);
+  });
 });
 
 describe("mapConverseStopReason", () => {
@@ -115,10 +136,93 @@ describe("mapConverseStopReason", () => {
     ["tool_use", "tool_use"],
     ["max_tokens", "max_tokens"],
     ["stop_sequence", "stop_sequence"],
-    ["content_filtered", "end_turn"],
+    ["content_filtered", "refusal"],
     ["unknown", "end_turn"],
   ])("%s -> %s", (input, expected) => {
     expect(mapConverseStopReason(input)).toBe(expected as ReturnType<typeof mapConverseStopReason>);
+  });
+});
+
+describe("converseResponseToIr reasoningContent (C1)", () => {
+  test("maps reasoningContent.reasoningText to an IRThinkingBlock preserving the signature", () => {
+    // Real Converse response shape (live-verified): reasoningContent block
+    // precedes the text block; reasoningText carries { text, signature }.
+    const ir = converseResponseToIr({
+      output: {
+        message: {
+          role: "assistant",
+          content: [
+            {
+              reasoningContent: {
+                reasoningText: { text: "17*23 = 391", signature: "SIGvalue123" },
+              },
+            },
+            { text: "The answer is 391." },
+          ],
+        },
+      },
+      stopReason: "end_turn",
+      usage: { inputTokens: 10, outputTokens: 8 },
+    });
+    // Thinking block comes first, with the signature preserved verbatim.
+    expect(ir.content[0]).toEqual({
+      type: "thinking",
+      thinking: "17*23 = 391",
+      signature: "SIGvalue123",
+    });
+    expect(ir.content[1]).toEqual({ type: "text", text: "The answer is 391." });
+  });
+
+  test("skips an empty reasoning text block", () => {
+    const ir = converseResponseToIr({
+      output: {
+        message: {
+          content: [{ reasoningContent: { reasoningText: { text: "" } } }, { text: "hi" }],
+        },
+      },
+    });
+    expect(ir.content).toEqual([{ type: "text", text: "hi" }]);
+  });
+
+  test("SR4: Converse usage cache counters map into IRUsage", () => {
+    const ir = converseResponseToIr({
+      output: { message: { content: [{ text: "ok" }] } },
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 200,
+        outputTokens: 10,
+        cacheReadInputTokens: 150,
+        cacheWriteInputTokens: 50,
+      },
+    });
+    expect(ir.usage.inputTokens).toBe(200);
+    expect(ir.usage.cacheReadInputTokens).toBe(150);
+    expect(ir.usage.cacheWriteInputTokens).toBe(50);
+  });
+
+  test("SR9: single configured stop_sequence + stop_sequence stopReason -> stopSequence set", () => {
+    const ir = converseResponseToIr(
+      { output: { message: { content: [{ text: "RED GREEN " }] } }, stopReason: "stop_sequence" },
+      ["BLUE"],
+    );
+    expect(ir.stopReason).toBe("stop_sequence");
+    expect(ir.stopSequence).toBe("BLUE");
+  });
+
+  test("SR9: multiple configured stop_sequences -> stopSequence stays unset (ambiguous)", () => {
+    const ir = converseResponseToIr(
+      { output: { message: { content: [{ text: "x" }] } }, stopReason: "stop_sequence" },
+      ["BLUE", "RED"],
+    );
+    expect(ir.stopSequence).toBeUndefined();
+  });
+
+  test("SR9: non-stop_sequence stopReason -> stopSequence unset even with one configured", () => {
+    const ir = converseResponseToIr(
+      { output: { message: { content: [{ text: "done" }] } }, stopReason: "end_turn" },
+      ["BLUE"],
+    );
+    expect(ir.stopSequence).toBeUndefined();
   });
 });
 

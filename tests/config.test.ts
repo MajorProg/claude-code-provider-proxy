@@ -1,6 +1,96 @@
 import { describe, expect, test } from "bun:test";
-import { awsRegionForPrefix, hostForRegion, loadConfig, validateConfig } from "../src/config.ts";
+import {
+  assertSafeExternalOrigin,
+  awsRegionForPrefix,
+  hostForRegion,
+  loadConfig,
+  validateConfig,
+} from "../src/config.ts";
 import { ConfigError } from "../src/errors.ts";
+
+describe("request limits config (SEC-4)", () => {
+  test("applies defaults when the limits block is absent", () => {
+    const cfg = validateConfig(VALID_RAW);
+    expect(cfg.limits.maxMessages).toBe(100_000);
+    expect(cfg.limits.maxContentBlocksPerMessage).toBe(10_000);
+    expect(cfg.limits.maxTools).toBe(1_000);
+  });
+
+  test("honors explicit limits and fills missing fields with defaults", () => {
+    const cfg = validateConfig({ ...VALID_RAW, limits: { maxMessages: 5 } });
+    expect(cfg.limits.maxMessages).toBe(5);
+    expect(cfg.limits.maxTools).toBe(1_000); // default preserved
+  });
+
+  test("rejects a non-positive limit", () => {
+    expect(() => validateConfig({ ...VALID_RAW, limits: { maxTools: 0 } })).toThrow(ConfigError);
+    expect(() => validateConfig({ ...VALID_RAW, limits: { maxMessages: -1 } })).toThrow(
+      ConfigError,
+    );
+  });
+});
+
+describe("logging captureTimeoutMs config (PC8)", () => {
+  test("defaults to 120000ms when absent", () => {
+    const cfg = validateConfig(VALID_RAW);
+    expect(cfg.logging.captureTimeoutMs).toBe(120_000);
+  });
+
+  test("honors an explicit positive integer", () => {
+    const cfg = validateConfig({
+      ...VALID_RAW,
+      logging: { enabled: false, captureTimeoutMs: 30_000 },
+    });
+    expect(cfg.logging.captureTimeoutMs).toBe(30_000);
+  });
+
+  test("falls back to the default for non-positive / non-integer values", () => {
+    for (const bad of [0, -1, 1.5, "60000"]) {
+      const cfg = validateConfig({
+        ...VALID_RAW,
+        logging: { enabled: false, captureTimeoutMs: bad },
+      });
+      expect(cfg.logging.captureTimeoutMs).toBe(120_000);
+    }
+  });
+});
+
+describe("assertSafeExternalOrigin (SEC-9 SSRF guard)", () => {
+  test("allows public https origins", () => {
+    expect(() => assertSafeExternalOrigin("https://api.openai.com/v1")).not.toThrow();
+    expect(() =>
+      assertSafeExternalOrigin("https://generativelanguage.googleapis.com"),
+    ).not.toThrow();
+    // Explicit localhost is permitted for local dev.
+    expect(() => assertSafeExternalOrigin("http://localhost:1234")).not.toThrow();
+  });
+
+  test("blocks cloud-metadata + link-local (169.254.0.0/16, incl IPv4-mapped)", () => {
+    expect(() => assertSafeExternalOrigin("https://169.254.169.254/latest/meta-data")).toThrow(
+      ConfigError,
+    );
+    expect(() => assertSafeExternalOrigin("https://[::ffff:169.254.169.254]")).toThrow(ConfigError);
+  });
+
+  test("blocks loopback + RFC-1918 ranges", () => {
+    expect(() => assertSafeExternalOrigin("https://127.0.0.1")).toThrow(ConfigError);
+    expect(() => assertSafeExternalOrigin("https://[::1]")).toThrow(ConfigError);
+    expect(() => assertSafeExternalOrigin("https://10.0.0.7")).toThrow(ConfigError);
+    expect(() => assertSafeExternalOrigin("https://172.16.5.5")).toThrow(ConfigError);
+    expect(() => assertSafeExternalOrigin("https://192.168.1.50")).toThrow(ConfigError);
+    expect(() => assertSafeExternalOrigin("https://0.0.0.0")).toThrow(ConfigError);
+  });
+
+  test("allows public IPs adjacent to private ranges", () => {
+    expect(() => assertSafeExternalOrigin("https://172.15.0.1")).not.toThrow();
+    expect(() => assertSafeExternalOrigin("https://172.32.0.1")).not.toThrow();
+    expect(() => assertSafeExternalOrigin("https://11.0.0.1")).not.toThrow();
+  });
+
+  test("throws on a malformed URL", () => {
+    expect(() => assertSafeExternalOrigin("not a url")).toThrow(ConfigError);
+  });
+});
 
 const VALID_RAW = {
   server: { host: "127.0.0.1", port: 8787 },

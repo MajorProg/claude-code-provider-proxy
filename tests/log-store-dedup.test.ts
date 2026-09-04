@@ -21,7 +21,13 @@ afterEach(() => {
 });
 
 function store(): LogStore {
-  return new LogStore({ enabled: true, dir: root, systemDir: "system", sessionDir: "sessions" });
+  return new LogStore({
+    enabled: true,
+    dir: root,
+    systemDir: "system",
+    sessionDir: "sessions",
+    captureTimeoutMs: 120000,
+  });
 }
 
 describe("recordSystemPrompt dedup under concurrency", () => {

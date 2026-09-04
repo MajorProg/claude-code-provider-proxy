@@ -25,12 +25,15 @@ import type {
 import { logger } from "../logging/logger.ts";
 import type { RouteTarget } from "../router.ts";
 import { converseStreamToAnthropicSse } from "../stream/converse-events.ts";
-import { normalizeForIrPaths } from "./normalize.ts";
+import { normalizeForIrPaths, normalizeToolSchema } from "./normalize.ts";
 import {
   type JsonObject,
   assertUpstreamOk,
   irToAnthropicResponse,
+  normalizeImageSource,
   parseUpstreamJson,
+  toolResultContentToString,
+  validateInboundBlock,
 } from "./relay.ts";
 
 /* ------------------------------------------------------------------ *
@@ -57,7 +60,10 @@ type AnthropicBlock =
   | { type: "text"; text: string }
   | { type: "tool_use"; id: string; name: string; input: unknown }
   | { type: "tool_result"; tool_use_id: string; content: unknown; is_error?: boolean }
-  | { type: "image"; source: { type: "base64"; media_type: string; data: string } };
+  | {
+      type: "image";
+      source: { type: "base64"; media_type: string; data: string } | { type: "url"; url: string };
+    };
 interface AnthropicTool {
   name: string;
   description?: string;
@@ -78,21 +84,6 @@ type AnthropicToolChoice =
   | { type: "none" }
   | { type: "tool"; name: string };
 
-/** Stringify tool_result content (string, or array of text blocks, or JSON). */
-function toolResultContentToString(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((b) =>
-        b && typeof b === "object" && "text" in b
-          ? String((b as { text: unknown }).text)
-          : JSON.stringify(b),
-      )
-      .join("");
-  }
-  return JSON.stringify(content);
-}
-
 function anthropicBlockToIr(block: AnthropicBlock): IRContentBlock {
   switch (block.type) {
     case "text":
@@ -106,8 +97,16 @@ function anthropicBlockToIr(block: AnthropicBlock): IRContentBlock {
         content: toolResultContentToString(block.content),
         ...(block.is_error !== undefined ? { isError: block.is_error } : {}),
       };
-    case "image":
-      return { type: "image", mediaType: block.source.media_type, data: block.source.data };
+    case "image": {
+      const img = normalizeImageSource(block.source);
+      if (!img) return { type: "text", text: "[unsupported image omitted]" };
+      return {
+        type: "image",
+        mediaType: img.mediaType,
+        ...(img.data !== undefined ? { data: img.data } : {}),
+        ...(img.url !== undefined ? { url: img.url } : {}),
+      };
+    }
     default:
       // Exhaustive over AnthropicBlock: a new variant becomes a compile error;
       // an unexpected on-the-wire type throws instead of returning undefined.
@@ -126,10 +125,26 @@ function isEmptyBlock(block: IRContentBlock): boolean {
 }
 
 function anthropicMessageToIr(msg: AnthropicMessage): IRMessage {
-  const raw: IRContentBlock[] =
-    typeof msg.content === "string"
-      ? [{ type: "text", text: msg.content }]
-      : msg.content.map(anthropicBlockToIr);
+  if (typeof msg.content === "string") {
+    return { role: msg.role, content: [{ type: "text", text: msg.content }] };
+  }
+  const raw: IRContentBlock[] = [];
+  for (const rawBlock of msg.content) {
+    // SEC-6: validate inbound (client-controlled) block shape -> 400 on unknown.
+    const type = validateInboundBlock(rawBlock, "message content block");
+    if (type === "thinking") {
+      const b = rawBlock as { thinking?: unknown; signature?: unknown };
+      raw.push({
+        type: "thinking",
+        thinking: typeof b.thinking === "string" ? b.thinking : "",
+        ...(typeof b.signature === "string" ? { signature: b.signature } : {}),
+      });
+      continue;
+    }
+    // redacted_thinking has no Converse representation; drop it.
+    if (type === "redacted_thinking") continue;
+    raw.push(anthropicBlockToIr(rawBlock as AnthropicBlock));
+  }
   const content = raw.filter((b) => !isEmptyBlock(b));
   return { role: msg.role, content };
 }
@@ -154,6 +169,20 @@ function irBlockToConverse(block: IRContentBlock): Record<string, unknown> {
   switch (block.type) {
     case "text":
       return { text: block.text };
+    case "thinking":
+      // IR thinking -> Converse reasoningContent. Preserve the signature
+      // verbatim when present (Path C / Converse is Claude, so the signature is
+      // valid and must round-trip unmodified). An unsigned thinking block
+      // (OpenAI-origin) is not expected on the Converse request path, but is
+      // still forwarded as reasoning text without a signature.
+      return {
+        reasoningContent: {
+          reasoningText: {
+            text: block.thinking,
+            ...(block.signature ? { signature: block.signature } : {}),
+          },
+        },
+      };
     case "tool_use":
       return { toolUse: { toolUseId: block.id, name: block.name, input: block.input } };
     case "tool_result":
@@ -165,6 +194,13 @@ function irBlockToConverse(block: IRContentBlock): Record<string, unknown> {
         },
       };
     case "image":
+      // Converse's image source is bytes-only (no URL support). A base64 image
+      // sends its bytes; a url-source image (TC6) has no Converse equivalent, so
+      // it degrades to a placeholder text block rather than emitting an invalid
+      // `source.bytes: undefined`.
+      if (block.data === undefined) {
+        return { text: "[image url omitted: not supported by this model]" };
+      }
       return {
         image: { format: imageFormat(block.mediaType), source: { bytes: block.data } },
       };
@@ -209,7 +245,22 @@ export function anthropicToConverseRequest(req: AnthropicRequest): ConverseReque
     .map((m) => anthropicMessageToIr({ role: m.role, content: m.content } as AnthropicMessage))
     .filter((m) => m.content.length > 0);
 
-  const messages = kept.map((m) => ({
+  // TC4: Converse REQUIRES strictly alternating user/assistant roles and rejects
+  // two consecutive same-role messages (ValidationException). Anthropic inbound
+  // can legitimately contain consecutive same-role turns, and normalization can
+  // *create* adjacency by dropping an empty turn between two same-role turns.
+  // Merge consecutive same-role turns by concatenating their content blocks.
+  const merged: typeof kept = [];
+  for (const m of kept) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === m.role) {
+      merged[merged.length - 1] = { role: last.role, content: [...last.content, ...m.content] };
+    } else {
+      merged.push(m);
+    }
+  }
+
+  const messages = merged.map((m) => ({
     role: m.role,
     content: m.content.map(irBlockToConverse),
   }));
@@ -236,7 +287,7 @@ export function anthropicToConverseRequest(req: AnthropicRequest): ConverseReque
       toolSpec: {
         name: t.name,
         ...(t.description ? { description: t.description } : {}),
-        inputSchema: { json: t.input_schema },
+        inputSchema: { json: normalizeToolSchema(t.input_schema, "converse") },
       },
     }));
     const toolChoiceIr = anthropicToolChoiceToIr(req.tool_choice);
@@ -263,7 +314,8 @@ interface ConverseResponse {
 }
 type ConverseResponseBlock =
   | { text: string }
-  | { toolUse: { toolUseId: string; name: string; input: unknown } };
+  | { toolUse: { toolUseId: string; name: string; input: unknown } }
+  | { reasoningContent: { reasoningText?: { text?: string; signature?: string } } };
 
 /** Map a Converse stopReason to the canonical Anthropic stop reason. */
 export function mapConverseStopReason(reason: string | undefined): IRStopReason {
@@ -277,10 +329,9 @@ export function mapConverseStopReason(reason: string | undefined): IRStopReason 
     case "stop_sequence":
       return "stop_sequence";
     case "content_filtered":
-      // No direct Anthropic stop_reason exists for a content filter; we map to
-      // end_turn (closest forced-completion). This intentionally CONFLATES a
-      // filtered response with a normal completion — documented, not a bug.
-      return "end_turn";
+      // Anthropic `refusal` stop reason (2025/2026) is the closest match for a
+      // filtered response — surface it rather than conflating with end_turn.
+      return "refusal";
     default:
       // A stop reason the Converse API introduced that we don't yet map.
       // Falling back to end_turn is safe, but log it so the gap is visible
@@ -292,11 +343,29 @@ export function mapConverseStopReason(reason: string | undefined): IRStopReason 
   }
 }
 
-function converseResponseToIr(res: ConverseResponse): IRResponse {
+export function converseResponseToIr(
+  res: ConverseResponse,
+  requestStopSequences?: readonly string[],
+): IRResponse {
   const blocks: IRContentBlock[] = [];
   for (const b of res.output?.message?.content ?? []) {
     if ("text" in b) {
       blocks.push({ type: "text", text: b.text });
+    } else if ("reasoningContent" in b) {
+      // C1: Claude-on-Converse emits reasoningContent.reasoningText{text,
+      // signature}. Carry it into an IRThinkingBlock, preserving the REAL
+      // signature so it round-trips to the Anthropic client verbatim (the
+      // signature is what lets the client resubmit the thinking block on a
+      // follow-up turn). An empty/absent reasoning text is skipped.
+      const rt = b.reasoningContent.reasoningText;
+      const text = rt?.text ?? "";
+      if (text.length > 0) {
+        blocks.push({
+          type: "thinking",
+          thinking: text,
+          ...(rt?.signature ? { signature: rt.signature } : {}),
+        });
+      }
     } else if ("toolUse" in b) {
       blocks.push({
         type: "tool_use",
@@ -307,10 +376,20 @@ function converseResponseToIr(res: ConverseResponse): IRResponse {
     }
   }
   const usage = res.usage ?? {};
+  const stopReason = mapConverseStopReason(res.stopReason);
+  // SR9: Bedrock Converse reports stopReason:"stop_sequence" but does NOT return
+  // which configured sequence matched (verified live — no field on the response
+  // or the streaming messageStop frame). We can surface it only when the match
+  // is unambiguous: exactly one sequence was configured.
+  const matchedStopSequence =
+    stopReason === "stop_sequence" && requestStopSequences?.length === 1
+      ? requestStopSequences[0]
+      : undefined;
   return {
     role: "assistant",
     content: blocks,
-    stopReason: mapConverseStopReason(res.stopReason),
+    stopReason,
+    ...(matchedStopSequence !== undefined ? { stopSequence: matchedStopSequence } : {}),
     usage: {
       inputTokens: usage.inputTokens ?? 0,
       outputTokens: usage.outputTokens ?? 0,
@@ -344,10 +423,21 @@ export async function handleConverseMessages(
   const opts = signal ? { signal } : {};
 
   if (streaming) {
-    const upstream = await postJson(route.streamPath, headers, JSON.stringify(converseBody), opts);
+    const streamOpts = { ...opts, retryTransientStatus: false };
+    const upstream = await postJson(
+      route.streamPath,
+      headers,
+      JSON.stringify(converseBody),
+      streamOpts,
+    );
     await assertUpstreamOk(upstream, route, { requireBody: true });
     const body = upstream.body as ReadableStream<Uint8Array>;
-    const sse = converseStreamToAnthropicSse(body, parsed.model ?? route.invocationId);
+    const sse = converseStreamToAnthropicSse(
+      body,
+      parsed.model ?? route.invocationId,
+      0,
+      parsed.stop_sequences,
+    );
     return new Response(sse, {
       headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
     });
@@ -357,7 +447,7 @@ export async function handleConverseMessages(
   await assertUpstreamOk(upstream, route);
 
   const converseJson = await parseUpstreamJson<ConverseResponse>(upstream, route);
-  const ir = converseResponseToIr(converseJson);
+  const ir = converseResponseToIr(converseJson, parsed.stop_sequences);
   const anthropicBody = irToAnthropicResponse(ir, parsed.model ?? route.invocationId);
   return Response.json(anthropicBody);
 }

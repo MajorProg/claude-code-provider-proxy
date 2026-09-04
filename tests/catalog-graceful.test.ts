@@ -14,7 +14,9 @@ import {
   Catalog,
   CatalogManager,
   type DiscoveryClient,
+  SourceBackoff,
   discoverCatalog,
+  discoverExternalCatalog,
 } from "../src/model/catalog.ts";
 import { type FetchMock, type MockResponseSpec, installFetchMock } from "./helpers/fetch-mock.ts";
 
@@ -201,5 +203,26 @@ describe("discoverCatalog graceful degradation", () => {
     const empty = new Catalog([], []);
     expect(empty.models).toEqual([]);
     expect(empty.get("global", "anthropic", "glm-5")).toBeUndefined();
+  });
+
+  test("PC9: a source in cooldown is skipped (no fetch) then retried after the window", async () => {
+    const config = makeConfig({ external: ZAI });
+    const backoff = new SourceBackoff();
+
+    // First cycle: discovery fails -> records a failure + cooldown.
+    const m1 = useMock([{ status: 503, json: {} }]);
+    const r1 = await discoverExternalCatalog(config, backoff);
+    expect(m1.requests).toHaveLength(1); // fetched once
+    expect(r1.statuses.find((s) => s.source === "zai")?.state).toBe("error");
+    expect(backoff.shouldSkip("zai")).toBe(true);
+    m1.restore();
+
+    // Second cycle while still cooling down: NO fetch, status = skipped.
+    const m2 = useMock([{ status: 200, json: { data: [{ id: "glm-5" }] } }]);
+    const r2 = await discoverExternalCatalog(config, backoff);
+    expect(m2.requests).toHaveLength(0); // cooldown -> no network call
+    const zaiStatus = r2.statuses.find((s) => s.source === "zai");
+    expect(zaiStatus?.state).toBe("skipped");
+    expect(zaiStatus?.detail).toContain("cooling down");
   });
 });

@@ -15,6 +15,7 @@ import {
   anthropicToOpenAIRequest,
   handleMantleMessages,
   mapOpenAIFinishReason,
+  openAIResponseToIr,
 } from "../src/paths/mantle.ts";
 import { route } from "../src/router.ts";
 import { awsCreds, describeLive, liveEnabled } from "./helpers/live.ts";
@@ -117,6 +118,34 @@ describe("anthropicToOpenAIRequest (pure mapping)", () => {
     expect(toolMsg).toEqual({ role: "tool", tool_call_id: "t1", content: "sunny" });
   });
 
+  test("G1: user turn with tool_result + text emits role:tool BEFORE user text", () => {
+    const body = anthropicToOpenAIRequest(
+      {
+        max_tokens: 50,
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "t1", name: "get", input: {} }],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "t1", content: "42" },
+              { type: "text", text: "now what?" },
+            ],
+          },
+        ],
+      },
+      "m",
+    );
+    // Sequence: assistant(tool_calls) -> tool(result) -> user(text). The tool
+    // message must immediately follow the assistant tool_calls (OpenAI contract).
+    const roles = body.messages.map((m) => m.role);
+    expect(roles).toEqual(["assistant", "tool", "user"]);
+    expect(body.messages[1]).toEqual({ role: "tool", tool_call_id: "t1", content: "42" });
+    expect(body.messages[2]).toEqual({ role: "user", content: "now what?" });
+  });
+
   test("tool_choice mapping variants", () => {
     const base = { max_tokens: 10, tools: [{ name: "x", input_schema: {} }], messages: [] };
     expect(
@@ -137,16 +166,82 @@ describe("mapOpenAIFinishReason", () => {
     ["stop", "end_turn"],
     ["tool_calls", "tool_use"],
     ["length", "max_tokens"],
-    ["content_filter", "end_turn"],
+    ["content_filter", "refusal"],
     ["unknown", "end_turn"],
   ])("%s -> %s", (input, expected) => {
     expect(mapOpenAIFinishReason(input)).toBe(expected as ReturnType<typeof mapOpenAIFinishReason>);
   });
 });
 
+describe("openAIResponseToIr — refusal (TC7)", () => {
+  test("surfaces message.refusal as text and maps content_filter -> refusal", () => {
+    const ir = openAIResponseToIr({
+      choices: [
+        {
+          message: { content: null, refusal: "I can't help with that." },
+          finish_reason: "content_filter",
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 6 },
+    });
+    expect(ir.stopReason).toBe("refusal");
+    const text = ir.content.find((b) => b.type === "text");
+    expect(text && "text" in text ? text.text : undefined).toBe("I can't help with that.");
+  });
+
+  test("reasoning field becomes a leading thinking block (R2)", () => {
+    const ir = openAIResponseToIr({
+      choices: [
+        { message: { content: "42", reasoning: "17*23=391... wait" }, finish_reason: "stop" },
+      ],
+    });
+    expect(ir.content[0]?.type).toBe("thinking");
+    expect(ir.stopReason).toBe("end_turn");
+  });
+
+  test("SR4: prompt_tokens_details.cached_tokens maps to cacheReadInputTokens", () => {
+    const ir = openAIResponseToIr({
+      choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 5,
+        prompt_tokens_details: { cached_tokens: 64 },
+      },
+    });
+    expect(ir.usage.inputTokens).toBe(100);
+    expect(ir.usage.cacheReadInputTokens).toBe(64);
+    // No cache-creation counter exists on the OpenAI-compat wire.
+    expect(ir.usage.cacheWriteInputTokens).toBeUndefined();
+  });
+
+  test("SR4: absent cached_tokens leaves cache fields unset", () => {
+    const ir = openAIResponseToIr({
+      choices: [{ message: { content: "hi" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 2 },
+    });
+    expect(ir.usage.cacheReadInputTokens).toBeUndefined();
+  });
+});
+
 function firstMantleNonClaude(): string {
-  const m = catalog.models.find((x) => x.backend === "mantle" && !x.isAnthropic);
-  if (!m) throw new Error("no non-Claude mantle model discovered");
+  // Prefer a known chat-capable text model. Some discovered mantle models are
+  // vision-/embedding-only (e.g. gemma-*-e2b, voxtral, *-vision) and reject the
+  // /v1/chat/completions route with a 400 ("isn't supported on this route"),
+  // and catalog ordering is non-deterministic — so pick deterministically.
+  const CHAT = /gpt-oss|qwen|glm|kimi|deepseek|minimax/i;
+  const VISION_OR_EMBED = /vision|voxtral|gemma|embed|palmyra/i;
+  const preferred = catalog.models.find(
+    (x) =>
+      x.backend === "mantle" &&
+      !x.isAnthropic &&
+      CHAT.test(x.nativeModelId) &&
+      !VISION_OR_EMBED.test(x.nativeModelId),
+  );
+  if (preferred) return preferred.nativeModelId;
+  const m = catalog.models.find(
+    (x) => x.backend === "mantle" && !x.isAnthropic && !VISION_OR_EMBED.test(x.nativeModelId),
+  );
+  if (!m) throw new Error("no non-Claude mantle chat model discovered");
   return m.nativeModelId;
 }
 
@@ -166,7 +261,9 @@ describeLive("Path M live (Mantle OpenAI)", () => {
     expect(json.role).toBe("assistant");
     expect(Array.isArray(json.content)).toBe(true);
     expect(typeof (json.usage as Record<string, unknown>).input_tokens).toBe("number");
-    expect(["end_turn", "max_tokens", "stop_sequence", "tool_use"]).toContain(json.stop_reason);
+    expect(["end_turn", "max_tokens", "stop_sequence", "tool_use", "refusal"]).toContain(
+      json.stop_reason,
+    );
   });
 
   test("non-Claude (mantle) tool use -> Anthropic tool_use block", async () => {

@@ -10,7 +10,7 @@
  *
  * Capture is best-effort and never blocks or alters the client response.
  */
-import { isCustomTool } from "../paths/relay.ts";
+import { coerceToolInput, isCustomTool } from "../paths/relay.ts";
 import type { LogStore, TurnRecord } from "./log-store.ts";
 import { errorMessage, logger } from "./logger.ts";
 
@@ -122,13 +122,13 @@ async function captureNonStreaming(
 const MAX_CAPTURE_CHARS = 8 * 1024 * 1024; // 8 MiB of reconstructed content
 
 /**
- * Wall-clock cap on the detached log-branch pump. The client branch is what the
- * user waits on; the log branch is best-effort. A hung/slow upstream must not
- * pin the tee'd log branch (and thus the upstream socket) open indefinitely
- * when nothing is consuming the client side any more. Independent of
+ * The streaming log-capture branch is a best-effort FOLLOWER of the client
+ * branch (PC8): it is cancelled promptly when the client branch ends (see
+ * `captureStreaming`) or on client disconnect. A wall-clock backstop
+ * (`LoggingConfig.captureTimeoutMs`, threaded via `LogStore.captureTimeoutMs`)
+ * only caps a hung upstream whose client branch never ends. Independent of
  * MAX_CAPTURE_CHARS, which bounds memory but not open-socket time.
  */
-const LOG_BRANCH_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Accumulates Anthropic SSE events to reconstruct content + usage + stop reason.
@@ -154,6 +154,16 @@ export class AnthropicStreamAccumulator {
     // captured stand; content is marked truncated in content().
     if (this.truncated) return;
     this.buffer += chunk;
+    // PC10: MAX_CAPTURE_CHARS counts DECODED content deltas, not the raw
+    // unparsed buffer. A stream that never sends a newline (or a single giant
+    // data line) would grow this.buffer without bound. Cap the raw buffer too:
+    // on overflow, stop buffering and mark truncated (capture is best-effort —
+    // usage/stop-reason captured so far stand; content is flagged truncated).
+    if (this.buffer.length > MAX_CAPTURE_CHARS) {
+      this.truncated = true;
+      this.buffer = "";
+      return;
+    }
     // Read-cursor scan: advance `start` per line and slice the remainder ONCE
     // per push, instead of re-slicing the whole buffer per line (O(L^2)).
     let start = 0;
@@ -242,14 +252,14 @@ export class AnthropicStreamAccumulator {
       }
       const tool = this.toolByIndex.get(index);
       if (tool) {
-        const rawJson = tool.json.join("");
-        let input: unknown = {};
-        try {
-          input = rawJson ? JSON.parse(rawJson) : {};
-        } catch {
-          input = rawJson;
-        }
-        blocks.push({ type: "tool_use", id: tool.id, name: tool.name, input });
+        // G10/SEC-10: logged tool_use.input is always an object; a truncated or
+        // malformed argument stream degrades to {} (never a raw string).
+        blocks.push({
+          type: "tool_use",
+          id: tool.id,
+          name: tool.name,
+          input: coerceToolInput(tool.json.join("")),
+        });
       }
     }
     if (this.truncated) {
@@ -325,16 +335,49 @@ function captureStreaming(
   if (!response.body) return response;
   const [clientBranch, logBranch] = response.body.tee();
 
+  // PC8: the log branch is a FOLLOWER. When the client branch finishes (the
+  // stream the user actually consumes ends or is cancelled), promptly cancel the
+  // log-branch read so the tee doesn't keep the upstream socket alive for the
+  // slower/idle branch. `clientDone` fires on client-branch close OR cancel.
+  const clientDone = new AbortController();
+  const clientReader = clientBranch.getReader();
+  const monitoredClientBranch = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await clientReader.read();
+        if (done) {
+          controller.close();
+          clientDone.abort(); // client branch reached end-of-stream
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        controller.error(err);
+        clientDone.abort();
+      }
+    },
+    cancel(reason) {
+      void clientReader.cancel(reason).catch(() => {});
+      clientDone.abort(); // client disconnected mid-stream
+    },
+  });
+
   runDetached(async () => {
     const reader = logBranch.getReader();
     // Cancel the log-branch read on client disconnect or after a wall-clock cap
     // so a slow/hung upstream can't pin the branch (and its socket) open.
     const timeout = setTimeout(() => {
       void reader.cancel(new Error("log capture timed out")).catch(() => {});
-    }, LOG_BRANCH_TIMEOUT_MS);
+    }, store.captureTimeoutMs);
     const onAbort = () => {
       void reader.cancel(new Error("client disconnected")).catch(() => {});
     };
+    // PC8: follow the client branch — when it ends, stop pumping the log branch.
+    const onClientDone = () => {
+      void reader.cancel(new Error("client branch ended")).catch(() => {});
+    };
+    if (clientDone.signal.aborted) onClientDone();
+    else clientDone.signal.addEventListener("abort", onClientDone, { once: true });
     if (signal) {
       if (signal.aborted) onAbort();
       else signal.addEventListener("abort", onAbort, { once: true });
@@ -375,6 +418,7 @@ function captureStreaming(
     } finally {
       clearTimeout(timeout);
       if (signal) signal.removeEventListener("abort", onAbort);
+      clientDone.signal.removeEventListener("abort", onClientDone);
       reader.releaseLock();
     }
   }, "streaming");
@@ -384,5 +428,5 @@ function captureStreaming(
   if (ct) headers["content-type"] = ct;
   const cc = response.headers.get("cache-control");
   if (cc) headers["cache-control"] = cc;
-  return new Response(clientBranch, { status: response.status, headers });
+  return new Response(monitoredClientBranch, { status: response.status, headers });
 }

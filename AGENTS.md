@@ -216,6 +216,17 @@ when wiring or debugging a provider.
   to a `global.*` or `<region>.*` profile. `ON_DEMAND` models accept bare IDs.
 - Default regions by measured coverage: **`us-east-1`** (richest) + **`eu-west-1`**
   (richest EU with both backends). `eu-west-3` has no Mantle endpoint.
+- **Images (TC6, live-verified):** Converse accepts an image only as base64
+  `image.source.bytes` (a JSON base64 string) with a `format` token derived from
+  the media type — it has **no URL image support**, so a `url`-source Anthropic
+  image degrades to a placeholder text block. Mantle's OpenAI route accepts
+  `image_url` as a **data: URI or an S3 URL only** — a plain `http(s)` image URL
+  is rejected `400 "Only inline image data URLs and S3 URLs are supported"`, so a
+  `url`-source image is passed through (correct for real OpenAI / external
+  providers that accept http URLs) and surfaces a clean relayed 400 on Mantle;
+  we never server-side-fetch a URL to inline it (SSRF). Inbound `media_type` is
+  validated against {png,jpeg,gif,webp}, defaulting an unknown base64 media type
+  to `image/png`.
 
 **External (non-Bedrock) providers**
 - Providers are a keyed map under `config.providers`; each non-`bedrock` entry
@@ -305,6 +316,18 @@ trusted operator. Both are called out here so they are not mistaken for defects:
    an origin allow/deny list for discovery + message fetches (block link-local /
    RFC-1918 / metadata IPs) — deliberately not done today, as the operator is
    trusted and the LAN bind limits reachability.
+
+3. **Trust-preserving system-hoisting (SEC-5).** The IR-path normalizer
+   (`normalize.ts`, Paths C/M only — Path P relays verbatim) hoists a
+   `role: "system"` message into the top-level system prompt **only when it
+   appears before the first user turn**. A `role: "system"` message that arrives
+   *after* the conversation has started (e.g. an injected mid-conversation
+   `<system-reminder>`) is **not** elevated to system-prompt trust — it is
+   demoted to a `user` turn so its text is still delivered but attributed to the
+   conversation, not the authoritative system prompt (OWASP LLM01 mitigation).
+   This depends on TC4's same-role merge: a demoted trailing system message can
+   produce consecutive user turns, which the Converse mapper coalesces
+   (live-verified: Bedrock Converse accepts the merged result 200 OK).
 
 ### Token generation (dev/testing)
 

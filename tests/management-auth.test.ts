@@ -55,7 +55,7 @@ function makeConfig(): ProxyConfig {
 
 /** Minimal Runtime stub: empty catalog, disabled log store. */
 function makeRuntime(config: ProxyConfig): Runtime {
-  const emptyCatalog = { models: [] as never[] };
+  const emptyCatalog = { models: [] as never[], sources: [] as never[] };
   const runtime = {
     config,
     tokenProvider: async () => "unused-in-these-tests",

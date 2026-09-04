@@ -42,14 +42,39 @@ export interface IRToolResultBlock {
 /** An input image block. */
 export interface IRImageBlock {
   readonly type: "image";
-  /** Media type, e.g. "image/png", "image/jpeg". */
+  /** Media type, e.g. "image/png", "image/jpeg". Empty string when unknown (url source). */
   readonly mediaType: string;
-  /** Base64-encoded image bytes. */
-  readonly data: string;
+  /** Base64-encoded image bytes (for a base64 source). Mutually exclusive with `url`. */
+  readonly data?: string;
+  /** Image URL (for a url source, TC6). Mutually exclusive with `data`. */
+  readonly url?: string;
+}
+
+/**
+ * Extended-thinking / reasoning block.
+ *
+ * Carries the model's reasoning text plus, when the source provider supplies a
+ * cryptographic thinking `signature` (Anthropic / Bedrock Converse `reasoning`),
+ * that signature verbatim. Signatures are provider-bound and MUST NOT be
+ * fabricated: OpenAI-origin reasoning (`reasoning_content`) is plaintext and
+ * unsigned, so those blocks carry no `signature` — they are emitted for
+ * visibility only. A block with a real signature (Path C / Converse) must
+ * preserve it unmodified so multi-turn continuation stays valid.
+ */
+export interface IRThinkingBlock {
+  readonly type: "thinking";
+  readonly thinking: string;
+  /** Cryptographic thinking signature, when the provider supplies one. */
+  readonly signature?: string;
 }
 
 /** Any content block in a message. */
-export type IRContentBlock = IRTextBlock | IRToolUseBlock | IRToolResultBlock | IRImageBlock;
+export type IRContentBlock =
+  | IRTextBlock
+  | IRThinkingBlock
+  | IRToolUseBlock
+  | IRToolResultBlock
+  | IRImageBlock;
 
 /** A single conversation message. */
 export interface IRMessage {
@@ -65,7 +90,7 @@ export type IRToolChoice =
   | { readonly type: "none" };
 
 /** Why generation stopped. Canonical (Anthropic) vocabulary. */
-export type IRStopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
+export type IRStopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "refusal";
 
 /** Token accounting, including prompt-cache counters when available. */
 export interface IRUsage {
@@ -80,5 +105,12 @@ export interface IRResponse {
   readonly role: "assistant";
   readonly content: readonly IRContentBlock[];
   readonly stopReason: IRStopReason;
+  /**
+   * The stop sequence that terminated generation, when known and unambiguous
+   * (SR9). Anthropic surfaces this as `message.stop_sequence`. Bedrock Converse
+   * does not report which configured sequence matched, so this is only set when
+   * `stopReason === "stop_sequence"` and exactly one sequence was configured.
+   */
+  readonly stopSequence?: string;
   readonly usage: IRUsage;
 }

@@ -7,7 +7,7 @@
  *
  * Required env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, (AWS_SESSION_TOKEN).
  */
-import { beforeAll, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { generateShortLivedBedrockToken } from "../src/auth/bedrock-token.ts";
 import { type ProxyConfig, validateConfig } from "../src/config.ts";
 import { parseCanonicalId } from "../src/model/canonical-id.ts";
@@ -15,6 +15,7 @@ import { type Catalog, CatalogManager, createHttpDiscoveryClient } from "../src/
 import {
   handlePassthroughCountTokens,
   handlePassthroughMessages,
+  withModel,
 } from "../src/paths/passthrough.ts";
 import { route } from "../src/router.ts";
 import { awsCreds, describeLive, liveEnabled } from "./helpers/live.ts";
@@ -134,5 +135,61 @@ describeLive("Path P passthrough (live Bedrock)", () => {
     expect(res.status).toBe(200);
     const json = (await res.json()) as Record<string, unknown>;
     expect(typeof json.input_tokens).toBe("number");
+  });
+});
+
+describe("withModel (PC6 targeted rewrite + TC9 no caller mutation)", () => {
+  test("rewrites model and drops unsupported top-level fields", () => {
+    const body = {
+      model: "orig",
+      max_tokens: 10,
+      context_management: { edits: [] },
+      output_config: { format: "json" },
+      messages: [{ role: "user", content: "hi" }],
+    };
+    const out = withModel(body, "resolved-id");
+    expect(out.model).toBe("resolved-id");
+    expect("context_management" in out).toBe(false);
+    expect("output_config" in out).toBe(false);
+    expect(out.max_tokens).toBe(10);
+    expect(out.messages).toBe(body.messages); // shallow: unchanged refs reused
+  });
+
+  test("TC9: does not mutate the caller body (model + stripped fields intact)", () => {
+    const body = {
+      model: "orig",
+      context_management: { edits: [] },
+      tools: [{ name: "t", defer_loading: true }],
+    };
+    const out = withModel(body, "resolved-id");
+    // Caller body is untouched.
+    expect(body.model).toBe("orig");
+    expect("context_management" in body).toBe(true);
+    expect((body.tools[0] as Record<string, unknown>).defer_loading).toBe(true);
+    // Output is rewritten + stripped.
+    expect(out.model).toBe("resolved-id");
+    expect("context_management" in out).toBe(false);
+    const outTool = (out.tools as Record<string, unknown>[])[0];
+    expect(outTool && "defer_loading" in outTool).toBe(false);
+  });
+
+  test("no-op strip still clones once to set model (caller body untouched)", () => {
+    const body = { model: "orig", messages: [{ role: "user", content: "hi" }] };
+    const out = withModel(body, "resolved-id");
+    expect(out).not.toBe(body); // a fresh object
+    expect(body.model).toBe("orig"); // caller unchanged
+    expect(out.model).toBe("resolved-id");
+    expect(out.messages).toBe(body.messages); // shallow clone reuses nested refs
+  });
+
+  test("strips per-tool defer_loading nested under custom", () => {
+    const body = {
+      model: "orig",
+      tools: [{ name: "t", custom: { defer_loading: true, other: 1 } }],
+    };
+    const out = withModel(body, "x");
+    const custom = (out.tools as Record<string, unknown>[])[0]?.custom as Record<string, unknown>;
+    expect("defer_loading" in custom).toBe(false);
+    expect(custom.other).toBe(1);
   });
 });

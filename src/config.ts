@@ -94,6 +94,15 @@ export interface ExternalProviderConfig {
    */
   readonly countTokens: boolean;
   /**
+   * Opt-in OpenAI strict function-calling (TC3). When true, tool `input_schema`
+   * is tightened to the strict dialect (`additionalProperties:false` + full
+   * `required` at each object; unsupported keywords stripped) before being sent
+   * as `function.parameters`. Only meaningful for type "openai". Defaults false
+   * — Bedrock Mantle and lenient providers keep the schema verbatim (live-
+   * verified lenient), so tightening is applied ONLY where the target demands it.
+   */
+  readonly strictTools?: boolean;
+  /**
    * Discovery endpoint (an OpenAI-style `/models` URL). Model IDs are fetched
    * from here at runtime — NO model ids are ever hardcoded in source or config
    * (DESIGN §7). This is a discovery endpoint, exactly like Bedrock's control
@@ -108,6 +117,12 @@ export interface ExternalProviderConfig {
  * flat baseUrl.
  */
 export function externalProviderOrigin(p: ExternalProviderConfig): string {
+  const origin = externalProviderOriginRaw(p);
+  assertSafeExternalOrigin(origin);
+  return origin;
+}
+
+function externalProviderOriginRaw(p: ExternalProviderConfig): string {
   if (p.hostTemplate) {
     const host = p.hostTemplate
       .replaceAll("{workspaceId}", p.workspaceId ?? "")
@@ -117,12 +132,89 @@ export function externalProviderOrigin(p: ExternalProviderConfig): string {
   return p.baseUrl;
 }
 
+/**
+ * SSRF guard (SEC-9): reject an external-provider origin whose host resolves to
+ * a private, link-local, loopback, or cloud-metadata address. Both runtime
+ * discovery and the message-path handlers fetch this origin **with a provider
+ * credential attached**, so an operator-set `baseUrl`/`hostTemplate` pointing at
+ * `https://169.254.169.254` (IMDS) or an RFC-1918 host would otherwise be a
+ * credentialed SSRF on the hot path. `isSecureExternalUrl` only enforces the
+ * scheme; this enforces the host.
+ *
+ * Loopback over plain http is still allowed by `isSecureExternalUrl` for local
+ * dev against a mock; that narrow case is permitted here too (explicit
+ * localhost), but a *credentialed https* origin pointing at an internal IP is
+ * rejected.
+ */
+export function assertSafeExternalOrigin(origin: string): void {
+  let host: string;
+  try {
+    host = new URL(origin).hostname;
+  } catch {
+    throw new ConfigError(`External provider origin is not a valid URL: "${origin}"`);
+  }
+  if (isBlockedHost(host)) {
+    throw new ConfigError(
+      `External provider origin "${origin}" resolves to a blocked internal/metadata host ("${host}")`,
+    );
+  }
+}
+
+/**
+ * True when a hostname is a private/link-local/loopback/metadata target that a
+ * credentialed proxy must not fetch. Matches literal IPv4/IPv6 forms (the SSRF
+ * vectors that don't require DNS); DNS-based rebinding is out of scope for a
+ * config-time check. An explicit "localhost" literal is permitted for local dev.
+ */
+function isBlockedHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, ""); // strip IPv6 brackets
+  if (h === "localhost") return false; // explicit local dev, allowed
+
+  // IPv6 loopback / link-local / unique-local.
+  if (h === "::1") return true;
+  if (h.startsWith("fe80:") || h.startsWith("fe80::")) return true; // link-local
+  if (/^f[cd][0-9a-f]{2}:/.test(h)) return true; // fc00::/7 unique-local
+  // IPv4-mapped IPv6. The URL parser normalizes ::ffff:169.254.169.254 to the
+  // hex form ::ffff:a9fe:a9fe, so handle BOTH the dotted and hex tails.
+  const mappedDotted = h.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  const mappedHex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  let v4 = h;
+  if (mappedDotted) {
+    v4 = mappedDotted[1] as string;
+  } else if (mappedHex) {
+    const hi = Number.parseInt(mappedHex[1] as string, 16);
+    const lo = Number.parseInt(mappedHex[2] as string, 16);
+    v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+  }
+
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v4);
+  if (!m) return false; // not an IP literal -> allowed (public DNS name)
+  const [a, b] = [Number(m[1]), Number(m[2])];
+  if (a === 127) return true; // loopback 127.0.0.0/8
+  if (a === 10) return true; // RFC-1918 10.0.0.0/8
+  if (a === 169 && b === 254) return true; // link-local / IMDS 169.254.0.0/16
+  if (a === 172 && b >= 16 && b <= 31) return true; // RFC-1918 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // RFC-1918 192.168.0.0/16
+  if (a === 0) return true; // 0.0.0.0/8
+  return false;
+}
+
 export interface LoggingConfig {
   readonly enabled: boolean;
   readonly dir: string;
   readonly systemDir: string;
   readonly sessionDir: string;
+  /**
+   * Wall-clock backstop (ms) on the detached streaming log-capture branch (PC8).
+   * The log branch is a follower — normally cancelled when the client branch
+   * ends — so this only caps a hung upstream whose client branch never ends.
+   * Defaults to {@link DEFAULT_LOG_CAPTURE_TIMEOUT_MS} when absent.
+   */
+  readonly captureTimeoutMs: number;
 }
+
+/** Default backstop for the streaming log-capture branch (PC8). */
+export const DEFAULT_LOG_CAPTURE_TIMEOUT_MS = 2 * 60 * 1000;
 
 export interface ChatPageConfig {
   readonly enabled: boolean;
@@ -147,7 +239,27 @@ export interface ProxyConfig {
   };
   readonly logging: LoggingConfig;
   readonly chatPage: ChatPageConfig;
+  /** Inbound request resource caps (SEC-4). Always present (defaults applied). */
+  readonly limits: RequestLimits;
 }
+
+/**
+ * Configurable caps on inbound request size dimensions (SEC-4). These bound the
+ * O(n) work every downstream pass (normalize/translate/serialize) does, so a
+ * single crafted request can't exhaust CPU/memory. Defaults are generous —
+ * far above any real Claude Code session — so legitimate traffic is unaffected.
+ */
+export interface RequestLimits {
+  readonly maxMessages: number;
+  readonly maxContentBlocksPerMessage: number;
+  readonly maxTools: number;
+}
+
+export const DEFAULT_REQUEST_LIMITS: RequestLimits = {
+  maxMessages: 100_000,
+  maxContentBlocksPerMessage: 10_000,
+  maxTools: 1_000,
+};
 
 const VALID_REGION_KEYS: readonly RegionKey[] = ["us", "eu"];
 const VALID_PROFILE_PREFERENCES: readonly ProfilePreference[] = ["global", "regional", "auto"];
@@ -429,6 +541,7 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     ...(typeof raw.workspaceId === "string" ? { workspaceId: raw.workspaceId } : {}),
     ...(typeof raw.region === "string" ? { region: raw.region } : {}),
     countTokens: raw.countTokens === true,
+    ...(raw.strictTools === true ? { strictTools: true } : {}),
     modelsUrl: raw.modelsUrl,
   };
 }
@@ -446,11 +559,17 @@ function validateExternalProviders(
 
 function validateLogging(raw: unknown): LoggingConfig {
   const rawLogging = isRecord(raw) ? raw : {};
+  const rawTimeout = rawLogging.captureTimeoutMs;
+  const captureTimeoutMs =
+    typeof rawTimeout === "number" && Number.isInteger(rawTimeout) && rawTimeout > 0
+      ? rawTimeout
+      : DEFAULT_LOG_CAPTURE_TIMEOUT_MS;
   return {
     enabled: rawLogging.enabled === true,
     dir: stringOrDefault(rawLogging.dir, "./logs"),
     systemDir: stringOrDefault(rawLogging.systemDir, "system"),
     sessionDir: stringOrDefault(rawLogging.sessionDir, "sessions"),
+    captureTimeoutMs,
   };
 }
 
@@ -508,8 +627,36 @@ export function validateConfig(raw: unknown): ProxyConfig {
     providers: { ...(bedrock ? { bedrock } : {}), external },
     logging: validateLogging(raw.logging),
     chatPage: { enabled: isRecord(raw.chatPage) && raw.chatPage.enabled === true },
+    limits: validateLimits(raw.limits),
   };
   return Object.freeze(config);
+}
+
+/**
+ * Validate the optional `limits` block (SEC-4). Absent block or absent field
+ * falls back to `DEFAULT_REQUEST_LIMITS`. Each provided value must be a positive
+ * integer.
+ */
+function validateLimits(raw: unknown): RequestLimits {
+  if (raw === undefined) return DEFAULT_REQUEST_LIMITS;
+  assert(isRecord(raw), "config.limits must be an object");
+  const pos = (v: unknown, name: string, dflt: number): number => {
+    if (v === undefined) return dflt;
+    assert(
+      typeof v === "number" && Number.isInteger(v) && v > 0,
+      `config.limits.${name} must be a positive integer`,
+    );
+    return v;
+  };
+  return {
+    maxMessages: pos(raw.maxMessages, "maxMessages", DEFAULT_REQUEST_LIMITS.maxMessages),
+    maxContentBlocksPerMessage: pos(
+      raw.maxContentBlocksPerMessage,
+      "maxContentBlocksPerMessage",
+      DEFAULT_REQUEST_LIMITS.maxContentBlocksPerMessage,
+    ),
+    maxTools: pos(raw.maxTools, "maxTools", DEFAULT_REQUEST_LIMITS.maxTools),
+  };
 }
 
 /** Resolve a concrete AWS region for a region key. */
@@ -653,6 +800,7 @@ export function serializeConfig(
       ...(p.workspaceId ? { workspaceId: exact(p.workspaceId) } : {}),
       ...(p.region ? { region: p.region } : {}),
       countTokens: p.countTokens,
+      ...(p.strictTools ? { strictTools: true } : {}),
       modelsUrl: embed(p.modelsUrl),
     };
   }
@@ -670,8 +818,14 @@ export function serializeConfig(
       dir: config.logging.dir,
       systemDir: config.logging.systemDir,
       sessionDir: config.logging.sessionDir,
+      captureTimeoutMs: config.logging.captureTimeoutMs,
     },
     chatPage: { enabled: config.chatPage.enabled },
+    limits: {
+      maxMessages: config.limits.maxMessages,
+      maxContentBlocksPerMessage: config.limits.maxContentBlocksPerMessage,
+      maxTools: config.limits.maxTools,
+    },
   };
 }
 

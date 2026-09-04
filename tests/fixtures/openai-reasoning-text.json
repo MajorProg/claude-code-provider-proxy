@@ -1,0 +1,21 @@
+{
+  "choices": [
+    {
+      "finish_reason": "length",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": null,
+        "reasoning": " The user is asking for the product of 17 and 23.\nI need to compute 17 * 23.\n\nI can do this directly:\n17 * 23 = 391\n\nLet me verify:\n17 * 20 = 340\n17 * 3 = 51\n340 + 51 = 391\n\nAlternatively:\n23 * 10 = 230\n23 * 7 = 161\n230 + 161 = 391\n\nOr using the difference of squares pattern:\n17 * 23 = (20 - 3) * (20 + 3) =",
+        "refusal": null,
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1788518548,
+  "id": "chatcmpl-68a4a42c-802c-40d3-8330-793fd65de087",
+  "model": "moonshotai.kimi-k2-thinking",
+  "object": "chat.completion",
+  "service_tier": "default",
+  "usage": { "completion_tokens": 120, "prompt_tokens": 22, "total_tokens": 142 }
+}
