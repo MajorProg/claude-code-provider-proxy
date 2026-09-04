@@ -97,8 +97,12 @@ export interface DiscoveredModel {
   /** Provider id: "bedrock" or an external provider key (e.g. "deepseek"). */
   readonly provider: string;
   readonly awsRegion: string;
-  /** Region/profile family. "global" for single-endpoint external providers. */
-  readonly regionKey: RegionKey | "global";
+  /**
+   * Region/profile family. For Bedrock: "us" | "eu" | "global".
+   * For external providers: "global" (single-endpoint) or region code
+   * (multi-regional providers like Alibaba: "ap-southeast-1", "eu-central-1").
+   */
+  readonly regionKey: string;
   readonly backend: Backend;
   readonly nativeModelId: string;
   readonly isAnthropic: boolean;
@@ -296,6 +300,102 @@ export async function discoverExternalCatalog(
   await Promise.all(
     entries.map(async ([providerKey, provider]) => {
       const backend: Backend = provider.type === "anthropic" ? "anthropic" : "openai";
+
+      // Multi-region provider: discover from each configured region
+      if (provider.regions) {
+        await Promise.all(
+          Object.entries(provider.regions).map(async ([regionCode, region]) => {
+            const sourceId = `${providerKey}:${regionCode}`;
+            const cred = region.credential ?? provider.credential;
+
+            const credState = credentialState(cred);
+            if (credState === "empty" || credState === "placeholder") {
+              logger.warn("region credential unset, skipping discovery", {
+                provider: providerKey,
+                region: regionCode,
+              });
+              statuses.push({
+                source: sourceId,
+                state: "skipped",
+                detail: "credential unset or placeholder for region",
+              });
+              return;
+            }
+
+            if (backoff?.shouldSkip(sourceId)) {
+              statuses.push({
+                source: sourceId,
+                state: "skipped",
+                detail: "cooling down after discovery failure (PC9 backoff)",
+              });
+              return;
+            }
+
+            try {
+              assertSafeExternalOrigin(region.modelsUrl);
+              const res = await fetch(region.modelsUrl, {
+                headers: { authorization: `Bearer ${cred}` },
+                signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+              });
+
+              if (!res.ok) {
+                // Workspace hosts may 404 on /api/v1/models (Singapore does)
+                // Log but don\'t fail - other regions may work
+                logger.warn("region discovery returned non-ok", {
+                  provider: providerKey,
+                  region: regionCode,
+                  status: res.status,
+                });
+                backoff?.recordFailure(sourceId);
+                statuses.push({
+                  source: sourceId,
+                  state: "error",
+                  detail: `discovery returned HTTP ${res.status}`,
+                });
+                return;
+              }
+
+              const data = (await res.json()) as { data?: { id?: string }[] };
+              for (const m of data.data ?? []) {
+                if (!m.id) continue;
+                const nativeModelId = m.id.startsWith("models/")
+                  ? m.id.slice("models/".length)
+                  : m.id;
+
+                out.push({
+                  provider: providerKey,
+                  awsRegion: "",
+                  regionKey: regionCode, // ← Region code instead of "global"
+                  backend,
+                  nativeModelId,
+                  isAnthropic: provider.type === "anthropic",
+                  supportsOnDemand: true,
+                  profiles: [],
+                  streaming: true,
+                });
+              }
+
+              backoff?.recordSuccess(sourceId);
+              statuses.push({ source: sourceId, state: "ok" });
+            } catch (err) {
+              logger.error("region discovery failed", {
+                provider: providerKey,
+                region: regionCode,
+                message: errorMessage(err),
+              });
+              backoff?.recordFailure(sourceId);
+              statuses.push({
+                source: sourceId,
+                state: "error",
+                detail: errorMessage(err),
+              });
+            }
+          }),
+        );
+        return; // Exit early - multi-region handling complete
+      }
+
+      // Single-endpoint provider (existing logic)
       const credState = credentialState(provider.credential);
       if (credState === "empty" || credState === "placeholder") {
         logger.warn("external provider credential unset, skipping discovery", {
@@ -389,11 +489,7 @@ export async function discoverExternalCatalog(
 }
 
 /** Key used to look up a discovered model. */
-function catalogKey(
-  regionKey: RegionKey | "global",
-  backend: Backend,
-  nativeModelId: string,
-): string {
+function catalogKey(regionKey: string, backend: Backend, nativeModelId: string): string {
   return `${regionKey}|${backend}|${nativeModelId}`;
 }
 
@@ -416,11 +512,7 @@ export class Catalog {
     }
   }
 
-  get(
-    regionKey: RegionKey | "global",
-    backend: Backend,
-    nativeModelId: string,
-  ): DiscoveredModel | undefined {
+  get(regionKey: string, backend: Backend, nativeModelId: string): DiscoveredModel | undefined {
     return this.byKey.get(catalogKey(regionKey, backend, nativeModelId));
   }
 }

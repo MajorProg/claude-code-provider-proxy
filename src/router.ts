@@ -76,15 +76,45 @@ function makeRoute(
 function routeExternal(config: ProxyConfig, id: CanonicalId): RouteTarget {
   const provider = config.providers.external[id.provider];
   if (!provider) throw new UnsupportedProviderError(id.provider);
+
+  // Multi-region provider: select region from profilePrefix
+  let origin: string;
+  let credential: string;
+
+  if (provider.regions) {
+    // profilePrefix = region code (e.g., "ap-southeast-1")
+    const region = provider.regions[id.profilePrefix];
+    if (!region) {
+      throw new ModelNotFoundError(
+        `Region "${id.profilePrefix}" not configured for provider "${id.provider}"`,
+      );
+    }
+
+    // Build region-specific origin
+    if (region.hostTemplate) {
+      const host = region.hostTemplate
+        .replaceAll("{workspaceId}", region.workspaceId ?? "")
+        .replaceAll("{region}", region.region ?? "");
+      origin = `https://${host}${region.basePath ?? ""}`.replace(/\/+$/, "");
+    } else {
+      // Fallback to provider-level baseUrl if region has no hostTemplate
+      origin = provider.baseUrl;
+    }
+    credential = region.credential ?? provider.credential;
+  } else {
+    // Single-endpoint provider (existing logic)
+    origin = externalProviderOrigin(provider);
+    credential = provider.credential;
+  }
+
   // Configured but inactive (empty/placeholder credential, e.g. "${VAR:-}"
   // before the env var is set) — a distinct, actionable error.
-  if (!isCredentialSet(provider.credential)) {
+  if (!isCredentialSet(credential)) {
     throw new ProviderDisabledError(
       id.provider,
       "credential is unset or a placeholder; set the provider API key and reload",
     );
   }
-  const origin = externalProviderOrigin(provider);
 
   if (provider.type === "anthropic") {
     // Native Anthropic — passthrough (Path P). Single global endpoint.

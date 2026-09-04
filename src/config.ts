@@ -54,6 +54,42 @@ export const DEFAULT_BEDROCK_HOSTS: Readonly<{
 export type ProviderAuthStyle = "x-api-key" | "bearer";
 
 /**
+ * Regional endpoint configuration for multi-region external providers.
+ * When present, the provider supports routing via region codes in the canonical ID
+ * (e.g., "alibaba.anthropic.ap-southeast-1.qwen3-max"). Each region has its own
+ * host template, credential, and discovery endpoint.
+ */
+export interface ExternalProviderRegion {
+  /**
+   * Host template with `{workspaceId}` and `{region}` placeholders.
+   * Example: "dashscope-intl.aliyuncs.com" or "{workspaceId}.{region}.maas.aliyuncs.com"
+   */
+  readonly hostTemplate?: string;
+  /** Path appended after the templated host (e.g. `/apps/anthropic`). */
+  readonly basePath?: string;
+  /** Value substituted for `{workspaceId}` in `hostTemplate`. */
+  readonly workspaceId?: string;
+  /** Value substituted for `{region}` in `hostTemplate` (e.g. `eu-central-1`). */
+  readonly region?: string;
+  /**
+   * Region-specific credential. Falls back to provider-level credential
+   * if unset. Required when billingMode === "payg" (workspace endpoints).
+   */
+  readonly credential?: string;
+  /**
+   * Discovery endpoint for this region (an OpenAI-style `/models` URL).
+   * Model IDs are fetched from here at runtime.
+   */
+  readonly modelsUrl: string;
+  /**
+   * Billing mode: "token-plan" (free dev tier) vs "payg" (production).
+   * Used for UI hints and error messages. Workspace-dedicated endpoints
+   * are PAYG-only; shared international endpoints support Token Plans.
+   */
+  readonly billingMode?: "token-plan" | "payg";
+}
+
+/**
  * A non-Bedrock, provider-hosted endpoint reached over one of the existing
  * translation paths:
  *   - type "anthropic" -> native Anthropic Messages (passthrough path)
@@ -64,6 +100,8 @@ export type ProviderAuthStyle = "x-api-key" | "bearer";
  * (e.g. `"${ZAI_API_KEY:-}"` before the env var is set) — an empty or
  * placeholder credential means the provider is skipped at discovery time with
  * a warning until the key is set.
+ *
+ * Multi-region providers set a `regions` map with per-region configuration.
  */
 export interface ExternalProviderConfig {
   readonly type: "anthropic" | "openai";
@@ -109,6 +147,28 @@ export interface ExternalProviderConfig {
    * host. Discovery authenticates with a bearer token by convention.
    */
   readonly modelsUrl: string;
+  /**
+   * Optional regional endpoint configuration. When present, the provider
+   * supports multi-regional routing via region codes in the canonical ID
+   * (e.g., "alibaba.anthropic.ap-southeast-1.qwen3-max"). Each region has
+   * its own host template, credential, and discovery endpoint.
+   *
+   * Example: alibaba with Singapore (Token Plan) and EU (PAYG) regions:
+   * {
+   *   "ap-southeast-1": {
+   *     "hostTemplate": "dashscope-intl.aliyuncs.com",
+   *     "modelsUrl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+   *     "billingMode": "token-plan"
+   *   },
+   *   "eu-central-1": {
+   *     "hostTemplate": "{workspaceId}.eu-central-1.maas.aliyuncs.com",
+   *     "workspaceId": "${WORKSPACE_ID_EU}",
+   *     "credential": "${API_KEY_EU}",
+   *     "billingMode": "payg"
+   *   }
+   * }
+   */
+  readonly regions?: Record<string, ExternalProviderRegion>;
 }
 
 /**
