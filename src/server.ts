@@ -1143,6 +1143,9 @@ async function main(): Promise<void> {
     hostname: host,
     port: PORT,
     fetch: handler,
+    // Set idle timeout to 0 (disabled) to prevent ECONNRESET errors
+    // from long-lived agent connections being closed by Bun's default 10s timeout
+    idleTimeout: 0,
   });
 
   console.log(
