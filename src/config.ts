@@ -3,12 +3,21 @@
  *
  * - Loads a JSONC config file (comments allowed).
  * - Interpolates ${ENV_VAR} references from the environment.
- * - Validates the shape and fails fast on any invalid value.
+ * - Validates the shape. STRUCTURAL errors (wrong types, bad enum values,
+ *   non-https URLs) fail fast; MISSING ENVIRONMENT INFO degrades instead: a
+ *   bare `${VAR}` whose env var is unset resolves empty (recorded as a load
+ *   warning), an empty credential/URL deactivates that provider or region with
+ *   a reason, and a missing inbound key mints an ephemeral one. Booting with
+ *   zero providers must never crash the server.
  *
  * The config is the ONLY place region/provider specifics live. Source code
  * contains lookups, never hardcoded catalogs (DESIGN §7).
  */
+import { copyFileSync, statSync } from "node:fs";
+import type { Stats } from "node:fs";
+import { dirname, join } from "node:path";
 import { ConfigError } from "./errors.ts";
+import { type CanonicalId, parseCanonicalId } from "./model/canonical-id.ts";
 
 export type RegionKey = "us" | "eu";
 export type ProfilePreference = "global" | "regional" | "auto";
@@ -54,12 +63,59 @@ export const DEFAULT_BEDROCK_HOSTS: Readonly<{
 export type ProviderAuthStyle = "x-api-key" | "bearer";
 
 /**
+ * One entry of a provider's credential pool (docs/VIRTUAL_MODELS.md). `label` is
+ * operator metadata for logs/UI/cost attribution — never used for matching and
+ * never a secret. Entries with an empty credential are filtered at validation;
+ * placeholder (`REPLACE_ME`) entries survive validation and are filtered at
+ * routing time (preserving the distinct "placeholder" error path).
+ */
+export interface CredentialPoolEntry {
+  readonly credential: string;
+  readonly label?: string;
+}
+
+/**
+ * Normalize a raw `credentials` array (unknown shape) into a pool: keep record
+ * entries with a non-empty string credential; non-records / empty credentials
+ * are dropped (missing-info tolerance); labels kept verbatim when non-empty
+ * strings. Shared by the provider and region validators.
+ */
+function validateCredentialPool(raw: unknown): CredentialPoolEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const pool: CredentialPoolEntry[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) continue;
+    const credential = entry.credential;
+    if (typeof credential !== "string" || credential === "") continue;
+    const label = entry.label;
+    pool.push({
+      credential,
+      ...(typeof label === "string" && label !== "" ? { label } : {}),
+    });
+  }
+  return pool;
+}
+
+/** The pool a flat `credential: "x"` normalizes to. */
+const DEFAULT_POOL_LABEL = "default";
+
+/**
  * Regional endpoint configuration for multi-region external providers.
  * When present, the provider supports routing via region codes in the canonical ID
  * (e.g., "alibaba.anthropic.ap-southeast-1.qwen3-max"). Each region has its own
  * host template, credential, and discovery endpoint.
+ *
+ * An inactive region (see `inactiveReason`) is skipped at discovery and routed
+ * with a clean 404 — it never blocks the provider's other regions or the boot.
  */
 export interface ExternalProviderRegion {
+  /**
+   * Computed at validation time: when set, the region is INACTIVE (its config
+   * references env vars that are unset — e.g. an empty `workspaceId` after
+   * `${WORKSPACE_ID}` resolved empty). Never trusted from input or serialized;
+   * discovery surfaces it as a `skipped` SourceStatus.
+   */
+  readonly inactiveReason?: string;
   /**
    * Host template with `{workspaceId}` and `{region}` placeholders.
    * Example: "dashscope-intl.aliyuncs.com" or "{workspaceId}.{region}.maas.aliyuncs.com"
@@ -72,8 +128,15 @@ export interface ExternalProviderRegion {
   /** Value substituted for `{region}` in `hostTemplate` (e.g. `eu-central-1`). */
   readonly region?: string;
   /**
-   * Region-specific credential. Falls back to provider-level credential
-   * if unset. Required when billingMode === "payg" (workspace endpoints).
+   * Region-specific credential pool. ABSENT = inherit the provider's pool at
+   * routing/discovery time; PRESENT-but-empty (after filtering) marks the
+   * region inactive. A flat `credential:` normalizes to a one-entry pool.
+   */
+  readonly credentials?: readonly CredentialPoolEntry[];
+  /**
+   * DERIVED convenience (= `credentials[0]?.credential ?? ""` when the region
+   * owns a pool) so `region.credential ?? provider.credential` reads keep
+   * working. Never trusted from input.
    */
   readonly credential?: string;
   /**
@@ -105,7 +168,20 @@ export interface ExternalProviderRegion {
  */
 export interface ExternalProviderConfig {
   readonly type: "anthropic" | "openai";
+  /**
+   * DERIVED convenience (= `credentials[0]?.credential ?? ""`): the primary
+   * pool credential. Kept so existing single-key reads compile; never trusted
+   * from input — the pool below is the source of truth.
+   */
   readonly credential: string;
+  /**
+   * Ordered credential pool (docs/VIRTUAL_MODELS.md): request-time failover walks
+   * it in config order (next key before next model). Always present after
+   * validation, possibly EMPTY (= provider inactive). An input `credentials`
+   * array wins over a flat `credential:`; the flat form normalizes to a
+   * one-entry pool labeled "default".
+   */
+  readonly credentials: readonly CredentialPoolEntry[];
   readonly auth: ProviderAuthStyle;
   /**
    * Base URL WITHOUT a trailing `/v1/messages` or `/chat/completions`.
@@ -169,6 +245,14 @@ export interface ExternalProviderConfig {
    * }
    */
   readonly regions?: Record<string, ExternalProviderRegion>;
+  /**
+   * Computed at validation time: when set, the provider is INACTIVE (missing
+   * info — e.g. an empty `modelsUrl`/`workspaceId` after an unset env ref
+   * resolved empty). Discovery skips it with a `skipped` SourceStatus carrying
+   * this reason; routing returns a clean 404. Never trusted from input, never
+   * serialized; STRUCTURAL errors (bad types/schemes) stay fatal instead.
+   */
+  readonly inactiveReason?: string;
 }
 
 /**
@@ -229,6 +313,10 @@ export function assertSafeExternalOrigin(origin: string): void {
 function isBlockedHost(host: string): boolean {
   const h = host.toLowerCase().replace(/^\[|\]$/g, ""); // strip IPv6 brackets
   if (h === "localhost") return false; // explicit local dev, allowed
+  // Degenerate empty-label host (e.g. ".foo.bar") from an env substitution that
+  // resolved empty inside a hostTemplate — URL parsers accept it, but it can
+  // never be a real endpoint; reject rather than fetch garbage.
+  if (h.startsWith(".")) return true;
 
   // IPv6 loopback / link-local / unique-local.
   if (h === "::1") return true;
@@ -280,9 +368,51 @@ export interface ChatPageConfig {
   readonly enabled: boolean;
 }
 
+/**
+ * Reserved prefix for process-minted inbound keys (`PROXY_INBOUND_KEY` unset).
+ * Distinct from the `ccpp_` prefix used by the CLI's `generateAuthToken`, so
+ * prefix-based handling is unambiguous. Validation treats any entry carrying
+ * this prefix as a runtime artifact — stripped and re-minted, never operator
+ * input — and serialization rewrites it to the bare `${PROXY_INBOUND_KEY}` ref
+ * so an ephemeral key is never persisted.
+ */
+export const EPHEMERAL_INBOUND_KEY_PREFIX = "ccpp-ephemeral-";
+
+/** True when `key` is a process-minted ephemeral inbound key. */
+export function isEphemeralInboundKey(key: string): boolean {
+  return key.startsWith(EPHEMERAL_INBOUND_KEY_PREFIX);
+}
+
+/** Mint a fresh random inbound key: `ccpp-ephemeral-<32 hex>` (16 random bytes). */
+export function generateEphemeralInboundKey(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${EPHEMERAL_INBOUND_KEY_PREFIX}${hex}`;
+}
+
+/**
+ * Inbound auth: keys Claude Code presents (via `Authorization: Bearer` or
+ * `x-api-key`). When `PROXY_INBOUND_KEY` (or an equivalent env ref) resolves
+ * empty, validation mints a single EPHEMERAL key and marks it — auth stays
+ * enforced, the key changes on every restart/reload, and it is never persisted.
+ */
+export interface InboundAuthConfig {
+  readonly keys: readonly string[];
+  /** Present only when `keys` holds a key minted this process. */
+  readonly ephemeralKey?: true;
+}
+
 export interface ProxyConfig {
   readonly server: { readonly host: string; readonly port: number };
-  readonly inboundAuth: { readonly keys: readonly string[] };
+  readonly inboundAuth: InboundAuthConfig;
+  /**
+   * Set (only) by {@link loadConfig} when env interpolation resolved bare
+   * `${VAR}` refs to empty (vars unset/empty). Surfaced by /status.json,
+   * /api/config/status, and doctor; never set by validateConfig (a UI save has
+   * no load-time warnings) and never serialized.
+   */
+  readonly loadWarnings?: readonly string[];
   readonly primaryRegion: RegionKey;
   readonly profilePreference: ProfilePreference;
   readonly refreshIntervalMinutes: number;
@@ -301,7 +431,24 @@ export interface ProxyConfig {
   readonly chatPage: ChatPageConfig;
   /** Inbound request resource caps (SEC-4). Always present (defaults applied). */
   readonly limits: RequestLimits;
+  /**
+   * Virtual model tiers (docs/VIRTUAL_MODELS.md): tier name → ordered list of real
+   * canonical ids, addressable as `virtual.anthropic.global.<tier>`. Optional;
+   * entries that don't parse as canonical ids (or nest `virtual.` ids) are
+   * dropped at load with a warning. Availability filtering happens at ROUTING
+   * time — this map preserves config order verbatim so a UI save never
+   * shrinks a tier.
+   */
+  readonly virtualModels?: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Total upstream attempts (candidates × pool keys) per request before the
+   * last error is relayed. Always present (default {@link DEFAULT_FAILOVER_ATTEMPTS}).
+   */
+  readonly maxFailoverAttempts: number;
 }
+
+/** Default pre-stream failover attempt cap (docs/VIRTUAL_MODELS.md). */
+export const DEFAULT_FAILOVER_ATTEMPTS = 4;
 
 /**
  * Configurable caps on inbound request size dimensions (SEC-4). These bound the
@@ -397,15 +544,22 @@ const ENV_REF = /\$\{([A-Z0-9_]+)(?::-([^}]*))?\}/g;
 /**
  * Replace ${ENV_VAR} / ${ENV_VAR:-default} tokens with values from `env`.
  *
- * - Bare ${VAR} fails fast when unset OR empty (DESIGN §10).
- * - ${VAR:-default} substitutes the literal default instead — the default may
- *   be empty, which expresses "configured but inactive until the env var is
- *   set" (empty provider credentials are skipped at discovery time).
+ * - ${VAR:-default} substitutes the literal default when unset/empty — the
+ *   default may be empty, which expresses "configured but inactive until the
+ *   env var is set" (empty provider credentials are skipped at discovery).
+ * - Bare ${VAR} resolves to "" when unset/empty, and the var name is recorded
+ *   in `missing` so the caller can surface a load warning. Missing environment
+ *   info degrades (provider/region inactive, ephemeral inbound key) instead of
+ *   failing the boot; structural config errors still fail fast.
  *
  * Env values are runtime data, so they are escaped for the surrounding JSON
  * string; default text is file-source and inserted verbatim.
  */
-function interpolateEnv(text: string, env: Record<string, string | undefined>): string {
+function interpolateEnv(
+  text: string,
+  env: Record<string, string | undefined>,
+  missing: Set<string>,
+): string {
   return text.replace(ENV_REF, (_match, name: string, fallback: string | undefined) => {
     const value = env[name];
     if (value !== undefined && value !== "") {
@@ -413,7 +567,8 @@ function interpolateEnv(text: string, env: Record<string, string | undefined>): 
       return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
     }
     if (fallback !== undefined) return fallback;
-    throw new ConfigError(`Config references unset environment variable: \${${name}}`);
+    missing.add(name);
+    return "";
   });
 }
 
@@ -481,17 +636,27 @@ function validateServer(raw: unknown): { host: string; port: number } {
   return { host, port };
 }
 
-function validateInboundAuth(raw: unknown): { keys: string[] } {
+/**
+ * Validate inbound auth. Entries may legitimately resolve empty (e.g. bare
+ * `${PROXY_INBOUND_KEY}` with the env var unset) — empties are filtered, and
+ * when nothing remains an EPHEMERAL key is minted so `keys` is always non-empty
+ * (every auth call site assumes at least one key) and auth is never bypassed:
+ * `extractInboundCredential` can never produce "" so an empty key matches
+ * nothing. Ephemeral-prefixed entries are runtime artifacts — stripped and
+ * re-minted so a stale one from a GET round-trip never becomes a real key.
+ */
+function validateInboundAuth(raw: unknown): InboundAuthConfig {
   assert(isRecord(raw), "config.inboundAuth must be an object");
-  const keys = raw.keys;
-  assert(
-    Array.isArray(keys) && keys.length > 0,
-    "config.inboundAuth.keys must be a non-empty array",
-  );
-  for (const k of keys) {
-    assertNonEmptyString(k, "config.inboundAuth.keys entry");
+  assert(Array.isArray(raw.keys), "config.inboundAuth.keys must be an array");
+  const kept: string[] = [];
+  for (const k of raw.keys) {
+    assert(typeof k === "string", "config.inboundAuth.keys entry must be a string");
+    if (k.length > 0 && !isEphemeralInboundKey(k)) kept.push(k);
   }
-  return { keys: [...(keys as string[])] };
+  if (kept.length === 0) {
+    return { keys: [generateEphemeralInboundKey()], ephemeralKey: true };
+  }
+  return { keys: kept };
 }
 
 function validateRegions(raw: unknown, primaryRegion: RegionKey): RegionConfig[] {
@@ -542,30 +707,39 @@ function validateBedrockProvider(raw: unknown): BedrockProviderConfig {
 
 const VALID_EXTERNAL_TYPES = ["anthropic", "openai"] as const;
 const VALID_AUTH_STYLES: readonly ProviderAuthStyle[] = ["x-api-key", "bearer"];
+const VALID_BILLING_MODES = ["token-plan", "payg"] as const;
 
-function validateExternalProvider(key: string, raw: unknown): ExternalProviderConfig {
-  const where = `config.providers.${key}`;
+/**
+ * Validate one entry of a provider's `regions` map. Same missing-info policy as
+ * the provider level: structural errors (non-record, non-string modelsUrl, bad
+ * scheme, unknown placeholder, bad billingMode) are fatal; an empty-but-typed
+ * field (e.g. workspaceId/modelsUrl after an unset `${VAR}` resolved empty)
+ * yields a per-region `inactiveReason` so this region is skipped while sibling
+ * regions keep working.
+ */
+function validateExternalProviderRegion(
+  providerKey: string,
+  regionKey: string,
+  raw: unknown,
+): ExternalProviderRegion {
+  const where = `config.providers.${providerKey}.regions.${regionKey}`;
   assert(isRecord(raw), `${where} must be an object`);
-  const ptype = raw.type;
-  assert(
-    VALID_EXTERNAL_TYPES.includes(ptype as (typeof VALID_EXTERNAL_TYPES)[number]),
-    `${where}.type must be one of ${VALID_EXTERNAL_TYPES.join(", ")}`,
-  );
-  const credential = assertString(raw.credential, `${where}.credential`);
-  const auth = raw.auth;
-  assert(
-    VALID_AUTH_STYLES.includes(auth as ProviderAuthStyle),
-    `${where}.auth must be one of ${VALID_AUTH_STYLES.join(", ")}`,
-  );
-  const hasHostTemplate = typeof raw.hostTemplate === "string";
-  if (hasHostTemplate) {
-    const hostTemplate = raw.hostTemplate as string;
-    assertNonEmptyString(
-      raw.workspaceId,
-      `${where}.workspaceId (required when hostTemplate is set)`,
+  let inactiveReason: string | undefined;
+
+  // modelsUrl is the region's discovery endpoint: required, secure — but an
+  // EMPTY string (env ref resolved empty) deactivates just this region.
+  const modelsUrl = assertString(raw.modelsUrl, `${where}.modelsUrl`);
+  if (modelsUrl === "") {
+    inactiveReason = `${where}.modelsUrl is empty (unset env ref?) — region inactive`;
+  } else {
+    assert(
+      isSecureExternalUrl(modelsUrl),
+      `${where}.modelsUrl must be an https:// discovery URL (http:// allowed only for localhost)`,
     );
-    // Every {placeholder} in the template must be a known key AND have a
-    // non-empty value, so the origin never silently substitutes to "" at load.
+  }
+
+  if (typeof raw.hostTemplate === "string") {
+    const hostTemplate = raw.hostTemplate as string;
     const known: Record<string, unknown> = {
       workspaceId: raw.workspaceId,
       region: raw.region,
@@ -576,24 +750,182 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
         placeholder in known,
         `${where}.hostTemplate has unknown placeholder {${placeholder}} (expected {workspaceId} or {region})`,
       );
-      assertNonEmptyString(
-        known[placeholder],
-        `${where}.${placeholder} (required by hostTemplate placeholder {${placeholder}})`,
+      const value = known[placeholder];
+      assert(
+        typeof value === "string",
+        `${where}.${placeholder} must be a string (required by hostTemplate placeholder {${placeholder}})`,
       );
+      if (value === "") {
+        inactiveReason ??= `${where}.${placeholder} is empty (unset env ref?) — cannot build region host`;
+      }
     }
-  } else {
+  }
+
+  // Region credential pool: an explicit `credentials` array (or a flat
+  // `credential`) makes this region OWN a pool; ABSENT = inherit the provider
+  // pool. A present-but-empty pool (unset env refs) deactivates the region.
+  let credentials: readonly CredentialPoolEntry[] | undefined;
+  if (raw.credentials !== undefined || raw.credential !== undefined) {
+    let pool: CredentialPoolEntry[];
+    if (raw.credentials !== undefined) {
+      pool = validateCredentialPool(raw.credentials);
+    } else {
+      const flat = assertString(raw.credential, `${where}.credential`);
+      pool = flat === "" ? [] : [{ credential: flat, label: DEFAULT_POOL_LABEL }];
+    }
+    if (pool.length === 0) {
+      inactiveReason ??= `${where} credential pool is empty (unset env ref?) — region inactive`;
+    }
+    credentials = pool;
+  }
+  if (raw.billingMode !== undefined) {
     assert(
-      typeof raw.baseUrl === "string" && isSecureExternalUrl(raw.baseUrl),
-      `${where}.baseUrl must be an https:// URL (http:// allowed only for localhost)`,
+      VALID_BILLING_MODES.includes(raw.billingMode as (typeof VALID_BILLING_MODES)[number]),
+      `${where}.billingMode must be one of ${VALID_BILLING_MODES.join(", ")}`,
     );
   }
+
+  return {
+    modelsUrl,
+    ...(typeof raw.hostTemplate === "string" ? { hostTemplate: raw.hostTemplate } : {}),
+    ...(typeof raw.basePath === "string" ? { basePath: raw.basePath } : {}),
+    ...(typeof raw.workspaceId === "string" ? { workspaceId: raw.workspaceId } : {}),
+    ...(typeof raw.region === "string" ? { region: raw.region } : {}),
+    ...(credentials !== undefined ? { credentials } : {}),
+    ...(credentials !== undefined && credentials.length > 0
+      ? { credential: (credentials[0] as CredentialPoolEntry).credential }
+      : {}),
+    ...(raw.billingMode !== undefined
+      ? { billingMode: raw.billingMode as "token-plan" | "payg" }
+      : {}),
+    ...(inactiveReason !== undefined ? { inactiveReason } : {}),
+  };
+}
+
+/**
+ * Validate an external provider. Structural errors (bad type/auth enums,
+ * non-string credential, non-secure URL schemes, unknown hostTemplate
+ * placeholders) stay fatal. MISSING INFO (empty workspaceId / modelsUrl /
+ * baseUrl after an unset bare `${VAR}` resolved empty) sets `inactiveReason`
+ * instead — the provider is skipped at discovery with that reason and routed
+ * as a clean 404, never a boot crash. A `regions`-only provider (no baseUrl,
+ * no hostTemplate) is valid: the regions carry the endpoints; provider-level
+ * `modelsUrl` may then be absent.
+ */
+function validateExternalProvider(key: string, raw: unknown): ExternalProviderConfig {
+  const where = `config.providers.${key}`;
+  assert(isRecord(raw), `${where} must be an object`);
+  const ptype = raw.type;
   assert(
-    typeof raw.modelsUrl === "string" && isSecureExternalUrl(raw.modelsUrl),
-    `${where}.modelsUrl must be an https:// discovery URL (http:// allowed only for localhost)`,
+    VALID_EXTERNAL_TYPES.includes(ptype as (typeof VALID_EXTERNAL_TYPES)[number]),
+    `${where}.type must be one of ${VALID_EXTERNAL_TYPES.join(", ")}`,
   );
+  const flatCredential =
+    raw.credential === undefined ? "" : assertString(raw.credential, `${where}.credential`);
+  const auth = raw.auth;
+  assert(
+    VALID_AUTH_STYLES.includes(auth as ProviderAuthStyle),
+    `${where}.auth must be one of ${VALID_AUTH_STYLES.join(", ")}`,
+  );
+
+  // Credential pool: an input `credentials` array wins over the flat form; the
+  // flat form normalizes to a one-entry "default" pool. Empty entries are
+  // filtered; an entirely-empty pool deactivates the provider (appended AFTER
+  // the host/URL reasons below so those stay first).
+  const credentials: readonly CredentialPoolEntry[] =
+    raw.credentials !== undefined
+      ? validateCredentialPool(raw.credentials)
+      : flatCredential === ""
+        ? []
+        : [{ credential: flatCredential, label: DEFAULT_POOL_LABEL }];
+
+  // Regions map: validate + PRESERVE (each region independently skippable).
+  let regions: Record<string, ExternalProviderRegion> | undefined;
+  if (raw.regions !== undefined) {
+    assert(isRecord(raw.regions), `${where}.regions must be an object`);
+    const map: Record<string, ExternalProviderRegion> = {};
+    for (const [regionKey, rawRegion] of Object.entries(raw.regions)) {
+      map[regionKey] = validateExternalProviderRegion(key, regionKey, rawRegion);
+    }
+    regions = map;
+  }
+
+  let inactiveReason: string | undefined;
+  const hasHostTemplate = typeof raw.hostTemplate === "string";
+  if (hasHostTemplate) {
+    const hostTemplate = raw.hostTemplate as string;
+    // workspaceId must be a string; an EMPTY one (unset env ref) deactivates
+    // the provider rather than silently substituting "" into the host.
+    if (typeof raw.workspaceId !== "string") {
+      throw new ConfigError(
+        `${where}.workspaceId must be a string (required when hostTemplate is set)`,
+      );
+    }
+    if (raw.workspaceId === "") {
+      inactiveReason ??= `${where}.workspaceId is empty (unset env ref?) — cannot build provider host`;
+    }
+    // Every {placeholder} in the template must be a known key (typo => fatal)
+    // with a string value; an empty value deactivates the provider.
+    const known: Record<string, unknown> = {
+      workspaceId: raw.workspaceId,
+      region: raw.region,
+    };
+    for (const match of hostTemplate.matchAll(/\{([^}]+)\}/g)) {
+      const placeholder = match[1] as string;
+      assert(
+        placeholder in known,
+        `${where}.hostTemplate has unknown placeholder {${placeholder}} (expected {workspaceId} or {region})`,
+      );
+      const value = known[placeholder];
+      assert(
+        typeof value === "string",
+        `${where}.${placeholder} must be a string (required by hostTemplate placeholder {${placeholder}})`,
+      );
+      if (value === "") {
+        inactiveReason ??= `${where}.${placeholder} is empty (unset env ref?) — cannot build provider host`;
+      }
+    }
+  } else if (raw.baseUrl !== undefined || regions === undefined) {
+    // Flat-endpoint provider (or one whose baseUrl is explicitly present):
+    // a NON-EMPTY baseUrl must be a secure URL (structural); an empty/absent
+    // one is missing info — fatal only for providers with no regions.
+    const baseUrl = assertString(raw.baseUrl, `${where}.baseUrl`);
+    if (baseUrl === "") {
+      if (regions === undefined) {
+        inactiveReason ??= `${where}.baseUrl is empty (unset env ref?) — provider inactive`;
+      }
+    } else {
+      assert(
+        isSecureExternalUrl(baseUrl),
+        `${where}.baseUrl must be an https:// URL (http:// allowed only for localhost)`,
+      );
+    }
+  }
+
+  // Provider-level modelsUrl: required for single-endpoint providers; may be
+  // absent (=> "") for regions-only providers, where each region has its own.
+  let modelsUrl = "";
+  if (raw.modelsUrl !== undefined || regions === undefined) {
+    modelsUrl = assertString(raw.modelsUrl, `${where}.modelsUrl`);
+    if (modelsUrl === "") {
+      inactiveReason ??= `${where}.modelsUrl is empty (unset env ref?) — provider inactive`;
+    } else {
+      assert(
+        isSecureExternalUrl(modelsUrl),
+        `${where}.modelsUrl must be an https:// discovery URL (http:// allowed only for localhost)`,
+      );
+    }
+  }
+
+  // Empty pool = missing info (all env refs unset) — deactivate, never fatal.
+  if (credentials.length === 0) {
+    inactiveReason ??= `${where} credential pool is empty (unset env ref?) — provider inactive`;
+  }
+
   return {
     type: ptype as "anthropic" | "openai",
-    credential,
+    credential: credentials.length > 0 ? (credentials[0] as CredentialPoolEntry).credential : "",
+    credentials,
     auth: auth as ProviderAuthStyle,
     baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl.replace(/\/+$/, "") : "",
     ...(typeof raw.hostTemplate === "string" ? { hostTemplate: raw.hostTemplate } : {}),
@@ -602,7 +934,9 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     ...(typeof raw.region === "string" ? { region: raw.region } : {}),
     countTokens: raw.countTokens === true,
     ...(raw.strictTools === true ? { strictTools: true } : {}),
-    modelsUrl: raw.modelsUrl,
+    modelsUrl,
+    ...(regions !== undefined ? { regions } : {}),
+    ...(inactiveReason !== undefined ? { inactiveReason } : {}),
   };
 }
 
@@ -631,6 +965,53 @@ function validateLogging(raw: unknown): LoggingConfig {
     sessionDir: stringOrDefault(rawLogging.sessionDir, "sessions"),
     captureTimeoutMs,
   };
+}
+
+/**
+ * Validate the optional `virtualModels` block (docs/VIRTUAL_MODELS.md). Missing-info
+ * tolerant: an entry is DROPPED (not fatal) when it is not a string, fails
+ * `parseCanonicalId`, or nests a `virtual.` id; a tier left empty is dropped;
+ * an emptied block returns undefined. Config order is preserved verbatim —
+ * availability filtering happens at routing time, never here (a UI save must
+ * not shrink tiers).
+ */
+function validateVirtualModels(
+  raw: unknown,
+): Readonly<Record<string, readonly string[]>> | undefined {
+  if (raw === undefined) return undefined;
+  assert(isRecord(raw), "config.virtualModels must be an object");
+  const out: Record<string, readonly string[]> = {};
+  for (const [tier, entries] of Object.entries(raw)) {
+    assert(Array.isArray(entries), `config.virtualModels["${tier}"] must be an array`);
+    const kept: string[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== "string") continue;
+      let parsed: CanonicalId;
+      try {
+        parsed = parseCanonicalId(entry);
+      } catch {
+        continue;
+      }
+      if (parsed.provider === "virtual") continue; // no nested tiers
+      kept.push(entry);
+    }
+    if (kept.length > 0) out[tier] = kept;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Validate `maxFailoverAttempts`: absent → default; otherwise a positive
+ * integer (bounded to 16 so a typo can't turn one request into an unbounded
+ * retry storm).
+ */
+function validateMaxFailoverAttempts(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_FAILOVER_ATTEMPTS;
+  assert(
+    typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= 16,
+    "config.maxFailoverAttempts must be an integer in [1, 16]",
+  );
+  return raw;
 }
 
 /** Validate a parsed object into a typed, frozen ProxyConfig. */
@@ -675,6 +1056,7 @@ export function validateConfig(raw: unknown): ProxyConfig {
       ? undefined
       : validateBedrockProvider(raw.providers.bedrock);
   const external = validateExternalProviders(raw.providers);
+  const virtualModels = validateVirtualModels(raw.virtualModels);
 
   const config: ProxyConfig = {
     server,
@@ -688,6 +1070,8 @@ export function validateConfig(raw: unknown): ProxyConfig {
     logging: validateLogging(raw.logging),
     chatPage: { enabled: isRecord(raw.chatPage) && raw.chatPage.enabled === true },
     limits: validateLimits(raw.limits),
+    maxFailoverAttempts: validateMaxFailoverAttempts(raw.maxFailoverAttempts),
+    ...(virtualModels !== undefined ? { virtualModels } : {}),
   };
   return Object.freeze(config);
 }
@@ -744,7 +1128,56 @@ export function hostForRegion(template: string, awsRegion: string): string {
 }
 
 /**
- * Load, interpolate, and validate config from a JSONC file.
+ * Shared load body: interpolate → parse → validate. Bare `${VAR}` refs whose
+ * env var is unset/empty resolve to "" and land in `missing` (the caller
+ * decides how to surface them). Structural errors still throw.
+ */
+async function configFromText(
+  rawText: string,
+  env: Record<string, string | undefined>,
+  missing: Set<string>,
+  sourceLabel: string,
+): Promise<ProxyConfig> {
+  const interpolated = interpolateEnv(stripJsonComments(rawText), env, missing);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(interpolated);
+  } catch (err) {
+    throw new ConfigError(`${sourceLabel} is not valid JSON after processing`, { cause: err });
+  }
+  const validated = validateConfig(parsed);
+  warnDroppedVirtualEntries(parsed, validated);
+  if (missing.size > 0) {
+    const names = [...missing].sort().join(", ");
+    console.warn(`config: unset env var(s) resolved empty: ${names}`);
+    return Object.freeze({ ...validated, loadWarnings: [...missing].sort() });
+  }
+  return validated;
+}
+
+/**
+ * Warn (load-time only; validateConfig must stay warning-free) about
+ * virtualModels entries dropped by validation — unparseable ids, nested
+ * `virtual.` tiers, non-strings. The root cause of an empty-after-interpolation
+ * entry is already covered by the missing-env warning.
+ */
+function warnDroppedVirtualEntries(parsed: unknown, validated: ProxyConfig): void {
+  if (!isRecord(parsed) || !isRecord(parsed.virtualModels)) return;
+  for (const [tier, entries] of Object.entries(parsed.virtualModels)) {
+    if (!Array.isArray(entries)) continue;
+    const kept = validated.virtualModels?.[tier] ?? [];
+    for (const entry of entries) {
+      if (typeof entry === "string" && !kept.includes(entry)) {
+        console.warn(`config: virtualModels["${tier}"] dropped unusable entry "${entry}"`);
+      }
+    }
+  }
+}
+
+/**
+ * Load, interpolate, and validate config from a JSONC file. Strict: a missing
+ * file throws (callers wanting boot resilience use {@link loadConfigResilient}
+ * instead). Missing env info is non-fatal — see {@link configFromText}.
  * @param path Path to the config file.
  * @param env  Environment used for ${ENV} interpolation (defaults to Bun.env).
  */
@@ -756,15 +1189,96 @@ export async function loadConfig(
   if (!(await file.exists())) {
     throw new ConfigError(`Config file not found: ${path}`);
   }
-  const rawText = await file.text();
-  const interpolated = interpolateEnv(stripJsonComments(rawText), env);
-  let parsed: unknown;
+  return configFromText(await file.text(), env, new Set(), `Config file ${path}`);
+}
+
+/**
+ * Last-resort raw config for {@link loadConfigResilient}: boots a zero-provider
+ * proxy (Bedrock absent ⇒ disabled; no external providers) with logging off
+ * (a read-only filesystem must not add a fatal path) and NO inbound key —
+ * validation mints an ephemeral one. Exported for tests.
+ */
+export const DEFAULT_CONFIG_RAW: Record<string, unknown> = Object.freeze({
+  server: Object.freeze({ host: "127.0.0.1", port: 8787 }),
+  inboundAuth: Object.freeze({ keys: Object.freeze([]) }),
+  primaryRegion: "us",
+  profilePreference: "global",
+  refreshIntervalMinutes: 60,
+  claudeFallbackToMantle: false,
+  regions: Object.freeze([Object.freeze({ key: "us", awsRegion: "us-east-1" })]),
+  providers: Object.freeze({}),
+  logging: Object.freeze({ enabled: false }),
+  chatPage: Object.freeze({ enabled: true }),
+});
+
+/** Which fallback tier {@link loadConfigResilient} served a config from. */
+export type ConfigBootSource = "file" | "copied-example" | "example-memory" | "default";
+
+/** stat() a path without throwing; undefined when absent (or stat itself fails). */
+function statFile(path: string): Stats | undefined {
   try {
-    parsed = JSON.parse(interpolated);
-  } catch (err) {
-    throw new ConfigError("Config file is not valid JSON after processing", { cause: err });
+    return statSync(path);
+  } catch {
+    return undefined;
   }
-  return validateConfig(parsed);
+}
+
+export interface ResilientConfigLoad {
+  readonly config: ProxyConfig;
+  readonly source: ConfigBootSource;
+}
+
+/**
+ * Boot-resilient config load — the server's entry point. Never fails for
+ * missing files or missing environment info; only structural errors in an
+ * EXISTING config file propagate (a broken operator edit should still be loud).
+ *
+ * Tiers, in order: the config file itself → copy config.example.jsonc next to
+ * it (best effort, skipped on read-only fs / directory at the path) → the
+ * example in memory → {@link DEFAULT_CONFIG_RAW} (zero providers).
+ *
+ * A DIRECTORY at `path` is the Docker bind-mount artifact (compose creates one
+ * when the host file is missing) — never written through; reported so the
+ * operator can fix it host-side.
+ */
+export async function loadConfigResilient(
+  path: string,
+  env: Record<string, string | undefined> = Bun.env,
+): Promise<ResilientConfigLoad> {
+  const stat = statFile(path);
+  if (stat?.isFile()) {
+    return { config: await loadConfig(path, env), source: "file" };
+  }
+
+  if (stat?.isDirectory()) {
+    console.warn(
+      `config: ${path} is a directory (Docker bind-mount artifact? delete it on the host and re-create the file) — not writing through it`,
+    );
+  } else {
+    console.warn(`config: ${path} not found`);
+  }
+
+  const examplePath = join(dirname(path), "config.example.jsonc");
+  if (statFile(examplePath)?.isFile()) {
+    const exampleText = await Bun.file(examplePath).text();
+    // Best-effort seed so the next boot (and the CLI) find a real file; a
+    // read-only fs or a directory at `path` just falls back to in-memory.
+    if (!stat) {
+      try {
+        copyFileSync(examplePath, path);
+        console.warn(`config: created ${path} from config.example.jsonc`);
+        return { config: await loadConfig(path, env), source: "copied-example" };
+      } catch {
+        console.warn(`config: could not create ${path} from example — loading example in memory`);
+      }
+    }
+    console.warn("config: loading config.example.jsonc in memory (no file written)");
+    const config = await configFromText(exampleText, env, new Set(), "config.example.jsonc");
+    return { config, source: "example-memory" };
+  }
+
+  console.warn("config: no config file or example found — booting a minimal built-in config");
+  return { config: validateConfig(DEFAULT_CONFIG_RAW), source: "default" };
 }
 
 /**
@@ -833,6 +1347,30 @@ export function serializeConfig(
   const exact = (s: string): string => (refs.length ? restoreExact(s, refs) : s);
   const embed = (s: string): string => (refs.length ? restoreEmbedded(s, refs) : s);
 
+  /**
+   * Pool serialization rule: a one-entry pool with the default (or no) label
+   * round-trips as a flat `credential:` — byte-identical to every existing
+   * single-key config, so a UI save churns nothing. A labeled singleton or a
+   * multi-entry pool serializes as a `credentials` array (labels preserved,
+   * secrets restored to ${VAR} refs per entry). An empty pool round-trips as
+   * `credential: ""` (the "${VAR:-}" unset form — next boot still loads).
+   */
+  const serializePool = (pool: readonly CredentialPoolEntry[]): Record<string, unknown> => {
+    if (pool.length === 0) return { credential: "" };
+    if (pool.length === 1) {
+      const only = pool[0] as CredentialPoolEntry;
+      if (only.label === undefined || only.label === DEFAULT_POOL_LABEL) {
+        return { credential: exact(only.credential) };
+      }
+    }
+    return {
+      credentials: pool.map((e) => ({
+        credential: exact(e.credential),
+        ...(e.label ? { label: e.label } : {}),
+      })),
+    };
+  };
+
   // Bedrock is optional: an absent block serializes with no `bedrock` key, and
   // a present-with-empty credential round-trips as "" (never as a strict
   // `${VAR}` ref — buildEnvRefMap skips empty env values, so the next boot of
@@ -850,29 +1388,68 @@ export function serializeConfig(
     };
   }
   for (const [key, p] of Object.entries(config.providers.external)) {
+    // Regions round-trip in full (secrets restored to ${VAR} refs like the
+    // provider level); computed `inactiveReason` is never written.
+    const regions = p.regions
+      ? Object.fromEntries(
+          Object.entries(p.regions).map(([regionKey, r]) => [
+            regionKey,
+            {
+              modelsUrl: embed(r.modelsUrl),
+              ...(r.hostTemplate ? { hostTemplate: r.hostTemplate } : {}),
+              ...(r.basePath ? { basePath: r.basePath } : {}),
+              ...(r.workspaceId !== undefined ? { workspaceId: exact(r.workspaceId) } : {}),
+              ...(r.region !== undefined ? { region: r.region } : {}),
+              // Region-owned pool (absent = inherit the provider pool: emit nothing).
+              ...(r.credentials !== undefined ? serializePool(r.credentials) : {}),
+              ...(r.billingMode ? { billingMode: r.billingMode } : {}),
+            },
+          ]),
+        )
+      : undefined;
     providers[key] = {
       type: p.type,
-      credential: exact(p.credential),
+      ...serializePool(p.credentials),
       auth: p.auth,
-      ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}),
+      // Fields validation requires for this provider's shape are ALWAYS
+      // emitted — including when they resolved EMPTY (a degraded provider:
+      // unset env ref). Omitting an empty-but-required field would make the
+      // UI round-trip (GET -> POST) trip the absent-field structural assert,
+      // so an operator could not save the config at all. Genuinely absent
+      // fields (no hostTemplate, regions-only shapes) stay omitted.
+      ...((p.baseUrl !== "" || p.regions === undefined) && p.baseUrl !== undefined
+        ? { baseUrl: p.baseUrl }
+        : {}),
       ...(p.hostTemplate ? { hostTemplate: p.hostTemplate } : {}),
       ...(p.basePath ? { basePath: p.basePath } : {}),
-      ...(p.workspaceId ? { workspaceId: exact(p.workspaceId) } : {}),
-      ...(p.region ? { region: p.region } : {}),
+      ...(p.workspaceId !== undefined ? { workspaceId: exact(p.workspaceId) } : {}),
+      ...(p.region !== undefined ? { region: p.region } : {}),
       countTokens: p.countTokens,
       ...(p.strictTools ? { strictTools: true } : {}),
-      modelsUrl: embed(p.modelsUrl),
+      ...(p.modelsUrl !== "" || p.regions === undefined ? { modelsUrl: embed(p.modelsUrl) } : {}),
+      ...(regions ? { regions } : {}),
     };
   }
   return {
     server: { host: config.server.host, port: config.server.port },
-    inboundAuth: { keys: config.inboundAuth.keys.map((k) => exact(k)) },
+    inboundAuth: {
+      keys: config.inboundAuth.keys.map((k) =>
+        // Save path: an ephemeral key is a process artifact — write the bare
+        // ref so it is never persisted and the next boot re-mints. Display
+        // path (no env): keep the literal so the operator can copy it.
+        env !== undefined && isEphemeralInboundKey(k) ? "${PROXY_INBOUND_KEY}" : exact(k),
+      ),
+    },
     primaryRegion: config.primaryRegion,
     profilePreference: config.profilePreference,
     refreshIntervalMinutes: config.refreshIntervalMinutes,
     claudeFallbackToMantle: config.claudeFallbackToMantle,
     regions: config.regions.map((r) => ({ key: r.key, awsRegion: r.awsRegion })),
     providers,
+    maxFailoverAttempts: config.maxFailoverAttempts,
+    // Tier lists round-trip verbatim (model ids are not secrets; availability
+    // filtering happens at routing time, never at serialization).
+    ...(config.virtualModels ? { virtualModels: config.virtualModels } : {}),
     logging: {
       enabled: config.logging.enabled,
       dir: config.logging.dir,

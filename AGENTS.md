@@ -89,8 +89,13 @@ bootstrap.sh / .ps1    Tiny shims: install Bun if missing, then run the Bun CLI
   `bootstrap.sh` / `bootstrap.ps1` are tiny shims that only install Bun then hand
   off to the CLI (there are no other shell scripts). `setup` auto-generates the
   shared `PROXY_INBOUND_KEY` and auto-derives `BIND_IP`; the Claude Code model
-  ids live in `.env` (`ANTHROPIC_MODEL`/`ANTHROPIC_SMALL_FAST_MODEL`), never in
-  `src/`.
+  ids live in `.env` (the full `ANTHROPIC_*` family incl.
+  `ANTHROPIC_DEFAULT_OPUS_MODEL` — on third-party providers that's also Claude
+  Code's auto-fallback target — plus `ANTHROPIC_DEFAULT_MODEL`,
+  `CLAUDE_CODE_SUBAGENT_MODEL`, `ANTHROPIC_CUSTOM_MODEL_OPTION`; the pure env
+  builder `buildClaudeEnv` in `src/cli/claude.ts` is the testable seam), never
+  in `src/`. `ANTHROPIC_SMALL_FAST_MODEL` is deprecated upstream — kept only as
+  a legacy fallback while `.env` still carries it.
 - **Biome** (`biome.json`): 100-char line width — long lines fail lint. `format`
   targets `src/` **and** `tests/`; `lint` targets `src/` only.
 - **tsconfig**: `allowImportingTsExtensions` + `verbatimModuleSyntax` require
@@ -102,9 +107,21 @@ bootstrap.sh / .ps1    Tiny shims: install Bun if missing, then run the Bun CLI
   (`:-`-gated, empty disables Bedrock). In `--local` mode `BIND_IP` becomes the
   server `HOST` bind.
 - **Config**: `config.local.jsonc` (JSONC) with `${ENV}` interpolation — bare
-  `${VAR}` fails fast when unset/empty, `${VAR:-default}` (bash-like, empty
-  default allowed) is the "configured but inactive until the env var is set"
-  form; secrets are restored to `${ENV}` form on UI save. `.env`,
+  `${VAR}` unset/empty resolves EMPTY with a load warning (missing info
+  degrades: provider/region goes inactive, never a boot crash; warning names
+  surface in `/status.json`, `/api/config/status`, and `doctor`);
+  `${VAR:-default}` (bash-like, empty default allowed) is the "configured but
+  inactive until the env var is set" form; secrets are restored to `${ENV}`
+  form on UI save. **Boot never fails for missing info**: a missing config file
+  bootstraps (real file → copy `config.example.jsonc` → example in memory →
+  built-in zero-provider default via `loadConfigResilient`), and an unset
+  `PROXY_INBOUND_KEY` mints an EPHEMERAL inbound key (printed once at boot,
+  boolean marker in `/status.json`, rotates every restart AND every config
+  save — the save response carries the new one — auth is never bypassed).
+  STRUCTURAL errors (wrong types, non-https URLs, bad enums) still fail fast.
+  Provider/region `regions` maps are validated, preserved through validation
+  AND UI saves, and degrade per-region (an unset env ref marks that region
+  `skipped` with its reason while siblings keep working). `.env`,
   `config.local.jsonc`, and AWS creds are git-ignored.
 - **Bedrock is optional** (`src/auth/bedrock-mode.ts`): an absent
   `providers.bedrock` block, an empty/placeholder (`REPLACE_ME`) credential, or
@@ -233,20 +250,34 @@ when wiring or debugging a provider.
   carries a `type` discriminator: `anthropic` (native Anthropic → passthrough
   path) or `openai` (OpenAI Chat Completions → mantle translation path). Drive
   path selection off `type`, **not** the model-name substring.
-- **No model ids in source OR config.** External providers supply a `modelsUrl`
-  (an OpenAI-style `/models` discovery endpoint); ids are fetched at runtime and
-  refreshed on the same cadence as Bedrock. `modelsUrl` is a discovery endpoint,
-  exactly like Bedrock's `hosts.control`.
+- **No model ids in source; discovery is runtime-only.** External providers
+  supply a `modelsUrl` (an OpenAI-style `/models` discovery endpoint); ids are
+  fetched at runtime and refreshed on the same cadence as Bedrock. `modelsUrl`
+  is a discovery endpoint, exactly like Bedrock's `hosts.control`. The shipped
+  `config.example.jsonc` DOES include a reference `virtualModels` tier block
+  (mirroring `config.local.jsonc` so a copy is a complete template) — those ids
+  are operator-side routing choices, not a code-level catalog; tier candidates
+  pointing at unconfigured providers simply never route.
 - Canonical id backends: `converse | mantle | anthropic | openai`. External
   models are single-endpoint → `profilePrefix = global`, addressable as
   `<provider>.anthropic.global.<model>` (or `.openai.`).
 - Credential resolver is per-provider: Bedrock uses region-aware token minting;
-  external providers return their static config API key. Header auth style is
-  `auth: "x-api-key" | "bearer"` (`buildAnthropicHeaders(..., authStyle)`).
+  external providers use a `credentials` pool (flat `credential:` normalizes to
+  a one-entry pool). Header auth style is `auth: "x-api-key" | "bearer"`
+  (`buildAnthropicHeaders(..., authStyle)`).
+- **Virtual model tiers** (`docs/VIRTUAL_MODELS.md`, reserved provider `virtual`):
+  `virtual.anthropic.global.<tier>` expands to the first available candidate
+  from the config `virtualModels` map; pre-stream failover advances next pool
+  key → next candidate on upstream 401/403/429 or connect exhaustion (never
+  5xx), capped by `maxFailoverAttempts` (default 4), always primary first. The
+  serving key's LABEL is logged + stored in `TurnRecord.servingKeyLabel` —
+  never the key value.
 - **Discovery always uses bearer.** External-provider `/models` discovery sends
   `Authorization: Bearer` regardless of the provider's message-path `auth` —
   some providers reject `x-api-key` on `/models` (`401`), but the OpenAI
-  `/models` convention is bearer, which all providers accept.
+  `/models` convention is bearer, which all providers accept. Discovery walks
+  the credential pool (advances on 401/403), so a dead primary key can't blank
+  the catalog.
 - **Host templating** (for workspace/regional domains, e.g. Alibaba): a provider
   may set `hostTemplate` (`{workspaceId}`/`{region}` placeholders) + `workspaceId`
   + `region` + `basePath` instead of a flat `baseUrl`; `externalProviderOrigin()`

@@ -18,6 +18,13 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
     <h1 class="text-xl font-semibold mb-1">Configuration</h1>
     <p class="text-sm text-slate-500 mb-4">Edits are saved to the config file and hot-reloaded (no restart). Local pod — no gating.</p>
 
+    <!-- Ephemeral inbound key: auth is enforced on a per-run key that rotates
+         on every restart AND every save — the operator must know. -->
+    <div x-show="auth.inbound && auth.inbound.ephemeral" x-cloak
+      class="mb-4 rounded-lg border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/30 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+      Inbound auth uses an <b>ephemeral key</b> (PROXY_INBOUND_KEY unset) — it changes on every restart <i>and every save</i>. Set PROXY_INBOUND_KEY in .env to persist one.
+    </div>
+
     <!-- Provider / region status -->
     <div class="mb-6">
       <div class="text-xs uppercase tracking-wide text-slate-500 mb-2">Provider status <span class="text-slate-400 normal-case" x-text="status.totalModels?('· '+status.totalModels+' models total'):''"></span></div>
@@ -167,10 +174,21 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
             <label class="block"><span class="text-xs text-slate-500">modelsUrl (runtime discovery endpoint)</span>
               <input x-model="cfg.providers[key].modelsUrl" class="mt-1 w-full px-2 py-1.5 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm font-mono" />
             </label>
-            <label class="block"><span class="text-xs text-slate-500">credential (API key)</span>
-              <input :type="reveal[key]?'text':'password'" x-model="cfg.providers[key].credential" spellcheck="false" class="mt-1 w-full px-2 py-1.5 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm font-mono" />
-              <label class="flex items-center gap-2 text-xs text-slate-500 mt-1"><input type="checkbox" x-model="reveal[key]" /> reveal</label>
-            </label>
+            <!-- Pool providers: the single-credential input would silently do
+                 nothing (the pool wins at validation) — show the pool instead.
+                 Pools/tiers are edited in config.local.jsonc (opaque round-trip
+                 through this form, like "regions"). -->
+            <template x-if="!cfg.providers[key].credentials || cfg.providers[key].credentials.length===0">
+              <label class="block"><span class="text-xs text-slate-500">credential (API key)</span>
+                <input :type="reveal[key]?'text':'password'" x-model="cfg.providers[key].credential" spellcheck="false" class="mt-1 w-full px-2 py-1.5 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm font-mono" />
+                <label class="flex items-center gap-2 text-xs text-slate-500 mt-1"><input type="checkbox" x-model="reveal[key]" /> reveal</label>
+              </label>
+            </template>
+            <div x-show="cfg.providers[key].credentials && cfg.providers[key].credentials.length>0" class="text-xs text-slate-500">
+              key pool: <b x-text="cfg.providers[key].credentials.length"></b> key(s) — labels
+              <span class="font-mono" x-text="(cfg.providers[key].credentials||[]).map(e=>e.label||'default').join(' → ')"></span>
+              (edit in config.local.jsonc)
+            </div>
             <label class="flex items-center gap-2 text-sm"><input type="checkbox" x-model="cfg.providers[key].countTokens" /> countTokens (upstream supports Anthropic count_tokens)</label>
           </div>
         </template>
@@ -203,8 +221,10 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
     dot(s){ return s==='ok'?'bg-emerald-500':(s==='skipped'||s==='disabled')?'bg-amber-500':'bg-rose-500'; },
     regionState(r){ return r.disabled?'disabled':(r.active?'ok':'error'); },
     regionDetail(r){ return r.error ? r.awsRegion+' · '+r.error : r.total+' models (converse '+r.converse+' / mantle '+r.mantle+')'; },
-    externalState(e){ return e.active?'ok':(e.state==='skipped'?'skipped':'error'); },
-    externalDetail(e){ return (e.detail?e.detail+' · ':'')+e.total+' models · '+e.baseUrl; },
+    externalState(e){ return e.active?'ok':(e.state==='skipped'||e.inactiveReason?'skipped':'error'); },
+    // inactiveReason (missing-info: unset env ref) is the most actionable text
+    // when present; regions-only providers have no baseUrl — don't show ' · '.
+    externalDetail(e){ return (e.detail||e.inactiveReason?((e.detail||e.inactiveReason)+' · '):'')+e.total+' models'+(e.baseUrl?' · '+e.baseUrl:''); },
     enableBedrock(){ this.cfg.providers.bedrock={type:'bedrock',credential:'',hosts:${jsonForScript(DEFAULT_BEDROCK_HOSTS)}}; },
     disableBedrock(){ delete this.cfg.providers.bedrock; },
     addProvider(){
@@ -218,7 +238,9 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
       try{
         const res=await window.adminFetch('/api/config',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(this.cfg)});
         const j=await res.json();
-        if(res.ok){ this.msg=j.message||'saved'; this.msgOk=true; await this.loadStatus(); await this.loadAuth(); }
+        // Reload the form too: on an ephemeral-key deployment every save
+        // rotates the inbound key, so the form must show the new one.
+        if(res.ok){ this.msg=j.message||'saved'; this.msgOk=true; await this.loadStatus(); await this.loadAuth(); await this.loadCfg(); }
         else { this.msg=(j.error&&j.error.message)||j.error||'save failed'; this.msgOk=false; }
       }catch(e){ this.msg='save failed: '+e; this.msgOk=false; }
       this.saving=false;

@@ -66,6 +66,11 @@ export interface CaptureContext {
   readonly messages: unknown;
   /** Tool-offer trace for the request (offered/dropped tools). Optional. */
   readonly tools?: ToolTrace;
+  /**
+   * LABEL of the credential-pool entry that served the request
+   * (VIRTUAL_MODELS.md cost attribution). The key VALUE never appears here.
+   */
+  readonly servingKeyLabel?: string;
   readonly requestedAt: string;
 }
 
@@ -106,6 +111,7 @@ async function captureNonStreaming(
     systemHash,
     messages: ctx.messages,
     ...(ctx.tools ? { tools: ctx.tools } : {}),
+    ...(ctx.servingKeyLabel ? { servingKeyLabel: ctx.servingKeyLabel } : {}),
     responseContent: body.content ?? [],
     stopReason: body.stop_reason ?? null,
     usage: {
@@ -401,6 +407,7 @@ function captureStreaming(
         systemHash,
         messages: ctx.messages,
         ...(ctx.tools ? { tools: ctx.tools } : {}),
+        ...(ctx.servingKeyLabel ? { servingKeyLabel: ctx.servingKeyLabel } : {}),
         responseContent: acc.content(),
         stopReason: acc.stopReason,
         usage: { inputTokens: acc.inputTokens, outputTokens: acc.outputTokens },

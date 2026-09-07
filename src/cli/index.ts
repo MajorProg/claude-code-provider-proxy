@@ -111,37 +111,66 @@ export function portValue(envPath: string): string {
 }
 
 /**
- * Read the Claude Code model ids from .env. These are client-facing defaults,
- * kept out of src/ per AGENTS.md rule #3 — .env.example ships sensible values.
+ * Read the Claude Code model-variable family from .env. These are client-facing
+ * defaults, kept out of src/ per AGENTS.md rule #3 — .env.example ships values.
  *
- * sonnetModel/haikuModel pin ANTHROPIC_DEFAULT_SONNET_MODEL / _HAIKU_MODEL to
- * the same canonical ids as mainModel/fastModel. Without them, Claude Code's
- * auto-mode classifier calls the bare alias "claude-sonnet-5" directly, which
- * the proxy rejects as an invalid canonical id — fall back to mainModel/
- * fastModel when unset so existing .env files keep working.
+ * Fallbacks keep existing .env files working: sonnet→main, haiku→legacy
+ * ANTHROPIC_SMALL_FAST_MODEL→main (in that order), opus/default→main,
+ * subagent→haiku. `legacySmallFast` records whether the deprecated
+ * ANTHROPIC_SMALL_FAST_MODEL is still the haiku source (writeClaudeSettings
+ * then emits BOTH vars for older Claude Code versions).
  */
 export function claudeModels(envPath: string): {
   mainModel: string;
   fastModel: string;
   sonnetModel: string;
   haikuModel: string;
+  opusModel: string;
+  defaultModel: string;
+  subagentModel: string;
+  legacySmallFast: boolean;
   maxContextTokens: string | undefined;
+  customModelOption: string | undefined;
+  customModelOptionName: string | undefined;
+  customModelOptionDescription: string | undefined;
 } {
   const mainModel = getEnvValue(envPath, "ANTHROPIC_MODEL")?.trim();
-  const fastModel = getEnvValue(envPath, "ANTHROPIC_SMALL_FAST_MODEL")?.trim();
-  if (!mainModel || !fastModel) {
+  if (!mainModel) {
     die(
-      "ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL missing in .env. " +
-        "Re-copy from .env.example (it ships defaults), then re-run.",
+      "ANTHROPIC_MODEL missing in .env. Re-copy from .env.example (it ships defaults), then re-run.",
     );
   }
+  const legacyFast = getEnvValue(envPath, "ANTHROPIC_SMALL_FAST_MODEL")?.trim();
+  const haikuExplicit = getEnvValue(envPath, "ANTHROPIC_DEFAULT_HAIKU_MODEL")?.trim();
+  const haikuModel = haikuExplicit || legacyFast || mainModel;
   const sonnetModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_SONNET_MODEL")?.trim() || mainModel;
-  const haikuModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_HAIKU_MODEL")?.trim() || fastModel;
-  // Optional: propagated verbatim into Claude Code's env so it knows the real
-  // context window of a proxied non-Claude model (else it assumes 200k + warns).
-  const maxContextTokens =
-    getEnvValue(envPath, "CLAUDE_CODE_MAX_CONTEXT_TOKENS")?.trim() || undefined;
-  return { mainModel, fastModel, sonnetModel, haikuModel, maxContextTokens };
+  const opusModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_OPUS_MODEL")?.trim() || mainModel;
+  const defaultModel = getEnvValue(envPath, "ANTHROPIC_DEFAULT_MODEL")?.trim() || mainModel;
+  const subagentModel = getEnvValue(envPath, "CLAUDE_CODE_SUBAGENT_MODEL")?.trim() || haikuModel;
+  const legacySmallFast = !haikuExplicit && !!legacyFast;
+  if (legacySmallFast) {
+    warn(
+      "ANTHROPIC_SMALL_FAST_MODEL is deprecated by Claude Code; ANTHROPIC_DEFAULT_HAIKU_MODEL is preferred. Keeping both for compatibility — migrate .env when convenient.",
+    );
+  }
+  const opt = (name: string): string | undefined => {
+    const v = getEnvValue(envPath, name)?.trim();
+    return v || undefined;
+  };
+  return {
+    mainModel,
+    fastModel: legacyFast ?? mainModel,
+    sonnetModel,
+    haikuModel,
+    opusModel,
+    defaultModel,
+    subagentModel,
+    legacySmallFast,
+    maxContextTokens: opt("CLAUDE_CODE_MAX_CONTEXT_TOKENS"),
+    customModelOption: opt("ANTHROPIC_CUSTOM_MODEL_OPTION"),
+    customModelOptionName: opt("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"),
+    customModelOptionDescription: opt("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"),
+  };
 }
 
 // --- BIND_IP resolution (shared by up/status/doctor) ----------------------
@@ -311,7 +340,18 @@ function cmdSetup(root: string, mode: Mode, rotate: boolean): void {
     fastModel: models.fastModel,
     sonnetModel: models.sonnetModel,
     haikuModel: models.haikuModel,
+    opusModel: models.opusModel,
+    defaultModel: models.defaultModel,
+    subagentModel: models.subagentModel,
+    legacySmallFast: models.legacySmallFast,
     ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
+    ...(models.customModelOption ? { customModelOption: models.customModelOption } : {}),
+    ...(models.customModelOptionName
+      ? { customModelOptionName: models.customModelOptionName }
+      : {}),
+    ...(models.customModelOptionDescription
+      ? { customModelOptionDescription: models.customModelOptionDescription }
+      : {}),
   });
 
   if (mode === "docker") {
@@ -413,8 +453,84 @@ function cmdConfigClaude(root: string): void {
     fastModel: models.fastModel,
     sonnetModel: models.sonnetModel,
     haikuModel: models.haikuModel,
+    opusModel: models.opusModel,
+    defaultModel: models.defaultModel,
+    subagentModel: models.subagentModel,
+    legacySmallFast: models.legacySmallFast,
     ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
+    ...(models.customModelOption ? { customModelOption: models.customModelOption } : {}),
+    ...(models.customModelOptionName
+      ? { customModelOptionName: models.customModelOptionName }
+      : {}),
+    ...(models.customModelOptionDescription
+      ? { customModelOptionDescription: models.customModelOptionDescription }
+      : {}),
   });
+}
+
+/**
+ * Pure config diagnostics for {@link cmdDoctor} (exported for tests): one line
+ * per notable state — ephemeral inbound key, load warnings, and per-provider /
+ * per-region activity — in print order, with the severity the doctor prints.
+ */
+export function configDiagnostics(config: ProxyConfig): {
+  level: "ok" | "warn";
+  line: string;
+}[] {
+  const out: { level: "ok" | "warn"; line: string }[] = [];
+  if (config.inboundAuth.ephemeralKey) {
+    out.push({
+      level: "warn",
+      line: "  Inbound key: EPHEMERAL (PROXY_INBOUND_KEY unset) — changes on every restart; set PROXY_INBOUND_KEY in .env to persist.",
+    });
+  }
+  for (const w of config.loadWarnings ?? []) {
+    out.push({ level: "warn", line: `  config warning: unset env var ${w} resolved empty.` });
+  }
+  for (const [key, p] of Object.entries(config.providers.external)) {
+    // Pool size next to the ok lines — cost attribution at a glance ("3 keys").
+    const poolSuffix = p.credentials.length > 1 ? `, ${p.credentials.length} keys` : "";
+    if (p.inactiveReason) {
+      out.push({ level: "warn", line: `  ${key}: inactive — ${p.inactiveReason}` });
+    } else if (p.regions) {
+      for (const [regionKey, r] of Object.entries(p.regions)) {
+        if (r.inactiveReason) {
+          out.push({
+            level: "warn",
+            line: `  ${key}:${regionKey}: inactive — ${r.inactiveReason}`,
+          });
+        } else {
+          const pool = r.credentials ?? p.credentials;
+          const usable = pool.filter(
+            (e) =>
+              credentialState(e.credential) !== "empty" &&
+              credentialState(e.credential) !== "placeholder",
+          );
+          out.push(
+            usable.length === 0
+              ? {
+                  level: "warn",
+                  line: `  ${key}:${regionKey}: skipped — credential unset/placeholder.`,
+                }
+              : {
+                  level: "ok",
+                  line: `  ${key}:${regionKey}: credential set (${p.type}${
+                    usable.length > 1 ? `, ${usable.length} keys` : ""
+                  }).`,
+                },
+          );
+        }
+      }
+    } else {
+      const state = credentialState(p.credential);
+      out.push(
+        state === "empty" || state === "placeholder"
+          ? { level: "warn", line: `  ${key}: skipped — credential unset/placeholder.` }
+          : { level: "ok", line: `  ${key}: credential set (${p.type}${poolSuffix}).` },
+      );
+    }
+  }
+  return out;
 }
 
 async function cmdDoctor(root: string, mode: Mode): Promise<void> {
@@ -462,17 +578,12 @@ async function cmdDoctor(root: string, mode: Mode): Promise<void> {
     warn(`  config.local.jsonc INVALID: ${err instanceof Error ? err.message : String(err)}`);
     return;
   }
-  const externals = Object.entries(config.providers.external);
-  if (externals.length === 0) {
+  if (Object.keys(config.providers.external).length === 0) {
     warn("  No external providers configured (see config.example.jsonc).");
   }
-  for (const [key, p] of externals) {
-    const state = credentialState(p.credential);
-    if (state === "empty" || state === "placeholder") {
-      warn(`  ${key}: skipped — credential unset/placeholder.`);
-    } else {
-      ok(`  ${key}: credential set (${p.type}).`);
-    }
+  for (const d of configDiagnostics(config)) {
+    if (d.level === "ok") ok(d.line);
+    else warn(d.line);
   }
 }
 

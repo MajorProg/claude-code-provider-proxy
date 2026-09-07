@@ -71,7 +71,7 @@ function handler() {
   const runtime = makeRuntime(config);
   return createFetchHandler(
     () => runtime,
-    async () => {},
+    async () => undefined,
   );
 }
 

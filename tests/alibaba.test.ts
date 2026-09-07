@@ -13,6 +13,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { type ProxyConfig, validateConfig } from "../src/config.ts";
+import { ProviderDisabledError } from "../src/errors.ts";
 import { buildAnthropicHeaders } from "../src/http/upstream.ts";
 import { parseCanonicalId } from "../src/model/canonical-id.ts";
 import { Catalog } from "../src/model/catalog.ts";
@@ -70,6 +71,192 @@ describe("Alibaba routing (unit)", () => {
     const h = buildAnthropicHeaders(HDR, "test-dashscope-key", "x-api-key");
     expect(h["x-api-key"]).toBe("test-dashscope-key");
     expect(h.authorization).toBeUndefined();
+  });
+});
+
+describe("Alibaba boot-resilience routing (unit)", () => {
+  /** Regions-only alibaba config; EU region's workspaceId left empty. */
+  function multiRegionConfig(): ProxyConfig {
+    return validateConfig({
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["test"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        alibaba: {
+          type: "anthropic",
+          credential: "test-dashscope-key",
+          auth: "x-api-key",
+          countTokens: true,
+          regions: {
+            "ap-southeast-1": {
+              hostTemplate: "dashscope-intl.aliyuncs.com",
+              basePath: "/apps/anthropic",
+              modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+              billingMode: "token-plan",
+            },
+            "eu-central-1": {
+              hostTemplate: "{workspaceId}.eu-central-1.maas.aliyuncs.com",
+              workspaceId: "",
+              credential: "sk-eu",
+              modelsUrl: "https://.eu-central-1.maas.aliyuncs.com/compatible-mode/v1/models",
+              billingMode: "payg",
+            },
+          },
+        },
+      },
+    });
+  }
+
+  test("regions survive validation and route to the region origin (regression)", () => {
+    // The latent bug: validateConfig dropped provider.regions, so this id
+    // could never resolve from a file-loaded config.
+    const t = route(
+      multiRegionConfig(),
+      new Catalog([]),
+      parseCanonicalId("alibaba.anthropic.ap-southeast-1.qwen3-max"),
+    );
+    expect(t.translationPath).toBe("passthrough");
+    expect(t.origin).toBe("https://dashscope-intl.aliyuncs.com/apps/anthropic");
+    expect(t.path).toBe("https://dashscope-intl.aliyuncs.com/apps/anthropic/v1/messages");
+  });
+
+  test("an inactive region routes to a clean ProviderDisabledError naming it", () => {
+    expect(() =>
+      route(
+        multiRegionConfig(),
+        new Catalog([]),
+        parseCanonicalId("alibaba.anthropic.eu-central-1.qwen3-max"),
+      ),
+    ).toThrow(ProviderDisabledError);
+    try {
+      route(
+        multiRegionConfig(),
+        new Catalog([]),
+        parseCanonicalId("alibaba.anthropic.eu-central-1.qwen3-max"),
+      );
+      expect.unreachable();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      expect(msg).toContain("eu-central-1");
+      expect(msg).toContain("workspaceId is empty");
+    }
+  });
+
+  test("RouteTarget.credentials prefers the region-owned pool over the provider pool (regression)", () => {
+    // The latent bug: resolveOutboundAuth read only the provider-level
+    // credential on the message path, so a region-specific key authenticated
+    // nothing even though discovery honored it. The RouteTarget now carries
+    // the effective pool — region-owned over provider.
+    const config = validateConfig({
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["test"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        alibaba: {
+          type: "anthropic",
+          credential: "provider-level-key",
+          auth: "x-api-key",
+          countTokens: true,
+          regions: {
+            "ap-southeast-1": {
+              hostTemplate: "dashscope-intl.aliyuncs.com",
+              basePath: "/apps/anthropic",
+              modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+              credentials: [
+                { credential: "sg-key-1", label: "token-plan" },
+                { credential: "sg-key-2", label: "backup" },
+              ],
+            },
+          },
+        },
+      },
+    });
+    const t = route(
+      config,
+      new Catalog([]),
+      parseCanonicalId("alibaba.anthropic.ap-southeast-1.qwen3-max"),
+    );
+    expect(t.credentials).toEqual([
+      { credential: "sg-key-1", label: "token-plan" },
+      { credential: "sg-key-2", label: "backup" },
+    ]);
+    // An inherited (credential-less) region falls back to the provider pool.
+    const inheritConfig = validateConfig({
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["test"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        alibaba: {
+          type: "anthropic",
+          credentials: [{ credential: "p1", label: "primary" }, { credential: "p2" }],
+          auth: "x-api-key",
+          countTokens: true,
+          regions: {
+            "ap-southeast-1": {
+              hostTemplate: "dashscope-intl.aliyuncs.com",
+              basePath: "/apps/anthropic",
+              modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+            },
+          },
+        },
+      },
+    });
+    const inherited = route(
+      inheritConfig,
+      new Catalog([]),
+      parseCanonicalId("alibaba.anthropic.ap-southeast-1.qwen3-max"),
+    );
+    expect(inherited.credentials).toEqual([
+      { credential: "p1", label: "primary" },
+      { credential: "p2" },
+    ]);
+  });
+
+  test("a single-endpoint provider with inactiveReason routes to ProviderDisabledError", () => {
+    // Fork-style config after DASHSCOPE_WORKSPACE_ID_INTL resolved empty:
+    // provider-level hostTemplate degenerates -> inactive, never an opaque 500.
+    const config = validateConfig({
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["test"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        alibaba: {
+          type: "anthropic",
+          credential: "test-dashscope-key",
+          auth: "x-api-key",
+          hostTemplate: "{workspaceId}.{region}.maas.aliyuncs.com",
+          workspaceId: "",
+          region: "ap-southeast-1",
+          basePath: "/apps/anthropic",
+          countTokens: true,
+          modelsUrl: "https://.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/models",
+        },
+      },
+    });
+    try {
+      route(config, new Catalog([]), parseCanonicalId("alibaba.anthropic.global.qwen3-max"));
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProviderDisabledError);
+      const msg = err instanceof Error ? err.message : String(err);
+      expect(msg).toContain("workspaceId is empty");
+    }
   });
 });
 

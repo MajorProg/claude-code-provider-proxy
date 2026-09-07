@@ -23,9 +23,10 @@ import { generateShortLivedBedrockToken } from "./auth/bedrock-token.ts";
 import { authenticateInbound } from "./auth/inbound.ts";
 import { BEDROCK_DEV_SENTINELS } from "./auth/token-provider.ts";
 import {
+  type CredentialPoolEntry,
   type ProxyConfig,
   externalProviderOrigin,
-  loadConfig,
+  loadConfigResilient,
   saveConfig,
   serializeConfig,
   validateConfig,
@@ -37,6 +38,7 @@ import {
   UnauthorizedError,
   UpstreamError,
 } from "./errors.ts";
+import { executeWithFailover, isClientDisconnect } from "./failover.ts";
 import { renderChatPageHtml } from "./http/chat-page.ts";
 import { renderConfigPageHtml } from "./http/config-page.ts";
 import { renderLogViewerHtml } from "./http/log-viewer-page.ts";
@@ -62,7 +64,7 @@ import {
   parseJsonObject,
   readBodyWithLimit,
 } from "./paths/relay.ts";
-import { route } from "./router.ts";
+import { VIRTUAL_PROVIDER, type route, virtualTierStatuses } from "./router.ts";
 
 const CONFIG_PATH = Bun.env.CONFIG_PATH ?? "config.local.jsonc";
 
@@ -96,23 +98,9 @@ function truncateForLog(body: string): string {
 }
 
 /**
- * True when an error is a client-driven abort — the inbound request's
- * `AbortSignal` fired because Claude Code closed the connection mid-flight
- * (e.g. the user hit Esc, or a streaming turn was cancelled). This propagates
- * through the upstream fetch as a `DOMException` named "AbortError". It is not
- * a proxy fault: there is no client left to receive a response, so it must be
- * logged quietly rather than dumped as an unhandled error with a full stack.
- * A structural `name` check (not `instanceof DOMException`) keeps this robust
- * across the different Error/DOMException shapes Bun surfaces for aborts.
+ * (isClientDisconnect moved to src/failover.ts — shared with the failover
+ * engine, which must never retry a client-driven abort.)
  */
-function isClientDisconnect(err: unknown): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    "name" in err &&
-    (err as { name: unknown }).name === "AbortError"
-  );
-}
 
 export function errorResponse(
   err: unknown,
@@ -282,10 +270,20 @@ async function resolveOutboundAuth(
   config: ProxyConfig,
   tokenProvider: RegionTokenProvider | null,
   target: ReturnType<typeof route>,
+  entry?: CredentialPoolEntry,
 ): Promise<{ bearer: string; authStyle: "x-api-key" | "bearer" }> {
   const externalProvider = config.providers.external[target.provider];
   if (externalProvider) {
-    return { bearer: externalProvider.credential, authStyle: externalProvider.auth };
+    // The bearer comes from the ROUTING-RESOLVED pool entry (region-owned pool
+    // over provider pool), NOT a fresh config read — this is what makes a
+    // region-specific credential actually authenticate on the message path
+    // (previously only discovery honored it). The primary entry is used when
+    // the failover engine has not selected one.
+    const primary = entry ?? target.credentials?.[0];
+    return {
+      bearer: primary?.credential ?? externalProvider.credential,
+      authStyle: externalProvider.auth,
+    };
   }
   // Defense-in-depth: route() already rejects bedrock targets when disabled.
   if (!tokenProvider) {
@@ -310,10 +308,11 @@ function maybeCaptureTurn(
 }
 
 /**
- * Core inference: parse model, route, dispatch to the translation path.
- * Auth is handled by callers (the public endpoint authenticates; the internal
- * chat endpoint is gated separately). Returns the Anthropic-shaped Response and
- * the resolved routing info (for logging).
+ * Core inference: parse model, run the pre-stream failover attempt plan over
+ * the translation paths (VIRTUAL_MODELS.md). Auth is handled per attempt via
+ * the pool entry (Bedrock mints per region; external use the pool). Returns
+ * the Anthropic-shaped Response, the resolved routing info, and the serving
+ * key's label (cost attribution; never the key value).
  */
 async function runInference(
   config: ProxyConfig,
@@ -326,41 +325,49 @@ async function runInference(
   response: Response;
   canonicalId: ReturnType<typeof parseCanonicalId>;
   target: ReturnType<typeof route>;
+  keyLabel?: string;
 }> {
   const canonicalId = parseCanonicalId(modelFromBody(parsed));
-  const target = route(config, catalog, canonicalId);
-  logger.debug("routing decision", {
-    provider: target.provider,
-    backend: target.backend,
-    translationPath: target.translationPath,
-    region: target.awsRegion || undefined,
-    invocationId: target.invocationId,
+  const outcome = await executeWithFailover({
+    config,
+    catalog,
+    tokenProvider,
+    canonicalId,
+    ...(signal ? { signal } : {}),
+    exec: async ({ target, entry }) => {
+      logger.debug("routing decision", {
+        provider: target.provider,
+        backend: target.backend,
+        translationPath: target.translationPath,
+        region: target.awsRegion || undefined,
+        invocationId: target.invocationId,
+      });
+      // Credential + auth style: Bedrock uses the region-aware token provider;
+      // external providers use the pool entry + configured header style.
+      const { bearer, authStyle } = await resolveOutboundAuth(config, tokenProvider, target, entry);
+      switch (target.translationPath) {
+        case "passthrough":
+          return handlePassthroughMessages(
+            target,
+            inboundHeaders,
+            bearer,
+            parsed,
+            authStyle,
+            signal,
+          );
+        case "converse":
+          return handleConverseMessages(target, bearer, parsed, signal);
+        case "mantle":
+          return handleMantleMessages(target, bearer, parsed, signal);
+      }
+    },
   });
-
-  // Credential + auth style: Bedrock uses the region-aware token provider;
-  // external providers use their static config API key + configured header style.
-  const { bearer, authStyle } = await resolveOutboundAuth(config, tokenProvider, target);
-
-  let response: Response;
-  switch (target.translationPath) {
-    case "passthrough":
-      response = await handlePassthroughMessages(
-        target,
-        inboundHeaders,
-        bearer,
-        parsed,
-        authStyle,
-        signal,
-      );
-      break;
-    case "converse":
-      response = await handleConverseMessages(target, bearer, parsed, signal);
-      break;
-    case "mantle":
-      response = await handleMantleMessages(target, bearer, parsed, signal);
-      break;
-  }
-  return { response, canonicalId, target };
+  return {
+    response: outcome.response,
+    canonicalId,
+    target: outcome.target,
+    ...(outcome.keyLabel ? { keyLabel: outcome.keyLabel } : {}),
+  };
 }
 
 /** Dispatch POST /v1/messages to the correct translation path. */
@@ -377,7 +384,7 @@ async function dispatchMessages(
   // inference and capture (no re-parse in extractModel/safeParse/the handler).
   const parsed = parseJsonObject(await readBodyWithLimit(req));
   assertInboundLimits(parsed, config.limits);
-  const { response, canonicalId, target } = await runInference(
+  const { response, canonicalId, target, keyLabel } = await runInference(
     config,
     catalog,
     tokenProvider,
@@ -401,6 +408,7 @@ async function dispatchMessages(
       system: parsed.system,
       messages: Array.isArray(parsed.messages) ? parsed.messages : [],
       ...(toolTrace ? { tools: toolTrace } : {}),
+      ...(keyLabel ? { servingKeyLabel: keyLabel } : {}),
       requestedAt,
     },
     req.signal,
@@ -446,7 +454,7 @@ async function dispatchChat(
     stream: raw.stream === true,
   };
   const noHeaders = { get: () => null };
-  const { response, canonicalId, target } = await runInference(
+  const { response, canonicalId, target, keyLabel } = await runInference(
     config,
     catalog,
     tokenProvider,
@@ -466,6 +474,7 @@ async function dispatchChat(
       translationPath: target.translationPath,
       system: raw.system ?? "You are a helpful assistant.",
       messages: Array.isArray(raw.messages) ? raw.messages : [],
+      ...(keyLabel ? { servingKeyLabel: keyLabel } : {}),
       requestedAt,
     },
     req.signal,
@@ -572,9 +581,16 @@ async function describeAuth(config: ProxyConfig): Promise<Response> {
       auth: p.auth,
       credential: p.credential,
       state: credentialState(p.credential),
+      ...(p.inactiveReason ? { inactiveReason: p.inactiveReason } : {}),
     };
   }
-  return Response.json({ bedrock, external });
+  // Boolean only — never the key value (metadata surface, like the minted
+  // Bedrock token; the live key is visible via GET /api/config).
+  return Response.json({
+    inbound: { ephemeral: config.inboundAuth.ephemeralKey === true },
+    bedrock,
+    external,
+  });
 }
 
 /** Dispatch POST /v1/messages/count_tokens (supported for Claude passthrough). */
@@ -588,15 +604,33 @@ async function dispatchCountTokens(
   const parsed = parseJsonObject(await readBodyWithLimit(req));
   assertInboundLimits(parsed, config.limits);
   const canonicalId = parseCanonicalId(modelFromBody(parsed));
-  const target = route(config, catalog, canonicalId);
 
-  if (target.translationPath === "passthrough" && target.countTokensPath) {
-    const { bearer, authStyle } = await resolveOutboundAuth(config, tokenProvider, target);
-    return handlePassthroughCountTokens(target, req.headers, bearer, parsed, authStyle, req.signal);
-  }
-  // Non-passthrough backends have no native Anthropic count endpoint; Claude Code
-  // falls back to counting via the messages endpoint, so 404 is acceptable here.
-  throw new BadRequestError("count_tokens is not supported for this backend/model");
+  // Same failover plan as messages, filtered to candidates that actually have
+  // a native count endpoint (passthrough + countTokensPath). The engine keeps
+  // the classic BadRequestError when no candidate qualifies.
+  const outcome = await executeWithFailover({
+    config,
+    catalog,
+    tokenProvider,
+    canonicalId,
+    countTokensOnly: true,
+    exec: async ({ target, entry }) => {
+      if (target.translationPath !== "passthrough" || !target.countTokensPath) {
+        // Filtered above; kept for the type checker + defense in depth.
+        throw new BadRequestError("count_tokens is not supported for this backend/model");
+      }
+      const { bearer, authStyle } = await resolveOutboundAuth(config, tokenProvider, target, entry);
+      return handlePassthroughCountTokens(
+        target,
+        req.headers,
+        bearer,
+        parsed,
+        authStyle,
+        req.signal,
+      );
+    },
+  });
+  return outcome.response;
 }
 
 /** Mutable runtime built from a config; swapped atomically on hot-reload. */
@@ -647,6 +681,16 @@ export async function buildRuntime(config: ProxyConfig): Promise<Runtime> {
  * any path parameters captured by the matcher. This lets each handler be a
  * small, independently testable function instead of a branch in a mega-if.
  */
+/**
+ * What a hot-reload changed that callers may need to report: when the reloaded
+ * config minted a fresh EPHEMERAL inbound key (PROXY_INBOUND_KEY unset), the
+ * previous one is gone — the save response must carry the new key or the
+ * operator is locked out until restart.
+ */
+export interface ReloadOutcome {
+  readonly ephemeralInboundKey?: string;
+}
+
 interface RouteContext {
   req: Request;
   /** Structural URL view (avoids the DOM-vs-Bun `URL` lib collision; see AGENTS.md). */
@@ -656,7 +700,7 @@ interface RouteContext {
   tokenProvider: RegionTokenProvider | null;
   catalogManager: CatalogManager;
   logStore: LogStore;
-  reloadRuntime: (rawConfig: unknown) => Promise<void>;
+  reloadRuntime: (rawConfig: unknown) => Promise<ReloadOutcome | undefined>;
   /** Path segments captured after a route's prefix (already decodeURIComponent'd). */
   params: string[];
 }
@@ -724,7 +768,7 @@ function handleRegistryJson({ config, catalogManager }: RouteContext): Response 
   return Response.json(buildRegistrySnapshot(config, catalogManager.current()));
 }
 
-function handleModelsList({ catalogManager }: RouteContext): Response {
+function handleModelsList({ config, catalogManager }: RouteContext): Response {
   const data = catalogManager
     .current()
     .models.map((m) => ({
@@ -735,6 +779,19 @@ function handleModelsList({ catalogManager }: RouteContext): Response {
         nativeModelId: m.nativeModelId,
       }),
     }))
+    .concat(
+      // Virtual tiers are listed as addressable ids, each annotated with the
+      // candidate it currently resolves to (null = nothing available now).
+      virtualTierStatuses(config, catalogManager.current()).map((t) => ({
+        id: formatCanonicalId({
+          provider: VIRTUAL_PROVIDER,
+          backend: "anthropic",
+          profilePrefix: "global",
+          nativeModelId: t.name,
+        }),
+        aliasOf: t.resolution,
+      })),
+    )
     .sort((a, b) => a.id.localeCompare(b.id));
   return Response.json({ data });
 }
@@ -830,6 +887,28 @@ function handleConfigStatus({ config, catalogManager }: RouteContext): Response 
   const external = Object.entries(config.providers.external).map(([key, p]) => {
     const models = cat.models.filter((m) => m.provider === key);
     const src = sources.get(key);
+    // Pool summary: LABELS only, never values (this surface is auth-gated but
+    // labels suffice for "which key is serving" visibility).
+    const poolSummary = (pool: readonly { credential: string; label?: string }[]) => ({
+      size: pool.length,
+      labels: pool.map((e) => e.label ?? "default"),
+      primary: pool[0]?.label ?? "default",
+    });
+    // Multi-region providers: one SourceStatus per region (provider:region),
+    // aggregated so a dead region (skipped) is visible next to live siblings.
+    const regionStates = p.regions
+      ? Object.entries(p.regions).map(([regionKey, r]) => {
+          const rsrc = sources.get(`${key}:${regionKey}`);
+          return {
+            key: regionKey,
+            ...(r.billingMode ? { billingMode: r.billingMode } : {}),
+            state: (rsrc?.state ?? "skipped") as "ok" | "error" | "skipped" | "disabled",
+            ...(rsrc?.detail ? { detail: rsrc.detail } : {}),
+            ...(r.inactiveReason ? { inactiveReason: r.inactiveReason } : {}),
+            ...(r.credentials ? { credentialPool: poolSummary(r.credentials) } : {}),
+          };
+        })
+      : undefined;
     return {
       key,
       type: p.type,
@@ -838,12 +917,20 @@ function handleConfigStatus({ config, catalogManager }: RouteContext): Response 
       total: models.length,
       state: (src?.state ?? "skipped") as "ok" | "error" | "skipped" | "disabled",
       ...(src?.detail ? { detail: src.detail } : {}),
+      ...(p.inactiveReason ? { inactiveReason: p.inactiveReason } : {}),
+      ...(p.credentials.length > 1 ? { credentialPool: poolSummary(p.credentials) } : {}),
+      ...(regionStates ? { regions: regionStates } : {}),
     };
   });
   return Response.json({
     bedrock: bedrockMode.enabled
       ? { enabled: true }
       : { enabled: false, reason: bedrockMode.reason },
+    inboundAuthEphemeral: config.inboundAuth.ephemeralKey === true,
+    ...(config.loadWarnings ? { warnings: [...config.loadWarnings] } : {}),
+    ...(Object.keys(config.virtualModels ?? {}).length > 0
+      ? { virtualTiers: virtualTierStatuses(config, cat) }
+      : {}),
     regions,
     external,
     totalModels: cat.models.length,
@@ -851,8 +938,17 @@ function handleConfigStatus({ config, catalogManager }: RouteContext): Response 
 }
 
 async function handleConfigSave({ req, reloadRuntime }: RouteContext): Promise<Response> {
-  await reloadRuntime(await req.json());
-  return Response.json({ ok: true, message: "Config saved and hot-reloaded." });
+  const outcome = await reloadRuntime(await req.json());
+  // An ephemeral inbound deployment rotates its key on every reload (the old
+  // literal is stripped by validation) — surface the new one or the operator
+  // cannot authenticate until a restart.
+  return Response.json({
+    ok: true,
+    message:
+      outcome?.ephemeralInboundKey !== undefined
+        ? `Config saved and hot-reloaded. PROXY_INBOUND_KEY is unset — new ephemeral inbound key: ${outcome.ephemeralInboundKey}`
+        : "Config saved and hot-reloaded.",
+  });
 }
 
 /**
@@ -888,6 +984,7 @@ function warmUpstreamConnections(config: ProxyConfig): void {
     }
   }
   for (const provider of Object.values(config.providers.external)) {
+    if (provider.inactiveReason) continue; // missing-info provider: nothing to warm
     try {
       preconnectOrigin(externalProviderOrigin(provider));
     } catch {
@@ -1062,7 +1159,7 @@ const ROUTES: Route[] = [
  */
 export function createFetchHandler(
   getRuntime: () => Runtime,
-  reloadRuntime: (rawConfig: unknown) => Promise<void>,
+  reloadRuntime: (rawConfig: unknown) => Promise<ReloadOutcome | undefined>,
 ): (req: Request) => Promise<Response> {
   return async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -1138,7 +1235,23 @@ export function createFetchHandler(
 }
 
 async function main(): Promise<void> {
-  const initialConfig: ProxyConfig = await loadConfig(CONFIG_PATH);
+  // Boot-resilient load: missing file / missing env info degrade (bootstrap
+  // tiers, skipped providers, ephemeral inbound key) instead of exiting; only
+  // structural errors in an existing config file are fatal.
+  const { config: initialConfig, source } = await loadConfigResilient(CONFIG_PATH);
+  if (source !== "file") {
+    console.warn(`Booting from config source: ${source}.`);
+  }
+  if (initialConfig.inboundAuth.ephemeralKey) {
+    // Printed once, to the operator's console only (docker logs / CLI up).
+    const key = initialConfig.inboundAuth.keys[0] ?? "";
+    console.log(
+      `No PROXY_INBOUND_KEY configured — generated an EPHEMERAL inbound key for this run: ${key}`,
+    );
+    console.log(
+      "Set PROXY_INBOUND_KEY in .env to persist an inbound key (this one changes on every restart).",
+    );
+  }
   const bedrockMode = resolveBedrockMode(initialConfig.providers.bedrock?.credential);
   if (bedrockMode.enabled) {
     console.log(
@@ -1166,9 +1279,13 @@ async function main(): Promise<void> {
    * config that would brick the next boot. On success: swap the single runtime
    * reference atomically, then stop exactly the manager we replaced. Throws on
    * invalid config (leaving the running runtime untouched).
+   *
+   * Reports a freshly minted ephemeral inbound key (PROXY_INBOUND_KEY unset —
+   * validation strips the old literal) via the outcome so the save response
+   * can carry it to the operator.
    */
-  function reloadRuntime(rawConfig: unknown): Promise<void> {
-    return serializeReload(async () => {
+  function reloadRuntime(rawConfig: unknown): Promise<ReloadOutcome | undefined> {
+    return serializeReload(async (): Promise<ReloadOutcome | undefined> => {
       const next = validateConfig(rawConfig);
       // Build + validate the runtime FIRST (may throw); only persist on success.
       const newRuntime = await buildRuntime(next);
@@ -1187,6 +1304,12 @@ async function main(): Promise<void> {
       console.log(
         `Config hot-reloaded: ${runtime.catalogManager.current().models.length} models across ${runtime.config.regions.map((r) => r.awsRegion).join(", ")}.`,
       );
+      if (next.inboundAuth.ephemeralKey) {
+        console.warn(
+          `Inbound key is EPHEMERAL (PROXY_INBOUND_KEY unset): new key ${next.inboundAuth.keys[0] ?? ""} — previous ephemeral key is no longer accepted.`,
+        );
+        return { ephemeralInboundKey: next.inboundAuth.keys[0] ?? "" };
+      }
     });
   }
 

@@ -69,7 +69,7 @@ function handler() {
   const runtime = makeRuntime(config);
   return createFetchHandler(
     () => runtime,
-    async () => {},
+    async () => undefined,
   );
 }
 
@@ -227,5 +227,91 @@ describe("errorResponse SEC-7 (generic message + stable id for unexpected errors
     expect(res.status).toBe(400);
     const json = (await res.json()) as { error: { message: string } };
     expect(json.error.message).toBe("messages must be an array");
+  });
+});
+
+describe("GET /v1/models + /api/config/status with virtual tiers & pools", () => {
+  const POOL_KEY_PRIMARY = "zai-pool-primary-abcdef123456";
+  const POOL_KEY_SECONDARY = "zai-pool-secondary-abcdef123456";
+
+  function tieredRuntime(): Runtime {
+    const config = validateConfig({
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: [KEY] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        bedrock: {
+          credential: "long-term-secret",
+          hosts: {
+            converse: "bedrock-runtime.{region}.amazonaws.com",
+            mantle: "bedrock-mantle.{region}.api.aws",
+            control: "bedrock.{region}.amazonaws.com",
+          },
+        },
+        zai: {
+          type: "anthropic",
+          credentials: [
+            { credential: POOL_KEY_PRIMARY, label: "primary" },
+            { credential: POOL_KEY_SECONDARY, label: "secondary" },
+          ],
+          auth: "bearer",
+          baseUrl: "https://api.z.ai/api/anthropic",
+          countTokens: true,
+          modelsUrl: "https://api.z.ai/api/paas/v4/models",
+        },
+      },
+      virtualModels: {
+        "sonnet-like": [
+          "zai.anthropic.global.glm-5.3",
+          "bedrock.converse.us.amazon.nova-lite-v1:0",
+        ],
+      },
+      logging: { enabled: false },
+      chatPage: { enabled: true },
+    });
+    return makeRuntime(config);
+  }
+
+  function tieredHandler() {
+    const runtime = tieredRuntime();
+    return createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+  }
+
+  test("/v1/models lists the virtual id with aliasOf naming the current resolution", async () => {
+    const res = await tieredHandler()(new Request("http://localhost/v1/models", { method: "GET" }));
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { data?: Array<{ id: string; aliasOf?: string | null }> };
+    const entry = (json.data ?? []).find((m) => m.id === "virtual.anthropic.global.sonnet-like");
+    expect(entry).toBeDefined();
+    expect(entry?.aliasOf).toBe("zai.anthropic.global.glm-5.3");
+  });
+
+  test("/api/config/status exposes virtualTiers + pool LABELS, never key values", async () => {
+    const res = await tieredHandler()(
+      new Request("http://localhost/api/config/status", {
+        headers: { authorization: `Bearer ${KEY}` },
+      }),
+    );
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    const json = JSON.parse(text) as {
+      virtualTiers?: Array<{ name: string; resolution: string | null }>;
+      external?: Array<{ key: string; credentialPool?: { labels: string[]; primary: string } }>;
+    };
+    expect(json.virtualTiers?.[0]?.name).toBe("sonnet-like");
+    expect(json.virtualTiers?.[0]?.resolution).toBe("zai.anthropic.global.glm-5.3");
+    const zai = (json.external ?? []).find((e) => e.key === "zai");
+    expect(zai?.credentialPool?.labels).toEqual(["primary", "secondary"]);
+    expect(zai?.credentialPool?.primary).toBe("primary");
+    // PUBLIC-surface hygiene even on the auth-gated status: no key material.
+    expect(text.includes(POOL_KEY_PRIMARY)).toBe(false);
+    expect(text.includes(POOL_KEY_SECONDARY)).toBe(false);
   });
 });

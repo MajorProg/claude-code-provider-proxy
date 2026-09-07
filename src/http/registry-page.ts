@@ -6,6 +6,7 @@
 import type { ProxyConfig } from "../config.ts";
 import { formatCanonicalId } from "../model/canonical-id.ts";
 import type { Catalog, DiscoveredModel, SourceStatus } from "../model/catalog.ts";
+import { virtualTierStatuses } from "../router.ts";
 import { jsonForScript, renderShell } from "./shell.ts";
 
 export interface RegistrySnapshot {
@@ -15,6 +16,26 @@ export interface RegistrySnapshot {
   regions: { key: string; awsRegion: string }[];
   /** Per-source discovery outcomes (bedrock regions + external providers). */
   sources: readonly SourceStatus[];
+  /**
+   * Load-time warnings (unset env vars resolved empty). /status.json is PUBLIC
+   * — only var NAMES here, never values (and never the inbound key: just the
+   * `inboundAuthEphemeral` boolean).
+   */
+  warnings?: readonly string[];
+  /** True when inbound auth runs on a process-minted ephemeral key. */
+  inboundAuthEphemeral?: true;
+  /**
+   * Virtual tier resolutions (ids only — public page; VIRTUAL_MODELS.md):
+   * tier name → the canonical id it currently resolves to (null = none).
+   */
+  virtualTiers?: {
+    name: string;
+    resolution: string | null;
+    available: number;
+    candidates: number;
+  }[];
+  /** Credential-pool LABELS per provider (public page: labels, never values). */
+  pools?: { provider: string; labels: string[] }[];
   counts: {
     total: number;
     byBackend: Record<string, number>;
@@ -73,6 +94,28 @@ export function buildRegistrySnapshot(config: ProxyConfig, catalog: Catalog): Re
     profilePreference: config.profilePreference,
     regions: config.regions.map((r) => ({ key: r.key, awsRegion: r.awsRegion })),
     sources: catalog.sources,
+    ...(config.loadWarnings ? { warnings: [...config.loadWarnings] } : {}),
+    ...(config.inboundAuth.ephemeralKey ? { inboundAuthEphemeral: true as const } : {}),
+    // Tier resolutions from the ROUTER (routing-time availability), labels only.
+    ...(Object.keys(config.virtualModels ?? {}).length > 0
+      ? {
+          virtualTiers: virtualTierStatuses(config, catalog).map((t) => ({
+            name: t.name,
+            resolution: t.resolution,
+            available: t.available.length,
+            candidates: t.candidates.length,
+          })),
+        }
+      : {}),
+    ...(() => {
+      const pools = Object.entries(config.providers.external)
+        .filter(([, p]) => p.credentials.length > 1)
+        .map(([provider, p]) => ({
+          provider,
+          labels: p.credentials.map((e) => e.label ?? "default"),
+        }));
+      return pools.length > 0 ? { pools } : {};
+    })(),
     counts: {
       total: catalog.models.length,
       byBackend,
@@ -108,6 +151,8 @@ export function renderRegistryHtml(snapshot: RegistrySnapshot, chatEnabled: bool
       primary region <b class="text-slate-700 dark:text-slate-200" x-text="snap.primaryRegion"></b> ·
       profile preference <b class="text-slate-700 dark:text-slate-200" x-text="snap.profilePreference"></b> ·
       regions <span x-text="snap.regions.map(r=>r.key+'→'+r.awsRegion).join(', ')"></span>
+      <div x-show="tiersLine()" class="mt-0.5 font-mono text-xs" x-text="'tiers: '+tiersLine()"></div>
+      <div x-show="poolsLine()" class="mt-0.5 font-mono text-xs" x-text="'key pools: '+poolsLine()"></div>
     </div>
     <div class="text-xs text-slate-400 flex items-center gap-2">
       <span x-show="loading" class="animate-pulse">refreshing…</span>
@@ -189,8 +234,24 @@ export function renderRegistryHtml(snapshot: RegistrySnapshot, chatEnabled: bool
       for(const s of srcs){
         if(s.state==='error') out.push(s.source+': '+(s.detail||'discovery failed'));
         else if(s.state==='disabled') out.push(s.source+': disabled');
+        else if(s.state==='skipped') out.push(s.source+': skipped ('+(s.detail||'credential unset')+')');
       }
+      for(const t of this.snap.virtualTiers||[]){
+        if(!t.resolution) out.push('virtual tier '+t.name+': no available candidate ('+t.candidates+' configured)');
+      }
+      if(this.snap.inboundAuthEphemeral) out.push('inbound auth: ephemeral key (PROXY_INBOUND_KEY unset — changes on restart)');
+      for(const w of this.snap.warnings||[]) out.push('unset env var: '+w+' (resolved empty)');
       return out;
+    },
+    tiersLine(){
+      const t=this.snap.virtualTiers||[];
+      if(t.length===0) return '';
+      return t.map(x=>x.name+' → '+(x.resolution||'(none)')).join(' · ');
+    },
+    poolsLine(){
+      const p=this.snap.pools||[];
+      if(p.length===0) return '';
+      return p.map(x=>x.provider+': '+x.labels.join(' → ')).join(' · ');
     },
     backendCounts(){const e=Object.entries(this.snap.counts.byBackend||{});return e.length?e.map(([k,v])=>k+':'+v).join(' · '):'—';},
     regionCounts(){const e=Object.entries(this.snap.counts.byRegion||{});return e.length?e.map(([k,v])=>k+':'+v).join(' · '):'—';},

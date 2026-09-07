@@ -128,10 +128,40 @@ describe("validateConfig", () => {
     expect(() => validateConfig(bad)).toThrow(ConfigError);
   });
 
-  test("rejects empty inbound keys", () => {
-    const bad = structuredClone(VALID_RAW);
-    (bad.inboundAuth as { keys: string[] }).keys = [];
-    expect(() => validateConfig(bad)).toThrow(ConfigError);
+  test("empty inbound keys mint an ephemeral key (marked, frozen)", () => {
+    const raw = structuredClone(VALID_RAW);
+    (raw.inboundAuth as { keys: string[] }).keys = [];
+    const cfg = validateConfig(raw);
+    expect(cfg.inboundAuth.keys).toHaveLength(1);
+    expect(cfg.inboundAuth.keys[0]).toMatch(/^ccpp-ephemeral-[0-9a-f]{32}$/);
+    expect(cfg.inboundAuth.ephemeralKey).toBe(true);
+    expect(Object.isFrozen(cfg)).toBe(true);
+  });
+
+  test("empty-string key entries are filtered; real keys survive alongside", () => {
+    const raw = structuredClone(VALID_RAW);
+    (raw.inboundAuth as { keys: string[] }).keys = ["", "secret-key", ""];
+    const cfg = validateConfig(raw);
+    expect(cfg.inboundAuth.keys).toEqual(["secret-key"]);
+    expect(cfg.inboundAuth.ephemeralKey).toBeUndefined();
+  });
+
+  test("an ephemeral-prefixed entry is stripped and re-minted (stale artifact)", () => {
+    const raw = structuredClone(VALID_RAW);
+    (raw.inboundAuth as { keys: string[] }).keys = ["ccpp-ephemeral-deadbeef"];
+    const cfg = validateConfig(raw);
+    // A fresh key was minted (different random value), never the stale one.
+    expect(cfg.inboundAuth.keys[0]).toMatch(/^ccpp-ephemeral-[0-9a-f]{32}$/);
+    expect(cfg.inboundAuth.keys[0] === "ccpp-ephemeral-deadbeef").toBe(false);
+    expect(cfg.inboundAuth.ephemeralKey).toBe(true);
+  });
+
+  test("two validations mint different ephemeral keys", () => {
+    const raw = structuredClone(VALID_RAW);
+    (raw.inboundAuth as { keys: string[] }).keys = [];
+    const a = validateConfig(structuredClone(raw));
+    const b = validateConfig(structuredClone(raw));
+    expect(a.inboundAuth.keys[0]).not.toBe(b.inboundAuth.keys[0]);
   });
 
   test("rejects primaryRegion with no matching region entry", () => {
@@ -284,6 +314,336 @@ describe("validateConfig", () => {
     };
     const cfg = validateConfig(raw);
     expect(cfg.providers.external.zai?.credential).toBe("");
+    expect(cfg.providers.external.zai?.credentials).toEqual([]);
+    // Empty pool = missing info: the provider deactivates with a reason.
+    expect(cfg.providers.external.zai?.inactiveReason).toContain("credential pool is empty");
+  });
+
+  test("flat credential normalizes to a one-entry pool labeled default", () => {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      credential: "zai-key",
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      countTokens: true,
+      modelsUrl: "https://api.z.ai/api/paas/v4/models",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.credentials).toEqual([
+      { credential: "zai-key", label: "default" },
+    ]);
+    expect(cfg.providers.external.zai?.credential).toBe("zai-key");
+    expect(cfg.providers.external.zai?.inactiveReason).toBeUndefined();
+  });
+
+  test("a credentials array wins over a flat credential; empty entries filtered; labels kept", () => {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      credential: "flat-ignored",
+      credentials: [
+        { credential: "", label: "unset-env-ref" },
+        { credential: "primary-key", label: "primary" },
+        "not-a-record",
+        { credential: "secondary-key" },
+      ],
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      countTokens: true,
+      modelsUrl: "https://api.z.ai/api/paas/v4/models",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.credentials).toEqual([
+      { credential: "primary-key", label: "primary" },
+      { credential: "secondary-key" },
+    ]);
+    expect(cfg.providers.external.zai?.credential).toBe("primary-key");
+  });
+
+  test("a provider with NO credential field at all is inactive, not fatal (pool-only shape)", () => {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      countTokens: true,
+      modelsUrl: "https://api.z.ai/api/paas/v4/models",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.credentials).toEqual([]);
+    expect(cfg.providers.external.zai?.inactiveReason).toContain("credential pool is empty");
+  });
+
+  test("an entirely-empty credentials array deactivates the provider", () => {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      credentials: [{ credential: "" }, { credential: "" }],
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      countTokens: true,
+      modelsUrl: "https://api.z.ai/api/paas/v4/models",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.credentials).toEqual([]);
+    expect(cfg.providers.external.zai?.inactiveReason).toContain("credential pool is empty");
+  });
+
+  test("hostTemplate with an EMPTY workspaceId deactivates the provider (not fatal)", () => {
+    // The fork-port scenario: ${DASHSCOPE_WORKSPACE_ID_INTL} resolved empty.
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.alibaba = {
+      type: "anthropic",
+      credential: "sk-secret",
+      auth: "x-api-key",
+      hostTemplate: "{workspaceId}.{region}.maas.aliyuncs.com",
+      workspaceId: "",
+      region: "ap-southeast-1",
+      basePath: "/apps/anthropic",
+      countTokens: true,
+      modelsUrl: "https://.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/models",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.alibaba?.inactiveReason).toContain("workspaceId is empty");
+  });
+
+  test("empty modelsUrl deactivates the provider (not fatal)", () => {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      credential: "sk-secret",
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      countTokens: true,
+      modelsUrl: "",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.inactiveReason).toContain("modelsUrl is empty");
+  });
+
+  test("an incoming inactiveReason field is ignored (computed, never trusted)", () => {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      credential: "sk-secret",
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      countTokens: true,
+      modelsUrl: "https://api.z.ai/api/paas/v4/models",
+      inactiveReason: "attacker-supplied reason",
+    };
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.inactiveReason).toBeUndefined();
+  });
+});
+
+describe("validateConfig — multi-region providers", () => {
+  const ALIBABA_REGIONS = {
+    "ap-southeast-1": {
+      hostTemplate: "dashscope-intl.aliyuncs.com",
+      basePath: "/apps/anthropic",
+      modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+      billingMode: "token-plan",
+    },
+    "eu-central-1": {
+      hostTemplate: "{workspaceId}.eu-central-1.maas.aliyuncs.com",
+      workspaceId: "ws-eu",
+      credential: "sk-eu",
+      modelsUrl: "https://ws-eu.eu-central-1.maas.aliyuncs.com/compatible-mode/v1/models",
+      billingMode: "payg",
+    },
+  };
+
+  /** Regions-only alibaba (no baseUrl, no provider-level modelsUrl). */
+  function alibabaRaw(regions: unknown): Record<string, unknown> {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.alibaba = {
+      type: "anthropic",
+      credential: "sk-shared",
+      auth: "x-api-key",
+      countTokens: true,
+      regions,
+    };
+    return raw;
+  }
+
+  test("regions map survives validateConfig with per-region fields intact", () => {
+    // Regression: the return object used to drop `regions` entirely, making
+    // the multi-region routing feature unreachable from a file-loaded config.
+    const cfg = validateConfig(alibabaRaw(ALIBABA_REGIONS));
+    const regions = cfg.providers.external.alibaba?.regions;
+    expect(regions).toBeDefined();
+    expect(Object.keys(regions ?? {})).toEqual(["ap-southeast-1", "eu-central-1"]);
+    expect(regions?.["eu-central-1"]?.workspaceId).toBe("ws-eu");
+    expect(regions?.["eu-central-1"]?.credential).toBe("sk-eu");
+    expect(regions?.["ap-southeast-1"]?.billingMode).toBe("token-plan");
+    expect(cfg.providers.external.alibaba?.inactiveReason).toBeUndefined();
+  });
+
+  test("regions-only provider (no baseUrl) validates — the documented multi-region shape", () => {
+    const cfg = validateConfig(alibabaRaw(ALIBABA_REGIONS));
+    expect(cfg.providers.external.alibaba?.baseUrl).toBe("");
+    expect(cfg.providers.external.alibaba?.modelsUrl).toBe("");
+    expect(cfg.providers.external.alibaba?.inactiveReason).toBeUndefined();
+  });
+
+  test("an inactive sibling region does not kill the active one", () => {
+    const regions = {
+      "ap-southeast-1": {
+        hostTemplate: "dashscope-intl.aliyuncs.com",
+        basePath: "/apps/anthropic",
+        modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+      },
+      // EU workspace vars unset: empty workspaceId deactivates only this region.
+      "eu-central-1": {
+        hostTemplate: "{workspaceId}.eu-central-1.maas.aliyuncs.com",
+        workspaceId: "",
+        credential: "sk-eu",
+        modelsUrl: "https://.eu-central-1.maas.aliyuncs.com/compatible-mode/v1/models",
+      },
+    };
+    const cfg = validateConfig(alibabaRaw(regions));
+    const r = cfg.providers.external.alibaba?.regions;
+    expect(r?.["ap-southeast-1"]?.inactiveReason).toBeUndefined();
+    expect(r?.["eu-central-1"]?.inactiveReason).toContain("workspaceId is empty");
+  });
+
+  test("region with a bad billingMode stays fatal (structural)", () => {
+    const regions = {
+      "ap-southeast-1": {
+        hostTemplate: "dashscope-intl.aliyuncs.com",
+        modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+        billingMode: "subscription",
+      },
+    };
+    expect(() => validateConfig(alibabaRaw(regions))).toThrow(ConfigError);
+  });
+
+  test("region with an empty modelsUrl deactivates only that region", () => {
+    const regions = {
+      "ap-southeast-1": {
+        hostTemplate: "dashscope-intl.aliyuncs.com",
+        modelsUrl: "",
+      },
+    };
+    const cfg = validateConfig(alibabaRaw(regions));
+    expect(cfg.providers.external.alibaba?.regions?.["ap-southeast-1"]?.inactiveReason).toContain(
+      "modelsUrl is empty",
+    );
+  });
+
+  test("region pool absent inherits the provider pool (no credentials field emitted)", () => {
+    const cfg = validateConfig(alibabaRaw(ALIBABA_REGIONS));
+    expect(
+      cfg.providers.external.alibaba?.regions?.["ap-southeast-1"]?.credentials,
+    ).toBeUndefined();
+    expect(cfg.providers.external.alibaba?.regions?.["ap-southeast-1"]?.credential).toBeUndefined();
+  });
+
+  test("region-owned pool: flat normalizes, credentials array wins, empty deactivates region", () => {
+    const regions = {
+      "ap-southeast-1": {
+        hostTemplate: "dashscope-intl.aliyuncs.com",
+        modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+        credentials: [{ credential: "sg-key-1", label: "token-plan" }, { credential: "sg-key-2" }],
+      },
+      "eu-central-1": {
+        hostTemplate: "{workspaceId}.eu-central-1.maas.aliyuncs.com",
+        workspaceId: "ws-eu",
+        modelsUrl: "https://ws-eu.eu-central-1.maas.aliyuncs.com/compatible-mode/v1/models",
+        credential: "eu-flat-key",
+      },
+      "us-east-1": {
+        hostTemplate: "{workspaceId}.us-east-1.maas.aliyuncs.com",
+        workspaceId: "ws-us",
+        modelsUrl: "https://ws-us.us-east-1.maas.aliyuncs.com/compatible-mode/v1/models",
+        credentials: [{ credential: "" }],
+      },
+    };
+    const cfg = validateConfig(alibabaRaw(regions));
+    const r = cfg.providers.external.alibaba?.regions;
+    expect(r?.["ap-southeast-1"]?.credentials).toEqual([
+      { credential: "sg-key-1", label: "token-plan" },
+      { credential: "sg-key-2" },
+    ]);
+    expect(r?.["ap-southeast-1"]?.credential).toBe("sg-key-1");
+    expect(r?.["eu-central-1"]?.credentials).toEqual([
+      { credential: "eu-flat-key", label: "default" },
+    ]);
+    expect(r?.["us-east-1"]?.inactiveReason).toContain("credential pool is empty");
+  });
+});
+
+describe("validateConfig — virtualModels + maxFailoverAttempts", () => {
+  const TIER_RAW = {
+    server: { host: "127.0.0.1", port: 8787 },
+    inboundAuth: { keys: ["k"] },
+    primaryRegion: "us",
+    profilePreference: "global",
+    refreshIntervalMinutes: 60,
+    claudeFallbackToMantle: false,
+    regions: [{ key: "us", awsRegion: "us-east-1" }],
+    providers: {},
+  };
+
+  test("valid tier entries are preserved in config order", () => {
+    const cfg = validateConfig({
+      ...TIER_RAW,
+      virtualModels: {
+        "sonnet-like": ["zai.anthropic.global.glm-5.3", "bedrock.mantle.us.zai.glm-5"],
+      },
+    });
+    expect(cfg.virtualModels).toEqual({
+      "sonnet-like": ["zai.anthropic.global.glm-5.3", "bedrock.mantle.us.zai.glm-5"],
+    });
+  });
+
+  test("unparseable / non-string / nested-virtual entries are dropped, not fatal", () => {
+    const cfg = validateConfig({
+      ...TIER_RAW,
+      virtualModels: {
+        "sonnet-like": [
+          "zai.anthropic.global.glm-5.3",
+          "not-a-canonical-id",
+          42,
+          "virtual.anthropic.global.haiku-like",
+        ],
+      },
+    });
+    expect(cfg.virtualModels).toEqual({ "sonnet-like": ["zai.anthropic.global.glm-5.3"] });
+  });
+
+  test("a tier left empty is dropped; an emptied block is omitted entirely", () => {
+    expect(
+      validateConfig({ ...TIER_RAW, virtualModels: { "sonnet-like": ["nope"] } }).virtualModels,
+    ).toBeUndefined();
+    expect(validateConfig({ ...TIER_RAW, virtualModels: {} }).virtualModels).toBeUndefined();
+    expect(validateConfig(TIER_RAW).virtualModels).toBeUndefined();
+  });
+
+  test("maxFailoverAttempts defaults to 4 and validates [1, 16]", () => {
+    expect(validateConfig(TIER_RAW).maxFailoverAttempts).toBe(4);
+    expect(validateConfig({ ...TIER_RAW, maxFailoverAttempts: 2 }).maxFailoverAttempts).toBe(2);
+    for (const bad of [0, -1, 1.5, "4", 17]) {
+      expect(() => validateConfig({ ...TIER_RAW, maxFailoverAttempts: bad })).toThrow(ConfigError);
+    }
   });
 });
 
@@ -326,8 +686,14 @@ describe("loadConfig (JSONC + env interpolation)", () => {
     expect(cfg.providers.external.zai?.credential).toBe("");
   });
 
-  test("fails fast when a referenced env var is unset", async () => {
-    await expect(loadConfig("config.example.jsonc", {})).rejects.toThrow(ConfigError);
+  test("example config with NO env boots: empty creds + ephemeral inbound key + warning", async () => {
+    // The zero-env scenario: PROXY_INBOUND_KEY unset (bare ref) mints an
+    // ephemeral key; ${VAR:-} provider creds resolve empty. No crash.
+    const cfg = await loadConfig("config.example.jsonc", {});
+    expect(cfg.inboundAuth.ephemeralKey).toBe(true);
+    expect(cfg.inboundAuth.keys[0]).toMatch(/^ccpp-ephemeral-[0-9a-f]{32}$/);
+    expect(cfg.providers.bedrock?.credential).toBe("");
+    expect(cfg.loadWarnings).toEqual(["PROXY_INBOUND_KEY"]);
   });
 
   test("missing file throws ConfigError", async () => {

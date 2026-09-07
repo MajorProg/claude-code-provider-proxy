@@ -12,6 +12,7 @@ import { credentialState } from "../auth/bedrock-mode.ts";
  *   - Mantle models:               GET {mantle}/v1/models
  */
 import {
+  type CredentialPoolEntry,
   type ProfilePreference,
   type ProxyConfig,
   type RegionKey,
@@ -275,6 +276,62 @@ export function buildRegionCatalog(
   return out;
 }
 
+/** Pool entries usable for discovery: non-empty and non-placeholder. */
+function usablePool(pool: readonly CredentialPoolEntry[]): CredentialPoolEntry[] {
+  return pool.filter((e) => {
+    const state = credentialState(e.credential);
+    return state !== "empty" && state !== "placeholder";
+  });
+}
+
+type PoolDiscoveryResult =
+  | { ok: true; data: { id?: string }[]; keyLabel?: string }
+  | { ok: false; status: number; attempted: number };
+
+/**
+ * Fetch a /models discovery endpoint walking a credential pool in order: the
+ * first key the endpoint accepts wins. Only 401/403 (key rejected) advance to
+ * the next key — any other non-ok status is key-independent (bad path, 404,
+ * 5xx) and stops the walk. Network errors PROPAGATE to the caller's catch (a
+ * dead host is key-independent too). Bearer-only by /models convention.
+ */
+async function fetchModelsWithPool(
+  url: string,
+  pool: readonly CredentialPoolEntry[],
+  sourceId: string,
+): Promise<PoolDiscoveryResult> {
+  let lastStatus = 0;
+  let attempted = 0;
+  for (const entry of pool) {
+    attempted++;
+    const res = await fetch(url, {
+      headers: { authorization: `Bearer ${entry.credential}` },
+      signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+    });
+    if (res.ok) {
+      const body = (await res.json()) as { data?: { id?: string }[] };
+      return { ok: true, data: body.data ?? [], ...(entry.label ? { keyLabel: entry.label } : {}) };
+    }
+    lastStatus = res.status;
+    if (res.status !== 401 && res.status !== 403) {
+      return { ok: false, status: res.status, attempted };
+    }
+    logger.warn("discovery key rejected, advancing credential pool", {
+      source: sourceId,
+      status: res.status,
+      keyLabel: entry.label,
+    });
+  }
+  return { ok: false, status: lastStatus, attempted };
+}
+
+/** SourceStatus detail for a failed pool discovery (keeps the classic wording). */
+function discoveryErrorDetail(result: { status: number; attempted: number }): string {
+  return `discovery returned HTTP ${result.status}${
+    result.attempted > 1 ? ` after ${result.attempted} pool key(s)` : ""
+  }`;
+}
+
 /**
  * Discover external (non-Bedrock) provider models at runtime by fetching each
  * provider's configured `modelsUrl` (an OpenAI-style `/models` endpoint). NO
@@ -282,8 +339,8 @@ export function buildRegionCatalog(
  * like Bedrock discovery. Each model becomes a single `global`-prefix entry
  * addressable as `<provider>.<backend>.global.<nativeModelId>`.
  *
- * A provider whose credential is unset/placeholder is skipped WITHOUT a
- * network call (`skipped` status) — that is the "configured but inactive"
+ * A provider whose credential pool is empty/placeholder-only is skipped WITHOUT
+ * a network call (`skipped` status) — that is the "configured but inactive"
  * state of `"${VAR:-}"` defaults. A provider whose discovery fails gets an
  * `error` status; neither ever fails the caller (best-effort).
  */
@@ -306,10 +363,25 @@ export async function discoverExternalCatalog(
         await Promise.all(
           Object.entries(provider.regions).map(async ([regionCode, region]) => {
             const sourceId = `${providerKey}:${regionCode}`;
-            const cred = region.credential ?? provider.credential;
 
-            const credState = credentialState(cred);
-            if (credState === "empty" || credState === "placeholder") {
+            // Missing-info region (unset env ref) — skipped with its reason,
+            // never blocking sibling regions or the boot.
+            if (region.inactiveReason) {
+              logger.warn("region inactive, skipping discovery", {
+                provider: providerKey,
+                region: regionCode,
+                reason: region.inactiveReason,
+              });
+              statuses.push({
+                source: sourceId,
+                state: "skipped",
+                detail: region.inactiveReason,
+              });
+              return;
+            }
+
+            const pool = usablePool(region.credentials ?? provider.credentials);
+            if (pool.length === 0) {
               logger.warn("region credential unset, skipping discovery", {
                 provider: providerKey,
                 region: regionCode,
@@ -333,30 +405,27 @@ export async function discoverExternalCatalog(
 
             try {
               assertSafeExternalOrigin(region.modelsUrl);
-              const res = await fetch(region.modelsUrl, {
-                headers: { authorization: `Bearer ${cred}` },
-                signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-              });
+              const result = await fetchModelsWithPool(region.modelsUrl, pool, sourceId);
 
-              if (!res.ok) {
+              if (!result.ok) {
                 // Workspace hosts may 404 on /api/v1/models (Singapore does)
-                // Log but don\'t fail - other regions may work
+                // Log but don't fail - other regions may work
                 logger.warn("region discovery returned non-ok", {
                   provider: providerKey,
                   region: regionCode,
-                  status: res.status,
+                  status: result.status,
                 });
                 backoff?.recordFailure(sourceId);
                 statuses.push({
                   source: sourceId,
                   state: "error",
-                  detail: `discovery returned HTTP ${res.status}`,
+                  detail: discoveryErrorDetail(result),
                 });
                 return;
               }
 
-              const data = (await res.json()) as { data?: { id?: string }[] };
-              for (const m of data.data ?? []) {
+              const data = result.data;
+              for (const m of data) {
                 if (!m.id) continue;
                 const nativeModelId = m.id.startsWith("models/")
                   ? m.id.slice("models/".length)
@@ -395,9 +464,23 @@ export async function discoverExternalCatalog(
         return; // Exit early - multi-region handling complete
       }
 
-      // Single-endpoint provider (existing logic)
-      const credState = credentialState(provider.credential);
-      if (credState === "empty" || credState === "placeholder") {
+      // Single-endpoint provider (existing logic). Missing-info provider
+      // (unset env ref left baseUrl/modelsUrl/workspaceId empty) — skipped
+      // with its reason, zero network calls, boot unaffected.
+      if (provider.inactiveReason) {
+        logger.warn("external provider inactive, skipping discovery", {
+          provider: providerKey,
+          reason: provider.inactiveReason,
+        });
+        statuses.push({
+          source: providerKey,
+          state: "skipped",
+          detail: provider.inactiveReason,
+        });
+        return;
+      }
+      const pool = usablePool(provider.credentials);
+      if (pool.length === 0) {
         logger.warn("external provider credential unset, skipping discovery", {
           provider: providerKey,
         });
@@ -418,38 +501,34 @@ export async function discoverExternalCatalog(
         });
         return;
       }
-      // The modelsUrl is an OpenAI-style /models endpoint, which by convention
-      // authenticates with a bearer token — even for providers whose message
-      // path uses x-api-key (e.g. Alibaba's compatible-mode /models rejects
-      // x-api-key with 401 but accepts bearer; DeepSeek accepts both). Bearer is
-      // the safe universal choice for discovery, independent of message auth.
-      const headers: Record<string, string> = {
-        authorization: `Bearer ${provider.credential}`,
-      };
       try {
         // SEC-9: block a credentialed discovery fetch to an internal/metadata
         // host (the modelsUrl is operator-configured and may differ from the
         // message-path origin, so it is guarded independently).
         assertSafeExternalOrigin(provider.modelsUrl);
-        const res = await fetch(provider.modelsUrl, {
-          headers,
-          signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-        });
-        if (!res.ok) {
+        // The modelsUrl is an OpenAI-style /models endpoint, which by convention
+        // authenticates with a bearer token — even for providers whose message
+        // path uses x-api-key (e.g. Alibaba's compatible-mode /models rejects
+        // x-api-key with 401 but accepts bearer; DeepSeek accepts both). Bearer
+        // is the safe universal choice for discovery, independent of message
+        // auth. The pool is walked in order: an auth-rejected key advances to
+        // the next (VIRTUAL_MODELS.md) so a dead primary key can't blank the
+        // catalog; non-auth failures are key-independent and stop the walk.
+        const result = await fetchModelsWithPool(provider.modelsUrl, pool, providerKey);
+        if (!result.ok) {
           logger.error("provider discovery returned non-ok, skipping", {
             provider: providerKey,
-            status: res.status,
+            status: result.status,
           });
           backoff?.recordFailure(providerKey);
           statuses.push({
             source: providerKey,
             state: "error",
-            detail: `discovery returned HTTP ${res.status}`,
+            detail: discoveryErrorDetail(result),
           });
           return;
         }
-        const data = (await res.json()) as { data?: { id?: string }[] };
-        for (const m of data.data ?? []) {
+        for (const m of result.data) {
           if (!m.id) continue;
           // Some OpenAI-compatible /models endpoints namespace ids (e.g. Gemini
           // returns "models/gemini-3.6-flash" but chat/completions wants the

@@ -38,6 +38,9 @@ services:
       # Optional — only needed when the corresponding provider is configured.
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
       ZAI_API_KEY: "${ZAI_API_KEY:-}"
+      # z.ai credential-pool failover keys (VIRTUAL_MODELS.md) — optional.
+      ZAI_API_KEY_SECONDARY: "${ZAI_API_KEY_SECONDARY:-}"
+      ZAI_API_KEY_TERTIARY: "${ZAI_API_KEY_TERTIARY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       DASHSCOPE_API_KEY_INTL: "${DASHSCOPE_API_KEY_INTL:-}"
       DASHSCOPE_API_KEY_EU: "${DASHSCOPE_API_KEY_EU:-}"

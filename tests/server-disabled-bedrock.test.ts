@@ -95,7 +95,7 @@ function handler(withBedrockBlock = true) {
   const runtime = makeRuntime(withBedrockBlock);
   return createFetchHandler(
     () => runtime,
-    async () => {},
+    async () => undefined,
   );
 }
 

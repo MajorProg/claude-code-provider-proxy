@@ -4,6 +4,9 @@
   "server": { "host": "127.0.0.1", "port": 8787 },
 
   // Inbound auth: keys Claude Code presents via ANTHROPIC_AUTH_TOKEN (DESIGN §8.1)
+  // If PROXY_INBOUND_KEY is unset the server still boots: it mints an EPHEMERAL
+  // key, prints it once at boot (and shows a marker in /status.json) — the key
+  // changes on every restart until you set a persistent one.
   "inboundAuth": {
     "keys": ["${PROXY_INBOUND_KEY}"]
   },
@@ -62,7 +65,14 @@
     // "region" + "basePath" instead of "baseUrl".
     "zai": {
       "type": "anthropic",
-      "credential": "${ZAI_API_KEY:-}",
+      // Credential pool (docs/VIRTUAL_MODELS.md): request-time failover walks these
+      // in order (401/403/429 or connect failure, pre-stream). Empty "${VAR:-}"
+      // entries are filtered — an entirely-empty pool just skips the provider.
+      "credentials": [
+        { "credential": "${ZAI_API_KEY:-}", "label": "primary" },
+        { "credential": "${ZAI_API_KEY_SECONDARY:-}", "label": "secondary" },
+        { "credential": "${ZAI_API_KEY_TERTIARY:-}", "label": "tertiary" }
+      ],
       "auth": "bearer",
       "baseUrl": "https://api.z.ai/api/anthropic",
       "countTokens": true,
@@ -75,6 +85,21 @@
       "baseUrl": "https://api.deepseek.com/anthropic",
       "countTokens": true,
       "modelsUrl": "https://api.deepseek.com/v1/models"
+    },
+    // Alibaba / Qwen — Singapore workspace (ap-southeast-1), the account
+    // carrying the Token Plan. Inert until DASHSCOPE_API_KEY_INTL /
+    // DASHSCOPE_WORKSPACE_ID_INTL are set in .env. Switch regions by
+    // re-pointing these refs, never by editing credential values.
+    "alibaba": {
+      "type": "anthropic",
+      "credential": "${DASHSCOPE_API_KEY_INTL:-}",
+      "auth": "x-api-key",
+      "hostTemplate": "{workspaceId}.{region}.maas.aliyuncs.com",
+      "basePath": "/apps/anthropic",
+      "workspaceId": "${DASHSCOPE_WORKSPACE_ID_INTL:-}",
+      "region": "ap-southeast-1",
+      "countTokens": true,
+      "modelsUrl": "https://${DASHSCOPE_WORKSPACE_ID_INTL:-}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/models"
     }
     //
     // OpenAI-compatible router (EU data residency). type "openai" → the proxy
@@ -122,5 +147,34 @@
   // Built-in chat test page at /chat (enabled by default for a local pod). The
   // browser calls the server-side /api/chat endpoint — NO credential is ever
   // placed in the HTML. Localhost-only.
-  "chatPage": { "enabled": true }
+  "chatPage": { "enabled": true },
+
+  // Virtual model tiers (docs/VIRTUAL_MODELS.md): quality-tier aliases Claude Code
+  // pins its env vars to (see .env.example). Each tier resolves to the FIRST
+  // currently-available candidate; on 401/403/429 or connect failure before
+  // streaming starts, the proxy advances: next pool key → next candidate.
+  // Candidates on providers whose keys are unset are skipped, so this block is
+  // SAFE with an empty .env — tiers simply degrade to whatever is active.
+  // Reorder the arrays to change provider/model priority.
+  "virtualModels": {
+    "sonnet-like": [
+      "zai.anthropic.global.glm-5.3",
+      "alibaba.anthropic.ap-southeast-1.qwen3-coder-480b-a35b-instruct",
+      "bedrock.mantle.us.zai.glm-5"
+    ],
+    "haiku-like": [
+      "zai.anthropic.global.glm-5.3-flash",
+      "alibaba.anthropic.ap-southeast-1.qwen3-coder-flash",
+      "bedrock.mantle.us.zai.glm-4.7-flash"
+    ],
+    "opus-like": [
+      "alibaba.anthropic.ap-southeast-1.qwen3.8-max-0902",
+      "bedrock.mantle.us.moonshotai.kimi-k2.5",
+      "zai.anthropic.global.glm-5.3"
+    ]
+  },
+
+  // Total upstream attempts (candidates x pool keys) per request before the
+  // last error is relayed. Default 4.
+  "maxFailoverAttempts": 4
 }

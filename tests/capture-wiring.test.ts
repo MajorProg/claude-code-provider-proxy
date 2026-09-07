@@ -177,3 +177,41 @@ describe("captureTurn (non-streaming)", () => {
     expect(rec.turns).toHaveLength(0);
   });
 });
+
+describe("captureTurn servingKeyLabel (docs/VIRTUAL_MODELS.md cost attribution)", () => {
+  const bytes = () => new TextEncoder().encode(readFixtureText("anthropic-stream.sse"));
+
+  test("streaming turn carries the serving key LABEL (never a value)", async () => {
+    const { store, rec } = stubStore();
+    const labeled: CaptureContext = { ...ctx(), servingKeyLabel: "primary" };
+    const out = captureTurn(store, labeled, sseResponse(bytes()));
+    await out.text();
+    await flush();
+    expect(rec.turns[0]?.servingKeyLabel).toBe("primary");
+  });
+
+  test("non-streaming turn carries the label too", async () => {
+    const { store, rec } = stubStore();
+    const body = {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "OK" }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+    const resp = new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json" },
+    });
+    const out = captureTurn(store, { ...ctx(), servingKeyLabel: "secondary" }, resp);
+    await out.text();
+    await flush();
+    expect(rec.turns[0]?.servingKeyLabel).toBe("secondary");
+  });
+
+  test("the field is omitted when no label was provided (old-record shape)", async () => {
+    const { store, rec } = stubStore();
+    const out = captureTurn(store, ctx(), sseResponse(bytes()));
+    await out.text();
+    await flush();
+    expect("servingKeyLabel" in (rec.turns[0] ?? {})).toBe(false);
+  });
+});

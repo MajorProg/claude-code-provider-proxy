@@ -147,7 +147,9 @@ describe("discoverCatalog graceful degradation", () => {
     expect(m.requests).toEqual([]);
     expect(catalog.sources).toEqual([
       { source: "bedrock", state: "disabled" },
-      { source: "zai", state: "skipped", detail: expect.stringContaining("credential unset") },
+      // An empty credential pool now carries the inactiveReason (missing-info
+      // wording) instead of the generic "credential unset" skip detail.
+      { source: "zai", state: "skipped", detail: expect.stringContaining("credential") },
     ]);
     expect(catalog.models).toEqual([]);
   });
@@ -224,5 +226,183 @@ describe("discoverCatalog graceful degradation", () => {
     const zaiStatus = r2.statuses.find((s) => s.source === "zai");
     expect(zaiStatus?.state).toBe("skipped");
     expect(zaiStatus?.detail).toContain("cooling down");
+  });
+
+  test("a provider with inactiveReason (unset env ref) is skipped with its reason, no fetch", async () => {
+    // The fork-port scenario: ${DASHSCOPE_API_KEY_INTL}-style bare refs resolved
+    // empty -> validation marks the provider inactive; discovery never dials.
+    const config = makeConfig({
+      external: {
+        alibaba: {
+          type: "anthropic",
+          credential: "sk-live",
+          auth: "x-api-key",
+          hostTemplate: "{workspaceId}.{region}.maas.aliyuncs.com",
+          workspaceId: "",
+          region: "ap-southeast-1",
+          basePath: "/apps/anthropic",
+          countTokens: true,
+          modelsUrl: "https://.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/models",
+        },
+      },
+    });
+    expect(config.providers.external.alibaba?.inactiveReason).toBeDefined();
+    const m = useMock([{ status: 200, json: { data: [{ id: "qwen3-max" }] } }]);
+    const r = await discoverExternalCatalog(config);
+    expect(m.requests).toEqual([]);
+    const status = r.statuses.find((s) => s.source === "alibaba");
+    expect(status?.state).toBe("skipped");
+    expect(status?.detail).toContain("workspaceId is empty");
+    expect(r.models).toEqual([]);
+  });
+
+  test("multi-region: an inactive region is skipped while its sibling still discovers", async () => {
+    const config = makeConfig({
+      external: {
+        alibaba: {
+          type: "anthropic",
+          credential: "sk-shared",
+          auth: "x-api-key",
+          countTokens: true,
+          regions: {
+            "ap-southeast-1": {
+              hostTemplate: "dashscope-intl.aliyuncs.com",
+              basePath: "/apps/anthropic",
+              modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+              billingMode: "token-plan",
+            },
+            "eu-central-1": {
+              // EU workspace env unset -> empty workspaceId -> region inactive.
+              hostTemplate: "{workspaceId}.eu-central-1.maas.aliyuncs.com",
+              workspaceId: "",
+              credential: "sk-eu",
+              modelsUrl: "https://.eu-central-1.maas.aliyuncs.com/compatible-mode/v1/models",
+              billingMode: "payg",
+            },
+          },
+        },
+      },
+    });
+    // Only the healthy region's discovery URL is fetched.
+    const m = useMock([{ status: 200, json: { data: [{ id: "qwen3-max" }] } }]);
+    const r = await discoverExternalCatalog(config);
+    expect(m.requests.map((req) => req.url)).toEqual([
+      "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+    ]);
+    const sg = r.statuses.find((s) => s.source === "alibaba:ap-southeast-1");
+    const eu = r.statuses.find((s) => s.source === "alibaba:eu-central-1");
+    expect(sg?.state).toBe("ok");
+    expect(eu?.state).toBe("skipped");
+    expect(eu?.detail).toContain("workspaceId is empty");
+    // The Singapore model is discoverable under the region-code prefix.
+    expect(r.models.map((x) => `${x.provider}:${x.regionKey}:${x.nativeModelId}`)).toEqual([
+      "alibaba:ap-southeast-1:qwen3-max",
+    ]);
+  });
+});
+
+describe("discovery credential pools", () => {
+  function poolConfig(credentials: unknown): ProxyConfig {
+    return makeConfig({
+      external: {
+        zai: {
+          type: "anthropic",
+          credentials,
+          auth: "bearer",
+          baseUrl: "https://api.z.ai/api/anthropic",
+          countTokens: true,
+          modelsUrl: "https://api.z.ai/api/paas/v4/models",
+        },
+      },
+    });
+  }
+
+  test("primary key 401 -> discovery advances to the secondary key (ok, models found)", async () => {
+    const config = poolConfig([
+      { credential: "rejected-key", label: "primary" },
+      { credential: "working-key", label: "secondary" },
+    ]);
+    const m = useMock([
+      { status: 401, json: {} },
+      { status: 200, json: { data: [{ id: "glm-5" }] } },
+    ]);
+    const r = await discoverExternalCatalog(config);
+    expect(m.requests).toHaveLength(2);
+    // Each attempt presented its own key (bearer by /models convention).
+    expect(m.requests[0]?.headers.authorization).toBe("Bearer rejected-key");
+    expect(m.requests[1]?.headers.authorization).toBe("Bearer working-key");
+    expect(r.statuses.find((s) => s.source === "zai")?.state).toBe("ok");
+    expect(r.models.map((x) => x.nativeModelId)).toEqual(["glm-5"]);
+  });
+
+  test("403 also advances the pool; exhaustion yields an error status naming the count", async () => {
+    const config = poolConfig([
+      { credential: "k1", label: "a" },
+      { credential: "k2", label: "b" },
+    ]);
+    const m = useMock([
+      { status: 403, json: {} },
+      { status: 403, json: {} },
+    ]);
+    const r = await discoverExternalCatalog(config);
+    expect(m.requests).toHaveLength(2);
+    const status = r.statuses.find((s) => s.source === "zai");
+    expect(status?.state).toBe("error");
+    expect(status?.detail).toContain("HTTP 403");
+    expect(status?.detail).toContain("2 pool key(s)");
+  });
+
+  test("a non-auth non-ok status does NOT advance keys (key-independent failure)", async () => {
+    const config = poolConfig([
+      { credential: "k1", label: "a" },
+      { credential: "k2", label: "b" },
+    ]);
+    const m = useMock([{ status: 503, json: {} }]);
+    const r = await discoverExternalCatalog(config);
+    expect(m.requests).toHaveLength(1);
+    expect(r.statuses.find((s) => s.source === "zai")?.detail).toBe("discovery returned HTTP 503");
+  });
+
+  test("placeholder-only pool is skipped without a fetch", async () => {
+    const config = poolConfig([{ credential: "REPLACE_ME" }]);
+    const m = useMock([{ status: 200, json: { data: [{ id: "glm-5" }] } }]);
+    const r = await discoverExternalCatalog(config);
+    expect(m.requests).toEqual([]);
+    expect(r.statuses.find((s) => s.source === "zai")?.state).toBe("skipped");
+  });
+
+  test("region discovery walks the region-owned pool", async () => {
+    const config = makeConfig({
+      external: {
+        alibaba: {
+          type: "anthropic",
+          credential: "provider-key",
+          auth: "x-api-key",
+          countTokens: true,
+          regions: {
+            "ap-southeast-1": {
+              hostTemplate: "dashscope-intl.aliyuncs.com",
+              basePath: "/apps/anthropic",
+              modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+              credentials: [
+                { credential: "region-rejected", label: "token-plan" },
+                { credential: "region-working" },
+              ],
+            },
+          },
+        },
+      },
+    });
+    const m = useMock([
+      { status: 401, json: {} },
+      { status: 200, json: { data: [{ id: "qwen3-max" }] } },
+    ]);
+    const r = await discoverExternalCatalog(config);
+    expect(m.requests.map((req) => req.headers.authorization)).toEqual([
+      "Bearer region-rejected",
+      "Bearer region-working",
+    ]);
+    expect(r.statuses.find((s) => s.source === "alibaba:ap-southeast-1")?.state).toBe("ok");
+    expect(r.models.map((x) => x.nativeModelId)).toEqual(["qwen3-max"]);
   });
 });

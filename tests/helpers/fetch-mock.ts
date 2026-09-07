@@ -53,6 +53,11 @@ export interface MockResponseSpec {
   stream?: Uint8Array;
   /** Chunk count for a streaming body (default 1). */
   chunks?: number;
+  /**
+   * Make this call THROW (network-level failure) instead of responding —
+   * for connect-failure / failover tests. The thrown error's message.
+   */
+  error?: string;
 }
 
 /**
@@ -95,6 +100,7 @@ export function installFetchMock(spec: MockResponseSpec | MockResponseSpec[]): F
 
     const s = specs[Math.min(call, specs.length - 1)] ?? {};
     call++;
+    if (s.error !== undefined) throw new TypeError(s.error);
     const status = s.status ?? 200;
     const respHeaders = new Headers(s.headers ?? {});
 

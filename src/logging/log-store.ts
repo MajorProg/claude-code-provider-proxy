@@ -47,6 +47,12 @@ export interface TurnRecord {
   readonly responseContent: unknown;
   readonly stopReason: string | null;
   readonly usage: TurnUsage;
+  /**
+   * LABEL of the credential-pool entry that served the turn (cost attribution,
+   * VIRTUAL_MODELS.md). Optional: absent for bedrock targets and unlabeled
+   * single-key providers; old records simply lack the field (read-side safe).
+   */
+  readonly servingKeyLabel?: string;
   readonly requestedAt: string;
   readonly respondedAt: string;
 }

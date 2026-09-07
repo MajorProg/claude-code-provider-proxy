@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   claudeModels,
+  configDiagnostics,
   localPaths,
   parseArgs,
   pidAlive,
@@ -19,6 +20,7 @@ import {
   readPid,
   resolveBindIp,
 } from "../src/cli/index.ts";
+import { validateConfig } from "../src/config.ts";
 
 let dir: string;
 beforeEach(() => {
@@ -80,7 +82,7 @@ describe("portValue", () => {
 });
 
 describe("claudeModels", () => {
-  test("reads both model ids from .env (trimmed)", () => {
+  test("reads the family from .env with fallbacks; legacy SMALL_FAST flagged", () => {
     const env = join(dir, ".env");
     writeFileSync(
       env,
@@ -91,11 +93,18 @@ describe("claudeModels", () => {
       fastModel: "bedrock.mantle.us.qwen.q",
       sonnetModel: "bedrock.converse.global.anthropic.claude-x",
       haikuModel: "bedrock.mantle.us.qwen.q",
+      opusModel: "bedrock.converse.global.anthropic.claude-x",
+      defaultModel: "bedrock.converse.global.anthropic.claude-x",
+      subagentModel: "bedrock.mantle.us.qwen.q",
+      legacySmallFast: true,
       maxContextTokens: undefined,
+      customModelOption: undefined,
+      customModelOptionName: undefined,
+      customModelOptionDescription: undefined,
     });
   });
 
-  test("sonnetModel/haikuModel use ANTHROPIC_DEFAULT_SONNET_MODEL / _HAIKU_MODEL when set", () => {
+  test("explicit alias pins win; legacySmallFast clears when HAIKU is explicit", () => {
     const env = join(dir, ".env");
     writeFileSync(
       env,
@@ -104,6 +113,9 @@ describe("claudeModels", () => {
         "ANTHROPIC_SMALL_FAST_MODEL=bedrock.mantle.us.qwen.q",
         "ANTHROPIC_DEFAULT_SONNET_MODEL= bedrock.mantle.eu.anthropic.claude-sonnet-5 ",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL=bedrock.mantle.eu.anthropic.claude-haiku-4-5",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL=virtual.anthropic.global.opus-like",
+        "ANTHROPIC_DEFAULT_MODEL=virtual.anthropic.global.sonnet-like",
+        "CLAUDE_CODE_SUBAGENT_MODEL=virtual.anthropic.global.haiku-like",
         "",
       ].join("\n"),
     );
@@ -112,8 +124,34 @@ describe("claudeModels", () => {
       fastModel: "bedrock.mantle.us.qwen.q",
       sonnetModel: "bedrock.mantle.eu.anthropic.claude-sonnet-5",
       haikuModel: "bedrock.mantle.eu.anthropic.claude-haiku-4-5",
+      opusModel: "virtual.anthropic.global.opus-like",
+      defaultModel: "virtual.anthropic.global.sonnet-like",
+      subagentModel: "virtual.anthropic.global.haiku-like",
+      legacySmallFast: false,
       maxContextTokens: undefined,
+      customModelOption: undefined,
+      customModelOptionName: undefined,
+      customModelOptionDescription: undefined,
     });
+  });
+
+  test("reads the custom-model-option family when present", () => {
+    const env = join(dir, ".env");
+    writeFileSync(
+      env,
+      [
+        "ANTHROPIC_MODEL=virtual.anthropic.global.sonnet-like",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL=virtual.anthropic.global.haiku-like",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION=virtual.anthropic.global.opus-like",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=Opus-like tier",
+        "",
+      ].join("\n"),
+    );
+    const models = claudeModels(env);
+    expect(models.customModelOption).toBe("virtual.anthropic.global.opus-like");
+    expect(models.customModelOptionName).toBe("Opus-like tier");
+    expect(models.customModelOptionDescription).toBeUndefined();
+    expect(models.legacySmallFast).toBe(false);
   });
 
   test("reads CLAUDE_CODE_MAX_CONTEXT_TOKENS when set (trimmed)", () => {
@@ -215,5 +253,64 @@ describe("pidAlive", () => {
   test("an unused high pid is not alive", () => {
     // 2^30-ish pid that won't exist; process.kill(pid,0) -> ESRCH.
     expect(pidAlive(1_073_741_823)).toBe(false);
+  });
+});
+
+describe("configDiagnostics (doctor's config check)", () => {
+  const BASE = {
+    server: { host: "127.0.0.1", port: 8787 },
+    primaryRegion: "us",
+    profilePreference: "global",
+    refreshIntervalMinutes: 60,
+    claudeFallbackToMantle: false,
+    regions: [{ key: "us", awsRegion: "us-east-1" }],
+    providers: {},
+    logging: { enabled: false },
+    chatPage: { enabled: false },
+  };
+
+  test("flags an ephemeral inbound key and load warnings", () => {
+    const cfg = validateConfig({ ...BASE, inboundAuth: { keys: [] } });
+    const lines = configDiagnostics(Object.freeze({ ...cfg, loadWarnings: ["SOME_VAR"] }));
+    const text = lines.map((l) => `${l.level}: ${l.line}`).join("\n");
+    expect(text).toContain("EPHEMERAL");
+    expect(text).toContain("SOME_VAR");
+    expect(lines.every((l) => l.level === "warn")).toBe(true);
+  });
+
+  test("reports a persistent-key provider as ok and an inactive provider with its reason", () => {
+    const cfg = validateConfig({
+      ...BASE,
+      inboundAuth: { keys: ["k"] },
+      providers: {
+        zai: {
+          type: "anthropic",
+          credential: "zai-key",
+          auth: "bearer",
+          baseUrl: "https://api.z.ai/api/anthropic",
+          countTokens: true,
+          modelsUrl: "https://api.z.ai/api/paas/v4/models",
+        },
+        alibaba: {
+          type: "anthropic",
+          credential: "sk",
+          auth: "x-api-key",
+          countTokens: true,
+          regions: {
+            "eu-central-1": {
+              hostTemplate: "{workspaceId}.eu-central-1.maas.aliyuncs.com",
+              workspaceId: "",
+              modelsUrl: "https://.eu-central-1.maas.aliyuncs.com/compatible-mode/v1/models",
+            },
+          },
+        },
+      },
+    });
+    const lines = configDiagnostics(cfg);
+    const zai = lines.find((l) => l.line.includes("zai"));
+    const eu = lines.find((l) => l.line.includes("alibaba:eu-central-1"));
+    expect(zai?.level).toBe("ok");
+    expect(eu?.level).toBe("warn");
+    expect(eu?.line).toContain("workspaceId is empty");
   });
 });

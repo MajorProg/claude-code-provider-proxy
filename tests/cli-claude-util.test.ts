@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
 import { join } from "node:path";
-import { backupClaudeSettings, claudeSettingsPath } from "../src/cli/claude.ts";
+import { backupClaudeSettings, buildClaudeEnv, claudeSettingsPath } from "../src/cli/claude.ts";
 import { bold, currentPlatform, isWindows, ok, warn } from "../src/cli/util.ts";
 
 describe("claudeSettingsPath", () => {
@@ -105,5 +105,67 @@ describe("colored logging helpers", () => {
     }
     expect(written.join("")).toBe("done\ncareful\n");
     expect(written.some((w) => w.includes("\u001b"))).toBe(false);
+  });
+});
+
+describe("buildClaudeEnv (pure env-block seam)", () => {
+  const baseInput = {
+    baseUrl: "http://127.0.0.1:8787",
+    authToken: "tok",
+    mainModel: "virtual.anthropic.global.sonnet-like",
+    fastModel: "virtual.anthropic.global.haiku-like",
+    sonnetModel: "virtual.anthropic.global.sonnet-like",
+    haikuModel: "virtual.anthropic.global.haiku-like",
+    opusModel: "virtual.anthropic.global.opus-like",
+    defaultModel: "virtual.anthropic.global.sonnet-like",
+    subagentModel: "virtual.anthropic.global.haiku-like",
+    legacySmallFast: false,
+  };
+
+  test("writes the complete family and forces ANTHROPIC_API_KEY empty", () => {
+    const env = buildClaudeEnv(baseInput, {});
+    expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:8787");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("tok");
+    expect(env.ANTHROPIC_API_KEY).toBe("");
+    expect(env.ANTHROPIC_MODEL).toBe("virtual.anthropic.global.sonnet-like");
+    expect(env.ANTHROPIC_DEFAULT_MODEL).toBe("virtual.anthropic.global.sonnet-like");
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe("virtual.anthropic.global.sonnet-like");
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe("virtual.anthropic.global.haiku-like");
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe("virtual.anthropic.global.opus-like");
+    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe("virtual.anthropic.global.haiku-like");
+    expect("ANTHROPIC_SMALL_FAST_MODEL" in env).toBe(false);
+  });
+
+  test("preserves unrelated previous env keys (merge, not clobber)", () => {
+    const env = buildClaudeEnv(baseInput, { THEME: "dark", ANTHROPIC_MODEL: "old-id" });
+    expect(env.THEME).toBe("dark");
+    expect(env.ANTHROPIC_MODEL).toBe(baseInput.mainModel); // managed key IS overwritten
+  });
+
+  test("legacy SMALL_FAST is written only when flagged", () => {
+    const legacy = buildClaudeEnv({ ...baseInput, legacySmallFast: true }, {});
+    expect(legacy.ANTHROPIC_SMALL_FAST_MODEL).toBe(baseInput.fastModel);
+  });
+
+  test("optional vars are omitted when unset; included when set", () => {
+    const none = buildClaudeEnv(baseInput, {});
+    expect("CLAUDE_CODE_MAX_CONTEXT_TOKENS" in none).toBe(false);
+    expect("ANTHROPIC_CUSTOM_MODEL_OPTION" in none).toBe(false);
+    const full = buildClaudeEnv(
+      {
+        ...baseInput,
+        maxContextTokens: "1000000",
+        customModelOption: "virtual.anthropic.global.opus-like",
+        customModelOptionName: "Opus-like",
+        aliasMeta: { opus: { name: "Opus tier", capabilities: "thinking,effort" } },
+      },
+      {},
+    );
+    expect(full.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe("1000000");
+    expect(full.ANTHROPIC_CUSTOM_MODEL_OPTION).toBe("virtual.anthropic.global.opus-like");
+    expect(full.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME).toBe("Opus-like");
+    expect(full.ANTHROPIC_DEFAULT_OPUS_MODEL_NAME).toBe("Opus tier");
+    expect(full.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES).toBe("thinking,effort");
+    expect("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME" in full).toBe(false);
   });
 });

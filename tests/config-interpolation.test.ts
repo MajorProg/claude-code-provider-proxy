@@ -2,7 +2,8 @@
  * ${ENV} interpolation tests (hermetic; real temp files through loadConfig).
  *
  * Covers both reference forms:
- *   - bare ${VAR}        — strict: unset OR empty fails the load
+ *   - bare ${VAR}        — lenient: unset OR empty resolves "" + a load warning
+ *                          (missing info degrades, never fails the boot)
  *   - ${VAR:-default}    — bash-like default; empty default allowed (the
  *                          "provider configured but inactive" form)
  * Only real loadConfig runs are exercised — the interpolation is not tested
@@ -13,7 +14,6 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../src/config.ts";
-import { ConfigError } from "../src/errors.ts";
 
 let dir: string;
 let path: string;
@@ -51,21 +51,26 @@ function writeConfig(credential: string): void {
   );
 }
 
-describe("bare ${VAR} (strict)", () => {
+describe("bare ${VAR} (lenient: missing info degrades)", () => {
   test("substitutes a set env var", async () => {
     writeConfig("${TEST_BEDROCK_KEY}");
     const cfg = await loadConfig(path, { TEST_BEDROCK_KEY: "bedrock-api-key-abc" });
     expect(cfg.providers.bedrock?.credential).toBe("bedrock-api-key-abc");
+    expect(cfg.loadWarnings).toBeUndefined();
   });
 
-  test("fails fast when the env var is unset", async () => {
+  test("unset env var resolves empty and records a load warning", async () => {
     writeConfig("${TEST_BEDROCK_KEY}");
-    await expect(loadConfig(path, {})).rejects.toThrow(ConfigError);
+    const cfg = await loadConfig(path, {});
+    expect(cfg.providers.bedrock?.credential).toBe("");
+    expect(cfg.loadWarnings).toEqual(["TEST_BEDROCK_KEY"]);
   });
 
-  test("fails fast when the env var is set but EMPTY", async () => {
+  test("env var set but EMPTY also resolves empty with a load warning", async () => {
     writeConfig("${TEST_BEDROCK_KEY}");
-    await expect(loadConfig(path, { TEST_BEDROCK_KEY: "" })).rejects.toThrow(ConfigError);
+    const cfg = await loadConfig(path, { TEST_BEDROCK_KEY: "" });
+    expect(cfg.providers.bedrock?.credential).toBe("");
+    expect(cfg.loadWarnings).toEqual(["TEST_BEDROCK_KEY"]);
   });
 
   test("escapes quote and backslash in env values into valid JSON", async () => {

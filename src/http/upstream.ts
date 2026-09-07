@@ -226,9 +226,28 @@ export async function postJson(
       options.signal?.removeEventListener("abort", onAbort);
     }
   }
-  throw new Error(`Upstream request failed for ${url} after ${maxRetries + 1} attempts`, {
-    cause: lastError,
-  });
+  throw new UpstreamRequestError(url, maxRetries + 1, { cause: lastError });
+}
+
+/**
+ * postJson exhaustion: every attempt failed at the network/connect level
+ * (DNS, TLS, refused, timeout-to-headers) — no HTTP status was ever received.
+ * Deliberately NOT a ProxyError subclass: when this is the error a client
+ * finally sees, it renders exactly as the historical plain-Error 500 (with
+ * server-side stack + correlation id). The failover engine matches on this
+ * type to advance to the next key/model/provider (VIRTUAL_MODELS.md).
+ */
+export class UpstreamRequestError extends Error {
+  readonly url: string;
+  readonly attempts: number;
+  constructor(url: string, attempts: number, options: { cause?: unknown } = {}) {
+    super(`Upstream request failed for ${url} after ${attempts} attempts`, {
+      cause: options.cause,
+    });
+    this.name = "UpstreamRequestError";
+    this.url = url;
+    this.attempts = attempts;
+  }
 }
 
 /**
