@@ -10,6 +10,7 @@ config.local.json
 config.local.jsonc
 .env
 .env.*
+.env*
 !.env.example
 
 # Logs / temp

@@ -268,10 +268,12 @@ when wiring or debugging a provider.
 - **Virtual model tiers** (`docs/VIRTUAL_MODELS.md`, reserved provider `virtual`):
   `virtual.anthropic.global.<tier>` expands to the first available candidate
   from the config `virtualModels` map; pre-stream failover advances next pool
-  key → next candidate on upstream 401/403/429 or connect exhaustion (never
-  5xx), capped by `maxFailoverAttempts` (default 4), always primary first. The
-  serving key's LABEL is logged + stored in `TurnRecord.servingKeyLabel` —
-  never the key value.
+  key → next candidate on upstream 401/403/429, connect exhaustion, or a 400
+  whose body matches known "context too long" wording (never generic 5xx),
+  capped by `maxFailoverAttempts` (default 4), always primary first — except
+  keys in the cross-request 429 cooldown (`CredentialCooldownStore`, 5-min TTL,
+  survives hot-reloads). The serving key's LABEL is logged + stored in
+  `TurnRecord.servingKeyLabel` — never the key value.
 - **Discovery always uses bearer.** External-provider `/models` discovery sends
   `Authorization: Bearer` regardless of the provider's message-path `auth` —
   some providers reject `x-api-key` on `/models` (`401`), but the OpenAI

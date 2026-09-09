@@ -281,13 +281,20 @@ export function routeCandidates(
   config: ProxyConfig,
   catalog: Catalog,
   entries: readonly string[],
-): { targets: RouteTarget[]; reasons: readonly (string | undefined)[] } {
+): {
+  targets: RouteTarget[];
+  /** Entry-aligned ids of the routed candidates (same order/length as targets). */
+  sources: readonly string[];
+  reasons: readonly (string | undefined)[];
+} {
   const targets: RouteTarget[] = [];
+  const sources: string[] = [];
   const reasons: (string | undefined)[] = [];
   for (const entry of entries) {
     try {
       const parsed = parseCanonicalId(entry);
       targets.push(route(config, catalog, parsed));
+      sources.push(entry);
       reasons.push(undefined);
     } catch (err) {
       // Unavailable candidate: record why, keep walking. Availability here is
@@ -295,7 +302,7 @@ export function routeCandidates(
       reasons.push(err instanceof Error ? err.message : String(err));
     }
   }
-  return { targets, reasons };
+  return { targets, sources, reasons };
 }
 
 /**

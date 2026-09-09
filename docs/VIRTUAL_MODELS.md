@@ -106,18 +106,26 @@ ids alongside real ones; the registry page shows each tier's current resolution.
 2. For each candidate, its provider's key pool in config order.
 3. Serve the first (candidate × key) combination that succeeds; see failover.
 
-**Always primary first (decided).** No stickiness between requests: every
-request re-walks the list from the top. Consequence accepted: while a
-higher-priority key is rate-limited, each request pays one failed round-trip
-before falling over. Future knob (not v1): `keyCooldownSeconds` to skip a key
-that failed within N seconds — restores primary-first semantics without the
-per-request penalty.
+**Always primary first, with a 429 cooldown (implemented).** Every request
+re-walks the list from the top — EXCEPT keys currently in cooldown: a 429
+marks the (provider, key-label) pair degraded for 5 minutes
+(`CredentialCooldownStore` in src/failover.ts, unref'd TTL timers, shared
+across hot-reloads), and `buildAttempts` skips degraded entries. A key whose
+whole provider-pool is cooled is skipped as a candidate; a direct-model
+request against a fully-cooled provider gets an actionable 404 ("all keys in
+429 cooldown; retry shortly"). The cooldown TTL is the reinstate mechanism —
+a recovered key returns to primary automatically. 401/403 never start a
+cooldown (those are mis-configured keys, not quota).
 
 ## Request-time failover (decided)
 
 - **Triggers:** upstream `401 / 403 / 429` or connection-level failure
   (ECONNREFUSED, DNS, TLS, timeout on *connect*). NOT 5xx (avoids re-sending —
-  and double-charging — long generations).
+  and double-charging — long generations). One narrow 400 exception: a body
+  matching known "context/input too long" wording (`isContextTooLong` —
+  provider phrasings like "range of input length should be [1, N]",
+  "context_length_exceeded", "prompt is too long") IS failover-eligible: the
+  next tier candidate may have a larger context window and succeed.
 - **Only before first byte reaches the client.** Once SSE streaming has begun,
   errors relay to the client as today; no mid-stream model or key switching.
   The existing `assertUpstreamOk` throw (paths/relay.ts) is the natural hook:
@@ -137,6 +145,13 @@ therefore doesn't blank the catalog.)
 
 ## Observability
 
+- Every `request completed` log line carries the serving truth: the canonical
+  id the client asked for (`requested=`, the virtual tier when applicable),
+  the REAL canonical id that answered (`served=`), the serving pool key
+  (`key=zai/secondary`), and the failover depth (`attempts=2`). The
+  `requestId` correlates these with the per-attempt `failover attempt failed`
+  / `upstream selected` lines. (AsyncLocalStorage context in
+  src/logging/request-context.ts; key LABELS only, never values.)
 - The **serving key's label** (never its value) is attached to the request log
   and the LogStore TurnRecord — cost attribution per key ("how much of today
   ran on the sponsor key").

@@ -11,6 +11,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import { type ProxyConfig, validateConfig } from "../src/config.ts";
+import { UpstreamError } from "../src/errors.ts";
+import { CredentialCooldownStore, isContextTooLong } from "../src/failover.ts";
 import { Catalog } from "../src/model/catalog.ts";
 import { type Runtime, createFetchHandler } from "../src/server.ts";
 import { type FetchMock, installFetchMock } from "./helpers/fetch-mock.ts";
@@ -278,5 +280,404 @@ describe("pre-stream failover via createFetchHandler", () => {
       }),
     );
     expect(res.status).toBe(400);
+  });
+});
+
+// ── isContextTooLong predicate ───────────────────────────────────────────────
+
+describe("isContextTooLong", () => {
+  function err400(body: string): UpstreamError {
+    return new UpstreamError(400, "Upstream 400", { upstreamBody: body });
+  }
+
+  test("Alibaba/Qwen 'Range of input length' body matches", () => {
+    const body =
+      'event:error\ndata:{"request_id":"x","code":"InvalidParameter","message":"data: {\\"error\\":{\\"code\\":\\"invalid_parameter_error\\",\\"message\\":\\"Range of input length should be [1, 204800]\\"}}"}\n\n';
+    expect(isContextTooLong(err400(body))).toBe(true);
+  });
+
+  test("OpenAI-compat context_length_exceeded code matches", () => {
+    const body = JSON.stringify({
+      error: { code: "context_length_exceeded", message: "too long" },
+    });
+    expect(isContextTooLong(err400(body))).toBe(true);
+  });
+
+  test("'prompt is too long' message matches", () => {
+    expect(isContextTooLong(err400("prompt is too long for this model"))).toBe(true);
+  });
+
+  test("'too many tokens' message matches", () => {
+    expect(isContextTooLong(err400("too many tokens in input"))).toBe(true);
+  });
+
+  test("'maximum context length' message matches", () => {
+    expect(isContextTooLong(err400("This model's maximum context length is 128000 tokens."))).toBe(
+      true,
+    );
+  });
+
+  test("unrelated 400 body does not match", () => {
+    expect(
+      isContextTooLong(
+        err400(
+          '{"error":{"type":"invalid_request_error","message":"Extra inputs are not permitted"}}',
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  test("non-400 status returns false even with matching body", () => {
+    const e = new UpstreamError(429, "Upstream 429", { upstreamBody: "context_length_exceeded" });
+    expect(isContextTooLong(e)).toBe(false);
+  });
+});
+
+// ── context-too-long failover (end-to-end via createFetchHandler) ────────────
+
+describe("context-too-long failover", () => {
+  const CONTEXT_TOO_LONG_BODY =
+    'event:error\ndata:{"code":"InvalidParameter","message":"Range of input length should be [1, 204800]"}\n\n';
+
+  test("400 context-too-long advances to the next candidate model", async () => {
+    const mock = installFetchMock([
+      { status: 400, text: CONTEXT_TOO_LONG_BODY },
+      { status: 400, text: CONTEXT_TOO_LONG_BODY }, // exhausts both zai keys
+      { status: 200, json: ANTHROPIC_OK },
+    ]);
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      // zai primary, zai secondary (both 400), then alibaba succeeds
+      expect(mock.requests.map((r) => r.url)).toEqual([
+        "https://api.z.ai/api/anthropic/v1/messages",
+        "https://api.z.ai/api/anthropic/v1/messages",
+        "https://dashscope-intl.aliyuncs.com/apps/anthropic/v1/messages",
+      ]);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("400 context-too-long on streaming request also advances", async () => {
+    const mock = installFetchMock([
+      { status: 400, text: CONTEXT_TOO_LONG_BODY },
+      { status: 200, json: ANTHROPIC_OK },
+    ]);
+    try {
+      const res = await handler()(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(mock.requests).toHaveLength(2);
+      expect(mock.requests[0]?.url).toBe("https://api.z.ai/api/anthropic/v1/messages");
+      expect(mock.requests[1]?.url).toBe("https://api.z.ai/api/anthropic/v1/messages");
+      expect(mock.requests[1]?.headers.authorization).toBe("Bearer secondary-key");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("plain (non-context) 400 does NOT advance — relayed immediately", async () => {
+    const mock = installFetchMock([
+      {
+        status: 400,
+        json: {
+          type: "error",
+          error: { type: "invalid_request_error", message: "Extra inputs are not permitted" },
+        },
+      },
+    ]);
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(400);
+      expect(mock.requests).toHaveLength(1); // no failover
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("context-too-long exhaustion relays the last 400", async () => {
+    const mock = installFetchMock([{ status: 400, text: CONTEXT_TOO_LONG_BODY }]);
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(400);
+      expect(mock.requests).toHaveLength(3); // zai(2 keys) + alibaba(1 key)
+    } finally {
+      mock.restore();
+    }
+  });
+});
+
+describe("cross-request 429 cooldown (CredentialCooldownStore)", () => {
+  function poolHandlerWithStore(store: CredentialCooldownStore) {
+    const runtime = {
+      ...makeRuntime(makeConfig()),
+      cooldownStore: store,
+    } as unknown as Runtime;
+    return createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+  }
+
+  test("a 429 marks the key; the NEXT request goes straight to the secondary", async () => {
+    const store = new CredentialCooldownStore();
+    // Request 1 (STREAMING so postJson does not absorb the 429 internally):
+    // primary 429s -> marked -> secondary serves.
+    let mock = installFetchMock([
+      { status: 429, json: {} },
+      { status: 200, json: ANTHROPIC_OK },
+    ]);
+    try {
+      const res = await poolHandlerWithStore(store)(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(mock.requests).toHaveLength(2);
+      expect(mock.requests[1]?.headers.authorization).toBe("Bearer secondary-key");
+    } finally {
+      mock.restore();
+    }
+    expect(store.isDegraded("zai", "primary")).toBe(true);
+
+    // Request 2: primary is skipped ENTIRELY — one fetch, secondary key.
+    mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await poolHandlerWithStore(store)(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(mock.requests).toHaveLength(1);
+      expect(mock.requests[0]?.headers.authorization).toBe("Bearer secondary-key");
+    } finally {
+      mock.restore();
+    }
+    store.clear();
+  });
+
+  test("clear() reinstates cooled keys (models the TTL expiry)", async () => {
+    const store = new CredentialCooldownStore();
+    store.mark("zai", "primary");
+    expect(store.isDegraded("zai", "primary")).toBe(true);
+    store.clear();
+    expect(store.isDegraded("zai", "primary")).toBe(false);
+
+    const mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await poolHandlerWithStore(store)(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      // Primary is back at attempt 1.
+      expect(mock.requests[0]?.headers.authorization).toBe("Bearer primary-key");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("a 401 does NOT start a cooldown (only 429 does)", async () => {
+    const store = new CredentialCooldownStore();
+    const mock = installFetchMock([
+      { status: 401, json: {} },
+      { status: 200, json: ANTHROPIC_OK },
+    ]);
+    try {
+      const res = await poolHandlerWithStore(store)(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      expect(store.isDegraded("zai", "primary")).toBe(false);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("all keys of candidate 1 in cooldown -> its whole provider is skipped", async () => {
+    const store = new CredentialCooldownStore();
+    store.mark("zai", "primary");
+    store.mark("zai", "secondary");
+    // zai fully cooled; the tier's next candidate (alibaba) serves on attempt 1.
+    const mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await poolHandlerWithStore(store)(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      expect(mock.requests).toHaveLength(1);
+      expect(mock.requests[0]?.url).toContain("dashscope-intl.aliyuncs.com");
+      expect(mock.requests[0]?.headers["x-api-key"]).toBe("alibaba-key");
+    } finally {
+      mock.restore();
+    }
+    store.clear();
+  });
+
+  test("a DIRECT model id whose provider is fully cooled gets a clean 404, not a 500", async () => {
+    const store = new CredentialCooldownStore();
+    store.mark("zai", "primary");
+    store.mark("zai", "secondary");
+    const mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await poolHandlerWithStore(store)(
+        postMessages({
+          model: "zai.anthropic.global.glm-5.3",
+          max_tokens: 16,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(404);
+      expect(mock.requests).toHaveLength(0);
+      const body = (await res.json()) as { error?: { message?: string } };
+      expect(body.error?.message).toContain("cooldown");
+    } finally {
+      mock.restore();
+    }
+    store.clear();
+  });
+
+  test("without a store, behavior is unchanged (every request retries primary first)", async () => {
+    const runtime = makeRuntime(makeConfig()) as unknown as Runtime;
+    const handle = createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+    for (const _ of [1, 2]) {
+      const mock = installFetchMock([
+        { status: 429, json: {} },
+        { status: 200, json: ANTHROPIC_OK },
+      ]);
+      try {
+        const res = await handle(
+          postMessages({
+            model: TIER,
+            max_tokens: 16,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        );
+        expect(res.status).toBe(200);
+        expect(mock.requests).toHaveLength(2); // primary retried both times
+        expect(mock.requests[0]?.headers.authorization).toBe("Bearer primary-key");
+      } finally {
+        mock.restore();
+      }
+    }
+  });
+});
+
+describe("request-completed log enrichment (serving info)", () => {
+  /** Capture console lines emitted during fn(); restores the original. */
+  async function captureLogs(fn: () => Promise<unknown>): Promise<string[]> {
+    const lines: string[] = [];
+    const orig = console.log;
+    const origWarn = console.warn;
+    const origErr = console.error;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    console.warn = console.log as unknown as typeof console.warn;
+    console.error = console.log as unknown as typeof console.error;
+    try {
+      await fn();
+    } finally {
+      console.log = orig;
+      console.warn = origWarn;
+      console.error = origErr;
+    }
+    return lines;
+  }
+
+  test("completed line shows requested (virtual), served (real canonical), and key", async () => {
+    const mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const lines = await captureLogs(async () => {
+        const res = await handler()(
+          postMessages({
+            model: TIER,
+            max_tokens: 16,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        );
+        expect(res.status).toBe(200);
+      });
+      const completed = lines.find((l) => l.includes("request completed"));
+      expect(completed).toBeDefined();
+      expect(completed).toContain("requested=virtual.anthropic.global.sonnet-like");
+      expect(completed).toContain("served=zai.anthropic.global.glm-5.3");
+      expect(completed).toContain("key=zai/primary");
+      // No failover: no attempts field.
+      expect(completed?.includes("attempts=")).toBe(false);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("after failover the completed line names the serving key and attempt count", async () => {
+    const store = new CredentialCooldownStore();
+    const runtime = { ...makeRuntime(makeConfig()), cooldownStore: store } as unknown as Runtime;
+    const handle = createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+    const mock = installFetchMock([
+      { status: 429, json: {} },
+      { status: 200, json: ANTHROPIC_OK },
+    ]);
+    try {
+      const lines = await captureLogs(async () => {
+        const res = await handle(
+          postMessages({
+            model: TIER,
+            max_tokens: 16,
+            ...STREAMING,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        );
+        expect(res.status).toBe(200);
+      });
+      const completed = lines.find((l) => l.includes("request completed"));
+      expect(completed).toContain("served=zai.anthropic.global.glm-5.3");
+      expect(completed).toContain("key=zai/secondary");
+      expect(completed).toContain("attempts=2");
+      // The advancing warn line carries the requestId for correlation.
+      const advancing = lines.find((l) => l.includes("failover attempt failed"));
+      expect(advancing).toContain("requestId=");
+      expect(advancing).toContain("key=zai/primary");
+    } finally {
+      mock.restore();
+      store.clear();
+    }
+  });
+
+  test("a non-inference request (health probe) has no serving fields", async () => {
+    const lines = await captureLogs(async () => {
+      const res = await handler()(new Request("http://localhost/api/hello", { method: "HEAD" }));
+      expect(res.status).toBe(204);
+    });
+    const completed = lines.find((l) => l.includes("request completed"));
+    expect(completed).toBeDefined();
+    expect(completed?.includes("served=")).toBe(false);
+    expect(completed?.includes("key=")).toBe(false);
   });
 });

@@ -38,7 +38,7 @@ import {
   UnauthorizedError,
   UpstreamError,
 } from "./errors.ts";
-import { executeWithFailover, isClientDisconnect } from "./failover.ts";
+import { CredentialCooldownStore, executeWithFailover, isClientDisconnect } from "./failover.ts";
 import { renderChatPageHtml } from "./http/chat-page.ts";
 import { renderConfigPageHtml } from "./http/config-page.ts";
 import { renderLogViewerHtml } from "./http/log-viewer-page.ts";
@@ -48,6 +48,12 @@ import { ZipLimitError, buildZip } from "./http/zip.ts";
 import { type CaptureContext, captureTurn, summarizeTools } from "./logging/capture.ts";
 import { LogStore } from "./logging/log-store.ts";
 import { errorMessage, logger, newRequestId } from "./logging/logger.ts";
+import {
+  type RequestServingInfo,
+  requestContext,
+  servingKeyToken,
+  updateRequestContext,
+} from "./logging/request-context.ts";
 import { formatCanonicalId, parseCanonicalId } from "./model/canonical-id.ts";
 import {
   type Catalog,
@@ -321,6 +327,7 @@ async function runInference(
   parsed: JsonObject,
   inboundHeaders: { get(name: string): string | null },
   signal?: AbortSignal,
+  cooldownStore?: CredentialCooldownStore,
 ): Promise<{
   response: Response;
   canonicalId: ReturnType<typeof parseCanonicalId>;
@@ -328,12 +335,16 @@ async function runInference(
   keyLabel?: string;
 }> {
   const canonicalId = parseCanonicalId(modelFromBody(parsed));
+  // Record what the client ASKED for (may be a virtual tier id); the engine
+  // records what actually SERVED — both land on the request-completed line.
+  updateRequestContext({ requestedModel: formatCanonicalId(canonicalId) });
   const outcome = await executeWithFailover({
     config,
     catalog,
     tokenProvider,
     canonicalId,
     ...(signal ? { signal } : {}),
+    ...(cooldownStore ? { cooldownStore } : {}),
     exec: async ({ target, entry }) => {
       logger.debug("routing decision", {
         provider: target.provider,
@@ -377,6 +388,7 @@ async function dispatchMessages(
   tokenProvider: RegionTokenProvider | null,
   store: LogStore,
   req: Request,
+  cooldownStore?: CredentialCooldownStore,
 ): Promise<Response> {
   authenticateInbound(req.headers, config.inboundAuth.keys);
   const requestedAt = new Date().toISOString();
@@ -391,6 +403,7 @@ async function dispatchMessages(
     parsed,
     req.headers,
     req.signal,
+    cooldownStore,
   );
 
   // Best-effort capture (no-op when logging disabled). Never blocks/alters
@@ -430,6 +443,7 @@ async function dispatchChat(
   tokenProvider: RegionTokenProvider | null,
   store: LogStore,
   req: Request,
+  cooldownStore?: CredentialCooldownStore,
 ): Promise<Response> {
   if (!config.chatPage.enabled) {
     return Response.json({ error: "chat page disabled" }, { status: 404 });
@@ -461,6 +475,7 @@ async function dispatchChat(
     body,
     noHeaders,
     req.signal,
+    cooldownStore,
   );
 
   return maybeCaptureTurn(
@@ -599,11 +614,15 @@ async function dispatchCountTokens(
   catalog: Catalog,
   tokenProvider: RegionTokenProvider | null,
   req: Request,
+  cooldownStore?: CredentialCooldownStore,
 ): Promise<Response> {
   authenticateInbound(req.headers, config.inboundAuth.keys);
   const parsed = parseJsonObject(await readBodyWithLimit(req));
   assertInboundLimits(parsed, config.limits);
   const canonicalId = parseCanonicalId(modelFromBody(parsed));
+  // Record what the client ASKED for (may be a virtual tier id); the engine
+  // records what actually SERVED — both land on the request-completed line.
+  updateRequestContext({ requestedModel: formatCanonicalId(canonicalId) });
 
   // Same failover plan as messages, filtered to candidates that actually have
   // a native count endpoint (passthrough + countTokensPath). The engine keeps
@@ -614,6 +633,7 @@ async function dispatchCountTokens(
     tokenProvider,
     canonicalId,
     countTokensOnly: true,
+    ...(cooldownStore ? { cooldownStore } : {}),
     exec: async ({ target, entry }) => {
       if (target.translationPath !== "passthrough" || !target.countTokensPath) {
         // Filtered above; kept for the type checker + defense in depth.
@@ -639,6 +659,8 @@ export interface Runtime {
   tokenProvider: RegionTokenProvider | null;
   catalogManager: CatalogManager;
   logStore: LogStore;
+  /** Cross-request 429 cooldown store — persists across hot-reloads (shared reference). */
+  cooldownStore: CredentialCooldownStore;
 }
 
 /**
@@ -648,7 +670,10 @@ export interface Runtime {
  * discovery failure degrades the catalog instead of throwing, so this only
  * fails for genuinely fatal problems (unwritable log dir, invalid config).
  */
-export async function buildRuntime(config: ProxyConfig): Promise<Runtime> {
+export async function buildRuntime(
+  config: ProxyConfig,
+  existingCooldownStore?: CredentialCooldownStore,
+): Promise<Runtime> {
   const mode = resolveBedrockMode(config.providers.bedrock?.credential);
   if (!mode.enabled) {
     logger.error("Bedrock provider disabled — running on external providers only", {
@@ -667,11 +692,16 @@ export async function buildRuntime(config: ProxyConfig): Promise<Runtime> {
   }
   const logStore = new LogStore(config.logging);
   await logStore.verifyWritable();
+  // Reuse an existing cooldown store across hot-reloads so in-flight cooldowns
+  // are preserved when config changes (e.g. a UI save). On first boot, create
+  // a new one.
+  const cooldownStore = existingCooldownStore ?? new CredentialCooldownStore();
   return {
     config,
     tokenProvider: mode.enabled ? mode.tokenProvider : null,
     catalogManager,
     logStore,
+    cooldownStore,
   };
 }
 
@@ -700,6 +730,8 @@ interface RouteContext {
   tokenProvider: RegionTokenProvider | null;
   catalogManager: CatalogManager;
   logStore: LogStore;
+  /** Cross-request 429 cooldown store (shared runtime reference). */
+  cooldownStore: CredentialCooldownStore;
   reloadRuntime: (rawConfig: unknown) => Promise<ReloadOutcome | undefined>;
   /** Path segments captured after a route's prefix (already decodeURIComponent'd). */
   params: string[];
@@ -839,12 +871,32 @@ async function handleLogsSessionDetail({ params, logStore }: RouteContext): Prom
   return Response.json({ error: "not found" }, { status: 404 });
 }
 
-function handleMessages({ config, catalogManager, tokenProvider, logStore, req }: RouteContext) {
-  return dispatchMessages(config, catalogManager.current(), tokenProvider, logStore, req);
+function handleMessages({
+  config,
+  catalogManager,
+  tokenProvider,
+  logStore,
+  cooldownStore,
+  req,
+}: RouteContext) {
+  return dispatchMessages(
+    config,
+    catalogManager.current(),
+    tokenProvider,
+    logStore,
+    req,
+    cooldownStore,
+  );
 }
 
-function handleCountTokens({ config, catalogManager, tokenProvider, req }: RouteContext) {
-  return dispatchCountTokens(config, catalogManager.current(), tokenProvider, req);
+function handleCountTokens({
+  config,
+  catalogManager,
+  tokenProvider,
+  cooldownStore,
+  req,
+}: RouteContext) {
+  return dispatchCountTokens(config, catalogManager.current(), tokenProvider, req, cooldownStore);
 }
 
 function handleChatDispatch({
@@ -852,9 +904,17 @@ function handleChatDispatch({
   catalogManager,
   tokenProvider,
   logStore,
+  cooldownStore,
   req,
 }: RouteContext) {
-  return dispatchChat(config, catalogManager.current(), tokenProvider, logStore, req);
+  return dispatchChat(
+    config,
+    catalogManager.current(),
+    tokenProvider,
+    logStore,
+    req,
+    cooldownStore,
+  );
 }
 
 function handleConfigGet({ config }: RouteContext): Response {
@@ -1195,6 +1255,10 @@ export function createFetchHandler(
       }
 
       let res: Response;
+      // Per-request serving context (see logging/request-context.ts): opened
+      // around handler execution; the engine records the REAL model + serving
+      // key into it and the completion log below reads them back.
+      let serving: RequestServingInfo | undefined;
       if (!matched) {
         res = notFound();
       } else {
@@ -1212,10 +1276,13 @@ export function createFetchHandler(
           tokenProvider: runtime.tokenProvider,
           catalogManager: runtime.catalogManager,
           logStore: runtime.logStore,
+          cooldownStore: runtime.cooldownStore,
           reloadRuntime,
           params: matched.params,
         };
-        res = await matched.route.handler(ctx);
+        const handle = matched.route.handler;
+        serving = { requestId };
+        res = await requestContext.run(serving, () => handle(ctx));
       }
 
       const isApi = pathname.startsWith("/v1/") || pathname.startsWith("/api/");
@@ -1226,6 +1293,16 @@ export function createFetchHandler(
         route: matched?.route.name,
         status: res.status,
         latencyMs: Date.now() - startedAt,
+        // Serving enrichment (inference routes only; absent elsewhere):
+        // the REAL canonical model that answered + which pool key served it.
+        ...(serving?.requestedModel !== undefined ? { requested: serving.requestedModel } : {}),
+        ...(serving?.servedModel !== undefined ? { served: serving.servedModel } : {}),
+        ...(serving?.provider !== undefined && serving.keyLabel !== undefined
+          ? { key: servingKeyToken(serving.provider, serving.keyLabel) }
+          : {}),
+        ...(serving?.attempts !== undefined && serving.attempts > 1
+          ? { attempts: serving.attempts }
+          : {}),
       });
       return res;
     } catch (err) {
@@ -1288,7 +1365,10 @@ async function main(): Promise<void> {
     return serializeReload(async (): Promise<ReloadOutcome | undefined> => {
       const next = validateConfig(rawConfig);
       // Build + validate the runtime FIRST (may throw); only persist on success.
-      const newRuntime = await buildRuntime(next);
+      // The cooldown store is carried over so in-flight 429 cooldowns survive
+      // a config reload (it is (provider, label)-keyed — still meaningful when
+      // pools change; stale entries simply expire on their own TTL).
+      const newRuntime = await buildRuntime(next, runtime.cooldownStore);
       const previous = runtime;
       try {
         await saveConfig(CONFIG_PATH, next);
