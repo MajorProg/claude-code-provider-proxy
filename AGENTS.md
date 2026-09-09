@@ -269,7 +269,8 @@ when wiring or debugging a provider.
   `virtual.anthropic.global.<tier>` expands to the first available candidate
   from the config `virtualModels` map; pre-stream failover advances next pool
   key → next candidate on upstream 401/403/429, connect exhaustion, or a 400
-  whose body matches known "context too long" wording (never generic 5xx),
+  whose body matches known "context too long" wording or a known provider
+  conversion-bug signature (z.ai 1210) (never generic 5xx),
   capped by `maxFailoverAttempts` (default 4), always primary first — except
   keys in the cross-request 429 cooldown (`CredentialCooldownStore`, 5-min TTL,
   survives hot-reloads). The serving key's LABEL is logged + stored in

@@ -125,7 +125,11 @@ cooldown (those are mis-configured keys, not quota).
   matching known "context/input too long" wording (`isContextTooLong` —
   provider phrasings like "range of input length should be [1, N]",
   "context_length_exceeded", "prompt is too long") IS failover-eligible: the
-  next tier candidate may have a larger context window and succeed.
+  next tier candidate may have a larger context window and succeed. So is a
+  400 matching a KNOWN provider conversion-bug signature (z.ai `1210`
+  "Invalid API parameter" — a server-side bug in their Anthropic-route
+  converter that rejects occasional valid shapes): the identical request
+  succeeds on the next candidate, so the bug is never surfaced.
 - **Only before first byte reaches the client.** Once SSE streaming has begun,
   errors relay to the client as today; no mid-stream model or key switching.
   The existing `assertUpstreamOk` throw (paths/relay.ts) is the natural hook:

@@ -128,6 +128,25 @@ export function isContextTooLong(err: UpstreamError): boolean {
   return CONTEXT_TOO_LONG_PATTERNS.some((re) => re.test(body));
 }
 
+/**
+ * 400 body signatures of KNOWN provider-side conversion bugs — the request
+ * itself is valid Anthropic, and another tier candidate can serve it as-is.
+ *
+ * - z.ai `1210` "Invalid API parameter": a recently-emerged server-side bug in
+ *   their Anthropic-compatible converter that rejects occasional valid
+ *   request shapes (shape-dependent, not reproducible on demand; see
+ *   github.com/zai-org/feedback issue #81 and linked reports). Advancing to
+ *   the next candidate serves the identical body fine.
+ */
+const PROVIDER_BUG_400_PATTERNS: readonly RegExp[] = [/"code"\s*:\s*"1210"/, /\[1210\]/];
+
+/** True when a 400's body matches a known provider-side conversion bug. */
+export function isProviderConversionBug(err: UpstreamError): boolean {
+  if (err.status !== 400) return false;
+  const body = err.upstreamBody ?? "";
+  return PROVIDER_BUG_400_PATTERNS.some((re) => re.test(body));
+}
+
 /** True when the error qualifies for a failover attempt. */
 function isFailoverEligible(err: unknown): boolean {
   if (err instanceof UpstreamError) {
@@ -135,6 +154,9 @@ function isFailoverEligible(err: unknown): boolean {
     // A 400 that signals "input too long" is failover-eligible: the next
     // candidate in the virtual tier may accept a larger context window.
     if (isContextTooLong(err)) return true;
+    // A 400 matching a known provider conversion bug: the same valid request
+    // succeeds on the next candidate — don't surface the provider's bug.
+    if (isProviderConversionBug(err)) return true;
     return false;
   }
   return err instanceof UpstreamRequestError;
@@ -332,6 +354,14 @@ export async function executeWithFailover(opts: {
     } catch (err) {
       if (isClientDisconnect(err) || signal?.aborted) throw err;
       lastError = err;
+      // Record the ATTEMPTED key even on failure, so error log lines attribute
+      // the failure to a key (the relayed error's route/model match this).
+      if (entry !== undefined) {
+        updateRequestContext({
+          provider: target.provider,
+          keyLabel: entry.label ?? "default",
+        });
+      }
       // Mark the key degraded on a 429 so future requests skip it immediately.
       if (
         cooldownStore !== undefined &&

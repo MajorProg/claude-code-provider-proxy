@@ -681,3 +681,101 @@ describe("request-completed log enrichment (serving info)", () => {
     expect(completed?.includes("key=")).toBe(false);
   });
 });
+
+describe("z.ai 1210 conversion-bug failover", () => {
+  const ZAI_1210 = {
+    status: 400,
+    json: {
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        code: "1210",
+        message: "[1210][Invalid API parameter, please check the documentation.][x]",
+      },
+    },
+  };
+
+  test("a 400 code-1210 advances (next key, then next candidate)", async () => {
+    const mock = installFetchMock([ZAI_1210, ZAI_1210, { status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      // Both zai keys rejected -> the alibaba candidate serves.
+      expect(mock.requests.map((r) => r.url)).toEqual([
+        "https://api.z.ai/api/anthropic/v1/messages",
+        "https://api.z.ai/api/anthropic/v1/messages",
+        "https://dashscope-intl.aliyuncs.com/apps/anthropic/v1/messages",
+      ]);
+      expect(mock.requests[2]?.headers["x-api-key"]).toBe("alibaba-key");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("a 400 code-1210 does NOT start a cooldown (shape-specific, not quota)", async () => {
+    const store = new CredentialCooldownStore();
+    const runtime = { ...makeRuntime(makeConfig()), cooldownStore: store } as unknown as Runtime;
+    const handle = createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+    const mock = installFetchMock([ZAI_1210, { status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handle(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      expect(store.isDegraded("zai", "primary")).toBe(false);
+    } finally {
+      mock.restore();
+      store.clear();
+    }
+  });
+
+  test("an unrelated 400 (no code) still relays immediately", async () => {
+    const mock = installFetchMock([
+      {
+        status: 400,
+        json: { type: "error", error: { type: "invalid_request_error", message: "bad body" } },
+      },
+    ]);
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(400);
+      expect(mock.requests).toHaveLength(1);
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("request-error lines carry the serving key + requested model", async () => {
+    const mock = installFetchMock([ZAI_1210, ZAI_1210, ZAI_1210]);
+    const lines: string[] = [];
+    const orig = console.log;
+    const origWarn = console.warn;
+    const origErr = console.error;
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    console.warn = console.log as unknown as typeof console.warn;
+    console.error = console.log as unknown as typeof console.error;
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(400); // all three attempts 1210 -> last relayed
+    } finally {
+      console.log = orig;
+      console.warn = origWarn;
+      console.error = origErr;
+      mock.restore();
+    }
+    const errLine = lines.find((l) => l.includes("request error"));
+    expect(errLine).toContain("requested=virtual.anthropic.global.sonnet-like");
+    expect(errLine).toContain("key=alibaba/default"); // the LAST failing attempt's key
+  });
+});

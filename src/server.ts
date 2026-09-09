@@ -50,6 +50,7 @@ import { LogStore } from "./logging/log-store.ts";
 import { errorMessage, logger, newRequestId } from "./logging/logger.ts";
 import {
   type RequestServingInfo,
+  currentRequestContext,
   requestContext,
   servingKeyToken,
   updateRequestContext,
@@ -127,6 +128,9 @@ export function errorResponse(
     );
   }
   if (err instanceof ProxyError) {
+    // Serving enrichment, same as the completion line: which key/model the
+    // failing attempt used (read from the request context, when present).
+    const serving = currentRequestContext();
     const base = {
       requestId: ctx?.requestId,
       method: ctx?.method,
@@ -134,6 +138,10 @@ export function errorResponse(
       status: err.status,
       type: err.type,
       message: err.message,
+      ...(serving?.requestedModel !== undefined ? { requested: serving.requestedModel } : {}),
+      ...(serving?.provider !== undefined && serving.keyLabel !== undefined
+        ? { key: servingKeyToken(serving.provider, serving.keyLabel) }
+        : {}),
       // Upstream failures carry route/model context; surface it in logs only
       // (never in the client body). Undefined fields are dropped by the logger.
       ...(err instanceof UpstreamError ? err.context : {}),
@@ -1282,7 +1290,14 @@ export function createFetchHandler(
         };
         const handle = matched.route.handler;
         serving = { requestId };
-        res = await requestContext.run(serving, () => handle(ctx));
+        // Errors are rendered INSIDE the request-context scope so errorResponse
+        // can attribute them (requested model + attempted key), same as the
+        // completion line.
+        res = await requestContext.run(serving, () =>
+          Promise.resolve(handle(ctx)).catch((err: unknown) =>
+            errorResponse(err, { requestId, method, path: pathname }),
+          ),
+        );
       }
 
       const isApi = pathname.startsWith("/v1/") || pathname.startsWith("/api/");
