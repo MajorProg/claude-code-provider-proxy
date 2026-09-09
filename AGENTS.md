@@ -272,8 +272,9 @@ when wiring or debugging a provider.
   whose body matches known "context too long" wording or a known provider
   conversion-bug signature (z.ai 1210) (never generic 5xx),
   capped by `maxFailoverAttempts` (default 4), always primary first — except
-  keys in the cross-request 429 cooldown (`CredentialCooldownStore`, 5-min TTL,
-  survives hot-reloads). The serving key's LABEL is logged + stored in
+  keys in the cross-request 429 cooldown (`CredentialCooldownStore` — TTL is
+  the quota-reset time parsed from the 429 body when present (z.ai 1310
+  "limit will reset at", clamped to 24h), else 5 min; survives hot-reloads). The serving key's LABEL is logged + stored in
   `TurnRecord.servingKeyLabel` — never the key value.
 - **Discovery always uses bearer.** External-provider `/models` discovery sends
   `Authorization: Bearer` regardless of the provider's message-path `auth` —

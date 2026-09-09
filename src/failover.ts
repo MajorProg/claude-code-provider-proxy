@@ -43,40 +43,78 @@ const FAILOVER_STATUSES: readonly number[] = [401, 403, 429];
 
 /** How long (ms) a key is held out of rotation after receiving a 429. */
 const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+/**
+ * Upper bound for a cooldown, even when the 429 body names a later reset
+ * time: a renewed/changed plan gets re-probed within a day at the latest.
+ */
+const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+/** Safety margin past a parsed reset time (clock skew, second-granularity). */
+const RESET_MARGIN_MS = 60 * 1000;
+
+/**
+ * Parse a provider quota-reset timestamp from a 429 body, as epoch ms.
+ *
+ * Known emitter: z.ai `"[1310][Weekly/Monthly Limit Exhausted. Your limit
+ * will reset at 2026-09-13 15:29:17][…]"` — a UTC `YYYY-MM-DD HH:MM:SS`
+ * stamp (their request ids are UTC and the weekly-reset arithmetic matches).
+ * Returns undefined when no parseable stamp is present.
+ */
+export function parseQuotaResetAt(body: string): number | undefined {
+  const m = /reset at (\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/i.exec(body);
+  if (m === null || m[1] === undefined || m[2] === undefined) return undefined;
+  const t = Date.parse(`${m[1]}T${m[2]}Z`);
+  return Number.isNaN(t) ? undefined : t;
+}
 
 /**
  * Cross-request cooldown store for rate-limited credentials.
  *
- * When a (provider, key label) pair receives a 429, it is marked degraded for
- * COOLDOWN_MS. `buildAttempts` skips degraded entries so subsequent requests
- * go straight to the next working key without burning a live attempt. The
- * store holds one live Timer per entry that clears the record on expiry —
- * timers are unref()'d so they never keep the process alive on their own.
+ * When a (provider, key label) pair receives a 429, it is marked degraded —
+ * until the quota-reset time parsed from the 429 body when one is present
+ * (exact TTL), else for {@link COOLDOWN_MS} (5 min). `buildAttempts` skips
+ * degraded entries so subsequent requests go straight to the next working
+ * key without burning a live attempt. The store holds one live Timer per
+ * entry that clears the record on expiry — timers are unref()'d so they
+ * never keep the process alive on their own.
  *
  * The key is `"${provider}:${label}"` — label is operator-visible metadata,
  * never the credential value itself.
  */
 export class CredentialCooldownStore {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly expiries = new Map<string, number>();
 
-  /** Mark a (provider, label) pair as degraded for COOLDOWN_MS. */
-  mark(provider: string, label: string): void {
+  /**
+   * Mark a (provider, label) pair as degraded. `resetAtMs` (epoch ms, parsed
+   * from the 429 body) makes the cooldown expire exactly then — clamped to
+   * [0, MAX_COOLDOWN_MS]; a past/reset-imminent time falls back to the plain
+   * 5-minute cooldown.
+   */
+  mark(provider: string, label: string, resetAtMs?: number): void {
     const key = `${provider}:${label}`;
     const existing = this.timers.get(key);
     if (existing !== undefined) clearTimeout(existing);
+    const now = Date.now();
+    let ttl = COOLDOWN_MS;
+    if (resetAtMs !== undefined) {
+      const parsed = resetAtMs + RESET_MARGIN_MS - now;
+      if (parsed > 0) ttl = Math.min(parsed, MAX_COOLDOWN_MS);
+    }
     const timer = setTimeout(() => {
       this.timers.delete(key);
       logger.info("credential cooldown expired, reinstating key", { provider, keyLabel: label });
-    }, COOLDOWN_MS);
+    }, ttl);
     // Don't keep the process alive if the server shuts down between requests.
     if (typeof timer === "object" && timer !== null && "unref" in timer) {
       (timer as { unref(): void }).unref();
     }
     this.timers.set(key, timer);
+    this.expiries.set(key, now + ttl);
     logger.warn("credential marked degraded (429 cooldown)", {
       provider,
       keyLabel: label,
-      cooldownMs: COOLDOWN_MS,
+      cooldownMs: ttl,
+      ...(resetAtMs !== undefined ? { quotaResetAt: new Date(resetAtMs).toISOString() } : {}),
     });
   }
 
@@ -85,10 +123,16 @@ export class CredentialCooldownStore {
     return this.timers.has(`${provider}:${label}`);
   }
 
+  /** Epoch ms when this pair's cooldown expires, or undefined when clean. */
+  degradedUntil(provider: string, label: string): number | undefined {
+    return this.expiries.get(`${provider}:${label}`);
+  }
+
   /** Clear all cooldowns (used in tests to reset state between cases). */
   clear(): void {
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
+    this.expiries.clear();
   }
 }
 
@@ -363,13 +407,16 @@ export async function executeWithFailover(opts: {
         });
       }
       // Mark the key degraded on a 429 so future requests skip it immediately.
+      // When the 429 body names the quota-reset time (z.ai 1310 "Your limit
+      // will reset at <UTC stamp>"), the cooldown expires exactly then —
+      // clamped to MAX_COOLDOWN_MS — instead of the blind 5-minute default.
       if (
         cooldownStore !== undefined &&
         err instanceof UpstreamError &&
         err.status === 429 &&
         entry?.label !== undefined
       ) {
-        cooldownStore.mark(target.provider, entry.label);
+        cooldownStore.mark(target.provider, entry.label, parseQuotaResetAt(err.upstreamBody ?? ""));
       }
       if (!isFailoverEligible(err) || i === attempts.length - 1) throw err;
       logger.warn("failover attempt failed, advancing", {

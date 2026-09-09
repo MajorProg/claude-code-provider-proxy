@@ -779,3 +779,89 @@ describe("z.ai 1210 conversion-bug failover", () => {
     expect(errLine).toContain("key=alibaba/default"); // the LAST failing attempt's key
   });
 });
+
+describe("quota-reset-aware cooldown (z.ai 1310)", () => {
+  const ZAI_429_RESET = {
+    status: 429,
+    json: {
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        code: "1310",
+        message:
+          "[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-13 15:29:17][x]",
+      },
+    },
+  };
+
+  test("parseQuotaResetAt extracts the UTC stamp as epoch ms", async () => {
+    const { parseQuotaResetAt } = await import("../src/failover.ts");
+    const body = ZAI_429_RESET.json.error?.message ?? "";
+    const parsed = parseQuotaResetAt(body);
+    expect(parsed).toBe(Date.parse("2026-09-13T15:29:17Z"));
+    expect(parseQuotaResetAt("[429] slow down")).toBeUndefined();
+    expect(parseQuotaResetAt("reset at not-a-date")).toBeUndefined();
+  });
+
+  test("a 429 with a reset-at stamp cools the key until (clamped) reset time", async () => {
+    const store = new CredentialCooldownStore();
+    const runtime = { ...makeRuntime(makeConfig()), cooldownStore: store } as unknown as Runtime;
+    const handle = createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+    const mock = installFetchMock([ZAI_429_RESET, { status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handle(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200); // failover to secondary served it
+    } finally {
+      mock.restore();
+    }
+    expect(store.isDegraded("zai", "primary")).toBe(true);
+    // Reset is 2026-09-13 — far beyond the 24h clamp: expiry = now + 24h.
+    const until = store.degradedUntil("zai", "primary");
+    expect(until).toBeDefined();
+    const in24h = Date.now() + 24 * 60 * 60 * 1000;
+    expect(until ?? 0).toBeGreaterThan(Date.now() + 23 * 60 * 60 * 1000);
+    expect(until ?? 0).toBeLessThanOrEqual(in24h + 5);
+    store.clear();
+  });
+
+  test("a plain 429 (no stamp) keeps the 5-minute default", async () => {
+    const store = new CredentialCooldownStore();
+    const runtime = { ...makeRuntime(makeConfig()), cooldownStore: store } as unknown as Runtime;
+    const handle = createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+    const mock = installFetchMock([
+      { status: 429, json: { error: { message: "rate limited" } } },
+      { status: 200, json: ANTHROPIC_OK },
+    ]);
+    try {
+      const res = await handle(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+    } finally {
+      mock.restore();
+    }
+    const until = store.degradedUntil("zai", "primary");
+    expect(until).toBeDefined();
+    expect(until ?? 0).toBeGreaterThan(Date.now() + 4 * 60 * 1000);
+    expect(until ?? 0).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000 + 10);
+    store.clear();
+  });
+});
