@@ -4,6 +4,7 @@
  * catalog; contains no hardcoded model data.
  */
 import type { ProxyConfig } from "../config.ts";
+import { currentServingKey } from "../logging/serving-alert.ts";
 import { formatCanonicalId } from "../model/canonical-id.ts";
 import type { Catalog, DiscoveredModel, SourceStatus } from "../model/catalog.ts";
 import { virtualTierStatuses } from "../router.ts";
@@ -36,6 +37,12 @@ export interface RegistrySnapshot {
   }[];
   /** Credential-pool LABELS per provider (public page: labels, never values). */
   pools?: { provider: string; labels: string[] }[];
+  /**
+   * The account (provider/label) that served the last successful inference —
+   * null until the first request or when servingChangePing is off. Labels
+   * only. Consumed by `bun run cli ping` (host-side change watcher).
+   */
+  servingAccount: string | null;
   counts: {
     total: number;
     byBackend: Record<string, number>;
@@ -107,6 +114,7 @@ export function buildRegistrySnapshot(config: ProxyConfig, catalog: Catalog): Re
           })),
         }
       : {}),
+    servingAccount: config.servingChangePing === true ? currentServingKey() : null,
     ...(() => {
       const pools = Object.entries(config.providers.external)
         .filter(([, p]) => p.credentials.length > 1)

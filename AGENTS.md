@@ -278,7 +278,9 @@ when wiring or debugging a provider.
   `TurnRecord.servingKeyLabel` — never the key value. `servingChangePing`
   (config, default off) additionally emits a terminal BEL + marked warn line
   when the serving account CHANGES across requests (failover/cooldown
-  reinstatement/provider shift).
+  reinstatement/provider shift), exposes `servingAccount` on /status.json,
+  and pairs with the host-side `bun run cli ping [sound]` watcher (afplay on
+  macOS) that plays a real sound on the default audio device on change.
 - **Discovery always uses bearer.** External-provider `/models` discovery sends
   `Authorization: Bearer` regardless of the provider's message-path `auth` —
   some providers reject `x-api-key` on `/models` (`401`), but the OpenAI

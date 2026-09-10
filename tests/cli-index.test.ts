@@ -19,6 +19,7 @@ import {
   portValue,
   readPid,
   resolveBindIp,
+  resolveSoundPlayer,
 } from "../src/cli/index.ts";
 import { validateConfig } from "../src/config.ts";
 
@@ -32,7 +33,12 @@ afterEach(() => {
 
 describe("parseArgs", () => {
   test("defaults to the help command with no mode/rotate", () => {
-    expect(parseArgs([])).toEqual({ command: "help", mode: undefined, rotate: false });
+    expect(parseArgs([])).toEqual({
+      command: "help",
+      mode: undefined,
+      rotate: false,
+      arg: undefined,
+    });
   });
 
   test("first positional is the command; --local/--docker set mode; --rotate flag", () => {
@@ -40,11 +46,13 @@ describe("parseArgs", () => {
       command: "up",
       mode: "local",
       rotate: false,
+      arg: undefined,
     });
     expect(parseArgs(["setup", "--docker", "--rotate"])).toEqual({
       command: "setup",
       mode: "docker",
       rotate: true,
+      arg: undefined,
     });
   });
 
@@ -53,6 +61,7 @@ describe("parseArgs", () => {
       command: "status",
       mode: "docker",
       rotate: false,
+      arg: "extra",
     });
   });
 
@@ -61,6 +70,7 @@ describe("parseArgs", () => {
       command: "restart",
       mode: undefined,
       rotate: true,
+      arg: undefined,
     });
   });
 });
@@ -312,5 +322,28 @@ describe("configDiagnostics (doctor's config check)", () => {
     expect(zai?.level).toBe("ok");
     expect(eu?.level).toBe("warn");
     expect(eu?.line).toContain("workspaceId is empty");
+  });
+});
+
+describe("resolveSoundPlayer (ping watcher)", () => {
+  test("macOS always resolves to afplay (no existence probe needed)", () => {
+    expect(resolveSoundPlayer("macos")).toEqual({ cmd: "afplay", baseArgs: [] });
+    expect(resolveSoundPlayer("macos", () => false)).toEqual({ cmd: "afplay", baseArgs: [] });
+  });
+
+  test("Linux picks the first available player with quiet flags", () => {
+    expect(resolveSoundPlayer("linux", (c) => c === "paplay")).toEqual({
+      cmd: "paplay",
+      baseArgs: [],
+    });
+    expect(resolveSoundPlayer("linux", (c) => c === "ffplay")).toEqual({
+      cmd: "ffplay",
+      baseArgs: ["-nodisp", "-autoexit", "-loglevel", "quiet"],
+    });
+    expect(resolveSoundPlayer("linux", () => false)).toBeNull();
+  });
+
+  test("Windows has no built-in player", () => {
+    expect(resolveSoundPlayer("windows")).toBeNull();
   });
 });

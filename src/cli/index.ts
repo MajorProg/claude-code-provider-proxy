@@ -44,6 +44,7 @@ import { getEnvValue, readEnvFile, setEnvValue } from "./env.ts";
 import {
   bold,
   commandExists,
+  currentPlatform,
   die,
   info,
   ok,
@@ -67,6 +68,8 @@ interface Args {
   command: string;
   mode: Mode | undefined;
   rotate: boolean;
+  /** Optional second positional (e.g. a sound file for `ping`). */
+  arg: string | undefined;
 }
 
 /** Project root = two levels up from src/cli/index.ts. */
@@ -86,7 +89,7 @@ export function parseArgs(argv: string[]): Args {
     else if (!a.startsWith("-")) positionals.push(a);
   }
   if (positionals[0]) command = positionals[0];
-  return { command, mode, rotate };
+  return { command, mode, rotate, arg: positionals[1] };
 }
 
 /** Resolve the run mode: explicit flag wins, else Docker if available. */
@@ -469,6 +472,77 @@ function cmdConfigClaude(root: string): void {
 }
 
 /**
+ * Resolve the host-side sound PLAYER for the ping watcher (pure, exported for
+ * tests). macOS gets first-class support (`afplay`, always present, plays on
+ * the default audio device); Linux is best-effort via the first available of
+ * paplay/ffplay/play; Windows has no built-in and returns null.
+ */
+export function resolveSoundPlayer(
+  platform: "macos" | "linux" | "windows",
+  has = (cmd: string): boolean => commandExists(cmd),
+): { cmd: string; baseArgs: string[] } | null {
+  if (platform === "macos") return { cmd: "afplay", baseArgs: [] };
+  if (platform === "windows") return null;
+  for (const [cmd, baseArgs] of [
+    ["paplay", []],
+    ["ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet"]],
+    ["play", ["-q"]],
+  ] as const) {
+    if (has(cmd)) return { cmd, baseArgs: [...baseArgs] };
+  }
+  return null;
+}
+
+/**
+ * Host-side serving-account change watcher: polls the proxy's public
+ * /status.json (`servingAccount` — labels only) every 2s and plays a sound on
+ * the default audio device whenever it changes (failover to another key,
+ * cooldown expiry, provider shift). Runs on the HOST (the container cannot
+ * reach the speakers) — works for both --local and --docker since it targets
+ * the published port. Ctrl-C to stop.
+ */
+async function cmdPing(soundPath: string | undefined): Promise<void> {
+  const root = projectRoot();
+  const base = `http://127.0.0.1:${portValue(join(root, ".env"))}`;
+  const player = resolveSoundPlayer(currentPlatform());
+  const sound = soundPath ?? "/System/Library/Sounds/Glass.aiff";
+  if (player === null) {
+    warn("No sound player on this platform (macOS: afplay). Watching without sound.");
+  } else if (!existsSync(sound)) {
+    warn(`Sound file not found: ${sound} — watching without sound.`);
+  }
+  info(`Watching ${base}/status.json for serving-account changes (Ctrl-C to stop)…`);
+  let last: string | null | undefined;
+  for (;;) {
+    try {
+      const res = await fetch(`${base}/status.json`, { signal: AbortSignal.timeout(4000) });
+      if (res.ok) {
+        const j = (await res.json()) as { servingAccount?: string | null };
+        const cur = j.servingAccount ?? null;
+        if (last !== undefined && cur !== last) {
+          info(
+            `${new Date().toLocaleTimeString()} serving account changed: ${last ?? "(none)"} -> ${
+              cur ?? "(none)"
+            }`,
+          );
+          if (player !== null && existsSync(sound)) {
+            runCapture(player.cmd, [...player.baseArgs, sound]);
+          }
+        }
+        last = cur;
+      }
+    } catch {
+      // Proxy down or restarting — keep watching; surface once per state change.
+      if (last !== undefined) {
+        info(`${new Date().toLocaleTimeString()} proxy unreachable, waiting…`);
+        last = undefined;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+/**
  * Pure config diagnostics for {@link cmdDoctor} (exported for tests): one line
  * per notable state — ephemeral inbound key, load warnings, and per-provider /
  * per-region activity — in print order, with the severity the doctor prints.
@@ -602,6 +676,8 @@ function usage(): void {
       "  status           show status + registry URLs",
       "  logs             follow logs",
       "  config-claude    (re)write Claude Code settings",
+      "  ping [sound]     watch the proxy; play a sound when the serving",
+      "                   account changes (default: macOS Glass.aiff)",
       "  doctor           diagnose environment",
       "  help             this message",
       "",
@@ -646,6 +722,9 @@ async function main(): Promise<void> {
       break;
     case "doctor":
       await cmdDoctor(root, mode);
+      break;
+    case "ping":
+      await cmdPing(args.arg);
       break;
     default:
       warn(`Unknown command: ${args.command}`);

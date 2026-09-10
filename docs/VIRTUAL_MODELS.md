@@ -152,14 +152,21 @@ therefore doesn't blank the catalog.)
 
 ## Observability
 
-- **Audible account-switch alert** (`servingChangePing: true`, default off):
-  when the serving ACCOUNT changes across requests (failover to the next pool
-  key, cooldown expiry reinstating a key, a tier shifting providers), the
-  proxy writes a BEL byte + a `SERVING ACCOUNT CHANGED from=… to=…` warn line
-  (src/logging/serving-alert.ts). `docker compose logs -f` / `bun run cli
-  logs` in a terminal with audible bell enabled pings on the host. The signal
-  is the key, not the model — model alternation is normal traffic, not an
-  event.
+- **Audible account-switch alert** (`servingChangePing: true`, default off).
+  The proxy itself runs headless in Docker and cannot reach the host's
+  speakers, so the sound comes from a HOST-side watcher:
+  - `/status.json` exposes `servingAccount` ("zai/secondary", labels only —
+    null while nothing served / feature off);
+  - `bun run cli ping [sound.aiff]` (run on the host, any terminal) polls it
+    every 2s and plays a real sound on the default audio device when it
+    changes — macOS via `afplay` (default
+    `/System/Library/Sounds/Glass.aiff`), Linux best-effort via
+    paplay/ffplay/play. Works for both run modes (targets the published
+    port).
+  The proxy ALSO writes a BEL byte + `SERVING ACCOUNT CHANGED from=… to=…`
+  warn line, so a `logs -f` terminal with audible bell pings as well. The
+  signal is the key (account), not the model — model alternation is normal
+  traffic, not an event.
 
 - Every `request completed` log line carries the serving truth: the canonical
   id the client asked for (`requested=`, the virtual tier when applicable),

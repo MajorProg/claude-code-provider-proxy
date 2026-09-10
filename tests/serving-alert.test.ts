@@ -5,7 +5,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import { validateConfig } from "../src/config.ts";
+import { buildRegistrySnapshot } from "../src/http/registry-page.ts";
 import { currentServingKey, noteServing, resetServingAlert } from "../src/logging/serving-alert.ts";
+import { Catalog } from "../src/model/catalog.ts";
 
 /** Capture console emissions (log + raw stdout writes) during fn(). */
 async function capture(
@@ -111,5 +113,36 @@ describe("servingChangePing config", () => {
   test("defaults to false; true round-trips through validation", () => {
     expect(validateConfig(BASE).servingChangePing).toBe(false);
     expect(validateConfig({ ...BASE, servingChangePing: true }).servingChangePing).toBe(true);
+  });
+});
+
+describe("servingAccount on /status.json", () => {
+  const cfg = (ping: boolean) =>
+    validateConfig({
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: ["k"] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {},
+      ...(ping ? { servingChangePing: true } : {}),
+    });
+
+  test("reflects the tracked serving account (labels only)", () => {
+    resetServingAlert();
+    noteServing(ON, "zai", "secondary", "zai.anthropic.global.glm-5.3");
+    const snap = buildRegistrySnapshot(cfg(true), new Catalog([], []));
+    expect(snap.servingAccount).toBe("zai/secondary");
+    resetServingAlert();
+  });
+
+  test("null when the feature is off or nothing served yet", () => {
+    resetServingAlert();
+    expect(buildRegistrySnapshot(cfg(true), new Catalog([], [])).servingAccount).toBeNull();
+    noteServing(ON, "zai", "primary", "zai.anthropic.global.glm-5.3");
+    expect(buildRegistrySnapshot(cfg(false), new Catalog([], [])).servingAccount).toBeNull();
+    resetServingAlert();
   });
 });
