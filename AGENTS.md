@@ -275,7 +275,10 @@ when wiring or debugging a provider.
   keys in the cross-request 429 cooldown (`CredentialCooldownStore` — TTL is
   the quota-reset time parsed from the 429 body when present (z.ai 1310
   "limit will reset at", clamped to 24h), else 5 min; survives hot-reloads). The serving key's LABEL is logged + stored in
-  `TurnRecord.servingKeyLabel` — never the key value.
+  `TurnRecord.servingKeyLabel` — never the key value. `servingChangePing`
+  (config, default off) additionally emits a terminal BEL + marked warn line
+  when the serving account CHANGES across requests (failover/cooldown
+  reinstatement/provider shift).
 - **Discovery always uses bearer.** External-provider `/models` discovery sends
   `Authorization: Bearer` regardless of the provider's message-path `auth` —
   some providers reject `x-api-key` on `/models` (`401`), but the OpenAI

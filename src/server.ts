@@ -55,6 +55,7 @@ import {
   servingKeyToken,
   updateRequestContext,
 } from "./logging/request-context.ts";
+import { noteServing } from "./logging/serving-alert.ts";
 import { formatCanonicalId, parseCanonicalId } from "./model/canonical-id.ts";
 import {
   type Catalog,
@@ -381,6 +382,9 @@ async function runInference(
       }
     },
   });
+  // Audible account-switch alert (config-gated): ping when this request was
+  // served by a DIFFERENT account than the previous one.
+  noteServing(config, outcome.target.provider, outcome.keyLabel, outcome.servedModel);
   return {
     response: outcome.response,
     canonicalId,

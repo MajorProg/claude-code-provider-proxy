@@ -176,5 +176,11 @@
 
   // Total upstream attempts (candidates x pool keys) per request before the
   // last error is relayed. Default 4.
-  "maxFailoverAttempts": 4
+  "maxFailoverAttempts": 4,
+
+  // Audible terminal alert when the serving ACCOUNT changes (failover to the
+  // next key, cooldown expiry reinstating a key, a tier shifting providers):
+  // emits a BEL + "SERVING ACCOUNT CHANGED" log line — `docker compose logs -f`
+  // / `bun run cli logs` pings on a terminal with audible bell enabled.
+  "servingChangePing": true
 }

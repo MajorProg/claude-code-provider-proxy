@@ -445,6 +445,12 @@ export interface ProxyConfig {
    * last error is relayed. Always present (default {@link DEFAULT_FAILOVER_ATTEMPTS}).
    */
   readonly maxFailoverAttempts: number;
+  /**
+   * Audible terminal alert (BEL + marked log line) when the serving ACCOUNT
+   * changes across requests (failover, cooldown expiry, provider shift) —
+   * see src/logging/serving-alert.ts. Default false.
+   */
+  readonly servingChangePing: boolean;
 }
 
 /** Default pre-stream failover attempt cap (docs/VIRTUAL_MODELS.md). */
@@ -1071,6 +1077,7 @@ export function validateConfig(raw: unknown): ProxyConfig {
     chatPage: { enabled: isRecord(raw.chatPage) && raw.chatPage.enabled === true },
     limits: validateLimits(raw.limits),
     maxFailoverAttempts: validateMaxFailoverAttempts(raw.maxFailoverAttempts),
+    servingChangePing: raw.servingChangePing === true,
     ...(virtualModels !== undefined ? { virtualModels } : {}),
   };
   return Object.freeze(config);
@@ -1447,6 +1454,7 @@ export function serializeConfig(
     regions: config.regions.map((r) => ({ key: r.key, awsRegion: r.awsRegion })),
     providers,
     maxFailoverAttempts: config.maxFailoverAttempts,
+    servingChangePing: config.servingChangePing,
     // Tier lists round-trip verbatim (model ids are not secrets; availability
     // filtering happens at routing time, never at serialization).
     ...(config.virtualModels ? { virtualModels: config.virtualModels } : {}),
