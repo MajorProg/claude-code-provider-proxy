@@ -300,6 +300,11 @@ target, so a crash mid-write can never leave a truncated JSON file for readers).
 `stop()` (idempotent) marks the store stopped so `isEnabled()` returns false and
 `record*` calls become no-ops — called on hot-reload before the replacement
 runtime swaps in, mirroring `CatalogManager.stop()`; in-flight writes settle.
+A per-session `_summary.json` index (mirrored on every `recordTurn`) serves the
+listing endpoints (`listSessions`/`listTurns`) from lightweight metadata instead
+of turn-file bodies, which total many GB on a long-lived deployment and OOM the
+process when read per request; a bounded-concurrency rebuild backfills sessions
+recorded before the index existed and heals count drift.
 
 ### `logging/capture.ts`
 `captureTurn` builds a `TurnRecord` from a proxy `Response`. For streaming, it

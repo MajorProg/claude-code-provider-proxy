@@ -6,6 +6,9 @@
  *   - One JSON file per conversation turn under
  *     `<dir>/<sessionDir>/<session-id>/`, containing the request messages, the
  *     inference output, token usage, stop reason, and timestamps.
+ *   - A per-session summary index (`_summary.json` alongside the turn files)
+ *     mirroring the listing metadata, so the log viewer scales to sessions
+ *     with thousands of turns / GBs of payloads without reading them.
  *
  * All writes are best-effort and MUST NOT affect the proxy response path: a
  * logging failure is swallowed (logged to console) so inference is never broken.
@@ -75,6 +78,125 @@ function sha256Hex(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
+/* ---------------- summary index (scalable log listing) ---------------- */
+
+/**
+ * Per-session summary index filename. Lives inside the session dir next to the
+ * turn files and holds the lightweight metadata the log viewer needs (model,
+ * timestamps, token counts), so listing endpoints never have to read + parse
+ * turn-file bodies (which contain full message payloads and can total many GB
+ * across a long-lived deployment — reading them all per request OOMs).
+ */
+const SUMMARY_FILE = "_summary.json";
+
+/** Turn basename for {@link SUMMARY_FILE} (filename without the extension). */
+const SUMMARY_TURN = "_summary";
+
+/**
+ * Turn files are `<5-digit seq>-<stamp>.json` by construction (recordTurn).
+ * Listing/enumeration matches this exact shape so the summary index (also a
+ * `.json` file in the same dir) is never mistaken for a turn.
+ */
+const TURN_FILE_RE = /^\d{5}-.*\.json$/;
+
+/** Max turn files read concurrently while (re)building a session summary. */
+const SCAN_CONCURRENCY = 8;
+/** Max sessions summarized concurrently by listSessions (bounds peak memory
+ *  during a first-listing backfill across many large sessions). */
+const SESSION_CONCURRENCY = 4;
+
+/**
+ * Lightweight per-turn metadata mirrored into the session summary index —
+ * exactly the fields listTurns exposes to the log viewer.
+ */
+export interface SessionTurnMeta {
+  readonly turn: string;
+  readonly model: string;
+  readonly requestedAt: string;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly stopReason: string | null;
+}
+
+/** Shape of the `_summary.json` index file. */
+interface SessionSummaryFile {
+  /** Number of turn FILES on disk when the index was built. Distinct from
+   *  `turns.length` when some files failed to parse (corrupt entries are
+   *  skipped); comparing against a fresh readdir detects drift without
+   *  forcing a rescan for unparseable-but-stable directories. */
+  fileCount: number;
+  /** Turn metadata in listing (filename) order. */
+  turns: SessionTurnMeta[];
+}
+
+/** Run `fn` serialized per key (chained-promise mutex, same shape as the
+ *  per-hash prompt lock): concurrent read-modify-writes of the same summary
+ *  would lose appends. The lock entry is dropped once it is the tail so the
+ *  map cannot grow without bound. */
+async function runLocked<T>(
+  locks: Map<string, Promise<void>>,
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = locks.get(key) ?? Promise.resolve();
+  const result = prev.then(() => fn());
+  const gate = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  locks.set(key, gate);
+  void gate.then(() => {
+    if (locks.get(key) === gate) locks.delete(key);
+  });
+  return result;
+}
+
+/** Map with bounded concurrency, preserving input order in the result. */
+async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      const item = items[i];
+      if (item === undefined) return;
+      results[i] = await fn(item);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return results;
+}
+
+/** Extract the listing metadata from a parsed turn record. */
+function turnMetaOf(file: string, rec: TurnRecord): SessionTurnMeta {
+  return {
+    turn: file.replace(/\.json$/, ""),
+    model: rec.canonicalModel,
+    requestedAt: rec.requestedAt,
+    inputTokens: rec.usage?.inputTokens ?? 0,
+    outputTokens: rec.usage?.outputTokens ?? 0,
+    stopReason: rec.stopReason ?? null,
+  };
+}
+
+/** Validate a parsed `_summary.json` payload; null unless structurally sound. */
+function parseSummaryFile(parsed: unknown): SessionSummaryFile | null {
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const fileCount = (parsed as { fileCount?: unknown }).fileCount;
+  const turns = (parsed as { turns?: unknown }).turns;
+  if (typeof fileCount !== "number" || !Array.isArray(turns)) return null;
+  const clean = turns.filter(
+    (t): t is SessionTurnMeta =>
+      typeof t === "object" && t !== null && typeof (t as SessionTurnMeta).turn === "string",
+  );
+  return { fileCount, turns: clean };
+}
+
 /** Produce a short, single-line preview of arbitrary system content. */
 function previewOf(system: unknown): string {
   const text =
@@ -125,6 +247,9 @@ export class LogStore {
   /** Per-system-prompt-hash write mutex: serializes read-modify-write of the
    *  dedup counter so concurrent identical prompts don't lose count updates. */
   private readonly promptLocks = new Map<string, Promise<void>>();
+  /** Per-session-dir write mutex for the summary index: serializes
+   *  read-modify-write so concurrent turn records don't lose appends. */
+  private readonly summaryLocks = new Map<string, Promise<void>>();
   /** Set by stop() so a dropped store (e.g. on hot-reload) stops recording. */
   private stopped = false;
 
@@ -266,20 +391,7 @@ export class LogStore {
     const serialized = JSON.stringify(system);
     if (serialized === '""' || serialized === "[]") return null;
     const hash = sha256Hex(serialized);
-
-    const prev = this.promptLocks.get(hash) ?? Promise.resolve();
-    const next = prev.then(() => this.writeSystemPrompt(hash, system));
-    // Keep the chain alive but swallow settlement so one failure doesn't poison
-    // the next writer; drop the entry once it's the tail (avoid unbounded map).
-    const guarded = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.promptLocks.set(hash, guarded);
-    void guarded.then(() => {
-      if (this.promptLocks.get(hash) === guarded) this.promptLocks.delete(hash);
-    });
-    await next;
+    await runLocked(this.promptLocks, hash, () => this.writeSystemPrompt(hash, system));
     return hash;
   }
 
@@ -323,6 +435,7 @@ export class LogStore {
       const stamp = turn.requestedAt.replace(/[:.]/g, "-");
       const file = join(dir, `${seqStr}-${stamp}.json`);
       await this.writeJsonAtomic(file, JSON.stringify(turn, null, 2));
+      await this.appendTurnSummary(dir, turnMetaOf(`${seqStr}-${stamp}.json`, turn));
     } catch (err) {
       // A dropped turn is data loss — surface at error level (with session id).
       logger.error("log-store failed to record turn", {
@@ -330,6 +443,98 @@ export class LogStore {
         message: errorMessage(err),
       });
     }
+  }
+
+  /**
+   * Mirror one recorded turn into the session's `_summary.json` index (under
+   * the per-session lock). Replaces an existing entry with the same turn name
+   * (recordTurn retries / seq-collisions after a restart overwrite the turn
+   * file, so the index must follow) or appends a new one. Only this method
+   * and loadTurnSummaryUnlocked write the index in steady state, so listing
+   * endpoints never need to touch turn-file bodies.
+   */
+  private async appendTurnSummary(dir: string, meta: SessionTurnMeta): Promise<void> {
+    await runLocked(this.summaryLocks, dir, async () => {
+      // Fast path: recordTurn wrote the turn file just before this call, so a
+      // summary that is exactly one entry behind is in sync minus our write —
+      // append without rescanning (steady state; keeps per-turn cost O(1)
+      // instead of a full-directory read on a long-lived session).
+      let turnFiles: string[] = [];
+      try {
+        turnFiles = (await readdir(dir)).filter((f) => TURN_FILE_RE.test(f));
+      } catch {
+        return; // unreadable dir: the turn-file write already failed loudly
+      }
+      const summaryFile = join(dir, SUMMARY_FILE);
+      const existing = parseSummaryFile(await this.readJsonSafe<unknown>(summaryFile));
+      if (
+        existing &&
+        existing.fileCount === turnFiles.length - 1 &&
+        !existing.turns.some((t) => t.turn === meta.turn)
+      ) {
+        const summary: SessionSummaryFile = {
+          fileCount: turnFiles.length,
+          turns: [...existing.turns, meta],
+        };
+        await this.writeJsonAtomic(summaryFile, JSON.stringify(summary, null, 2));
+        return;
+      }
+      // Slow path (first turn of a session, retry with the same filename,
+      // drift): rebuild from disk — the rebuild's readdir already includes the
+      // new turn file, so the scan indexes it; replace-or-append defensively.
+      const summary = await this.loadTurnSummaryUnlocked(dir);
+      const idx = summary.turns.findIndex((t) => t.turn === meta.turn);
+      if (idx >= 0) {
+        summary.turns[idx] = meta;
+      } else {
+        summary.turns.push(meta);
+        summary.fileCount += 1;
+      }
+      await this.writeJsonAtomic(summaryFile, JSON.stringify(summary, null, 2));
+    });
+  }
+
+  /**
+   * Load (and if needed build) the session summary index. Steady state is one
+   * readdir + one small-file read; a missing index (session recorded by a
+   * pre-index build) or a file-count mismatch (crash between the turn-file
+   * write and the index write) triggers a bounded-concurrency rebuild from the
+   * turn files themselves, persisted so the scan happens at most once. A
+   * corrupt-but-stable directory (unparseable turn files) does not loop: the
+   * index records the file COUNT, so failed parses skip entries without
+   * re-tripping the mismatch check.
+   *
+   * Callers must already hold the per-session summary lock (appendTurnSummary,
+   * listTurns) — the recordTurn write path always does.
+   */
+  private async loadTurnSummaryUnlocked(dir: string): Promise<SessionSummaryFile> {
+    let turnFiles: string[] = [];
+    try {
+      turnFiles = (await readdir(dir)).filter((f) => TURN_FILE_RE.test(f)).sort();
+    } catch {
+      return { fileCount: 0, turns: [] };
+    }
+    const existing = parseSummaryFile(await this.readJsonSafe<unknown>(join(dir, SUMMARY_FILE)));
+    if (existing && existing.fileCount === turnFiles.length) return existing;
+    const metas = await mapLimit(turnFiles, SCAN_CONCURRENCY, async (f) => {
+      const rec = await this.readJsonSafe<TurnRecord>(join(dir, f));
+      return rec ? turnMetaOf(f, rec) : null;
+    });
+    const summary: SessionSummaryFile = {
+      fileCount: turnFiles.length,
+      turns: metas.filter((m): m is SessionTurnMeta => m !== null),
+    };
+    try {
+      await this.writeJsonAtomic(join(dir, SUMMARY_FILE), JSON.stringify(summary, null, 2));
+    } catch (err) {
+      // The in-memory result is still returned; only persistence failed —
+      // the next listing rebuilds again (best-effort, like all log writes).
+      logger.warn("log-store failed to persist session summary", {
+        dir,
+        message: errorMessage(err),
+      });
+    }
+    return summary;
   }
 
   /* ---------------- read side (for the log viewer API) ---------------- */
@@ -370,7 +575,14 @@ export class LogStore {
     return this.readJsonSafe<SystemPromptFile>(join(this.systemPath, `${hash}.json`));
   }
 
-  /** List sessions with aggregate stats. */
+  /**
+   * List sessions with aggregate stats. Served from per-session summary
+   * indexes (one readdir + one small read per session), never from turn-file
+   * bodies — reading every turn of every session (many GB in a long-lived
+   * deployment) OOMs the process. Sessions are summarized with bounded
+   * concurrency so even a first-listing backfill of many large sessions keeps
+   * peak memory flat.
+   */
   async listSessions(): Promise<
     {
       id: string;
@@ -396,10 +608,10 @@ export class LogStore {
       firstAt: string;
       lastAt: string;
     }[] = [];
-    // Read every session's turns concurrently (was serial N+1).
-    const perSession = await Promise.all(
-      sessionDirs.map(async (id) => ({ id, turns: await this.listTurns(id) })),
-    );
+    const perSession = await mapLimit(sessionDirs, SESSION_CONCURRENCY, async (id) => ({
+      id,
+      turns: await this.listTurns(id),
+    }));
     for (const { id, turns } of perSession) {
       if (turns.length === 0) continue;
       let inputTokens = 0;
@@ -421,58 +633,22 @@ export class LogStore {
     return out;
   }
 
-  /** List a session's turns (lightweight metadata), ordered by sequence. */
-  async listTurns(sessionId: string): Promise<
-    {
-      turn: string;
-      model: string;
-      requestedAt: string;
-      inputTokens: number;
-      outputTokens: number;
-      stopReason: string | null;
-    }[]
-  > {
+  /** List a session's turns (lightweight metadata), ordered by sequence.
+   *  Served from the summary index; builds it on first access. */
+  async listTurns(sessionId: string): Promise<SessionTurnMeta[]> {
     if (!this.enabled) return [];
     const dir = this.sessionDir(sessionId);
-    let files: string[];
-    try {
-      files = await readdir(dir);
-    } catch {
-      return [];
-    }
-    const turnFiles = files.filter((f) => f.endsWith(".json")).sort();
-    const records = await Promise.all(
-      turnFiles.map(async (f) => {
-        const rec = await this.readJsonSafe<TurnRecord>(join(dir, f));
-        return rec ? { file: f, rec } : null;
-      }),
+    const summary = await runLocked(this.summaryLocks, dir, () =>
+      this.loadTurnSummaryUnlocked(dir),
     );
-    const out: {
-      turn: string;
-      model: string;
-      requestedAt: string;
-      inputTokens: number;
-      outputTokens: number;
-      stopReason: string | null;
-    }[] = [];
-    for (const entry of records) {
-      if (!entry) continue;
-      out.push({
-        turn: entry.file.replace(/\.json$/, ""),
-        model: entry.rec.canonicalModel,
-        requestedAt: entry.rec.requestedAt,
-        inputTokens: entry.rec.usage.inputTokens,
-        outputTokens: entry.rec.usage.outputTokens,
-        stopReason: entry.rec.stopReason,
-      });
-    }
-    return out;
+    return summary.turns;
   }
 
   /** Read one turn's full record. */
   async getTurn(sessionId: string, turn: string): Promise<TurnRecord | null> {
     if (!this.enabled) return null;
     const dir = this.sessionDir(sessionId);
+    if (turn === SUMMARY_TURN) return null;
     if (!/^[a-zA-Z0-9._-]+$/.test(turn)) return null;
     return this.readJsonSafe<TurnRecord>(join(dir, `${turn}.json`));
   }
@@ -525,7 +701,7 @@ export class LogStore {
         }
         const entries = await Promise.all(
           files
-            .filter((f) => f.endsWith(".json"))
+            .filter((f) => TURN_FILE_RE.test(f))
             .map(async (f) => {
               const content = await this.readTextSafe(join(this.sessionPath, sid, f));
               if (content === null) return null;
