@@ -36,6 +36,7 @@ function store(): LogStore {
     systemDir: "system",
     sessionDir: "sessions",
     captureTimeoutMs: 120000,
+    compression: { enabled: false, minAgeMinutes: 10 },
   });
 }
 

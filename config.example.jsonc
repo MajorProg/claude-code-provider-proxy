@@ -141,7 +141,12 @@
     "enabled": true,
     "dir": "./logs",
     "systemDir": "system",
-    "sessionDir": "sessions"
+    "sessionDir": "sessions",
+    // Background gzip compression of turn files (json -> json.gz); readers
+    // (viewer, API, ZIP export) decompress transparently. Existing logs are
+    // compressed by the same bounded sweep. minAgeMinutes avoids churning
+    // files a resumed session may still re-write.
+    "compression": { "enabled": true, "minAgeMinutes": 10 }
   },
 
   // Built-in chat test page at /chat (enabled by default for a local pod). The

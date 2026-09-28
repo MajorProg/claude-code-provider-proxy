@@ -359,10 +359,35 @@ export interface LoggingConfig {
    * Defaults to {@link DEFAULT_LOG_CAPTURE_TIMEOUT_MS} when absent.
    */
   readonly captureTimeoutMs: number;
+  /**
+   * Background gzip compression of turn files (`.json` -> `.json.gz`). Readers
+   * (log viewer, API, ZIP export) decompress transparently; listings serve
+   * from the summary index and never touch bodies. Defaults to
+   * {@link DEFAULT_LOG_COMPRESSION} when absent.
+   */
+  readonly compression: LogCompressionConfig;
+}
+
+/** Knobs for background turn-file compression. */
+export interface LogCompressionConfig {
+  readonly enabled: boolean;
+  /**
+   * Only compress turn files at least this many minutes old. Not a correctness
+   * guard (a basename re-write after compression is handled by preferring the
+   * plain file and dropping the stale `.gz`) — it avoids churning files a
+   * resumed session may still re-write.
+   */
+  readonly minAgeMinutes: number;
 }
 
 /** Default backstop for the streaming log-capture branch (PC8). */
 export const DEFAULT_LOG_CAPTURE_TIMEOUT_MS = 2 * 60 * 1000;
+
+/** Default background-compression policy: on, files >= 10 minutes old. */
+export const DEFAULT_LOG_COMPRESSION: LogCompressionConfig = {
+  enabled: true,
+  minAgeMinutes: 10,
+};
 
 export interface ChatPageConfig {
   readonly enabled: boolean;
@@ -964,12 +989,21 @@ function validateLogging(raw: unknown): LoggingConfig {
     typeof rawTimeout === "number" && Number.isInteger(rawTimeout) && rawTimeout > 0
       ? rawTimeout
       : DEFAULT_LOG_CAPTURE_TIMEOUT_MS;
+  const rawCompression = isRecord(rawLogging.compression) ? rawLogging.compression : {};
+  const rawMinAge = rawCompression.minAgeMinutes;
   return {
     enabled: rawLogging.enabled === true,
     dir: stringOrDefault(rawLogging.dir, "./logs"),
     systemDir: stringOrDefault(rawLogging.systemDir, "system"),
     sessionDir: stringOrDefault(rawLogging.sessionDir, "sessions"),
     captureTimeoutMs,
+    compression: {
+      enabled: rawCompression.enabled !== false,
+      minAgeMinutes:
+        typeof rawMinAge === "number" && Number.isInteger(rawMinAge) && rawMinAge >= 0
+          ? rawMinAge
+          : DEFAULT_LOG_COMPRESSION.minAgeMinutes,
+    },
   };
 }
 
@@ -1464,6 +1498,10 @@ export function serializeConfig(
       systemDir: config.logging.systemDir,
       sessionDir: config.logging.sessionDir,
       captureTimeoutMs: config.logging.captureTimeoutMs,
+      compression: {
+        enabled: config.logging.compression.enabled,
+        minAgeMinutes: config.logging.compression.minAgeMinutes,
+      },
     },
     chatPage: { enabled: config.chatPage.enabled },
     limits: {

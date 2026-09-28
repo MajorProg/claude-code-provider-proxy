@@ -15,10 +15,15 @@
  * When disabled, every method is a no-op.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
+import { promisify } from "node:util";
+import { gunzip, gzip } from "node:zlib";
 import type { LoggingConfig } from "../config.ts";
 import { errorMessage, logger } from "./logger.ts";
+
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
 
 /** Token usage captured for a turn. */
 export interface TurnUsage {
@@ -93,11 +98,24 @@ const SUMMARY_FILE = "_summary.json";
 const SUMMARY_TURN = "_summary";
 
 /**
- * Turn files are `<5-digit seq>-<stamp>.json` by construction (recordTurn).
+ * Turn files are `<5-digit seq>-<stamp>.json` by construction (recordTurn),
+ * optionally gzip-compressed to `…<stamp>.json.gz` by the background sweep.
  * Listing/enumeration matches this exact shape so the summary index (also a
  * `.json` file in the same dir) is never mistaken for a turn.
  */
-const TURN_FILE_RE = /^\d{5}-.*\.json$/;
+const TURN_FILE_RE = /^\d{5}-.*\.json(\.gz)?$/;
+
+/** Turn basename (filename without the `.json`/`.json.gz` extension). */
+function turnBasename(f: string): string {
+  return f.replace(/\.json(\.gz)?$/, "");
+}
+
+/** Background-compression sweep cadence. `unref()`'d; never blocks exit. */
+const COMPRESS_TICK_MS = 30_000;
+/** Per-sweep file/byte budgets: the initial backlog of a long-lived repo (tens
+ *  of GB) is chewed through incrementally without hogging the disk. */
+const COMPRESS_MAX_FILES_PER_SWEEP = 128;
+const COMPRESS_MAX_BYTES_PER_SWEEP = 256 * 1024 * 1024;
 
 /** Max turn files read concurrently while (re)building a session summary. */
 const SCAN_CONCURRENCY = 8;
@@ -175,7 +193,7 @@ async function mapLimit<T, R>(
 /** Extract the listing metadata from a parsed turn record. */
 function turnMetaOf(file: string, rec: TurnRecord): SessionTurnMeta {
   return {
-    turn: file.replace(/\.json$/, ""),
+    turn: turnBasename(file),
     model: rec.canonicalModel,
     requestedAt: rec.requestedAt,
     inputTokens: rec.usage?.inputTokens ?? 0,
@@ -252,6 +270,10 @@ export class LogStore {
   private readonly summaryLocks = new Map<string, Promise<void>>();
   /** Set by stop() so a dropped store (e.g. on hot-reload) stops recording. */
   private stopped = false;
+  /** Background compression (config-gated): min age + sweep timer + re-entry flag. */
+  private readonly compressionMinAgeMs: number;
+  private compressTimer: ReturnType<typeof setInterval> | null = null;
+  private sweeping = false;
 
   /** Cap the in-memory seq map so a long-lived process with many distinct
    *  sessions cannot grow it without bound (LRU by insertion recency). */
@@ -262,6 +284,11 @@ export class LogStore {
     this.systemPath = join(config.dir, config.systemDir);
     this.sessionPath = join(config.dir, config.sessionDir);
     this.captureTimeoutMs = config.captureTimeoutMs;
+    this.compressionMinAgeMs = config.compression.minAgeMinutes * 60_000;
+    if (config.enabled && config.compression.enabled) {
+      this.compressTimer = setInterval(() => void this.tickCompress(), COMPRESS_TICK_MS);
+      this.compressTimer.unref();
+    }
   }
 
   isEnabled(): boolean {
@@ -303,6 +330,10 @@ export class LogStore {
    */
   stop(): void {
     this.stopped = true;
+    if (this.compressTimer !== null) {
+      clearInterval(this.compressTimer);
+      this.compressTimer = null;
+    }
   }
 
   /**
@@ -340,14 +371,31 @@ export class LogStore {
   }
 
   /**
-   * Atomically write JSON: write to a unique temp file then rename over the
-   * target (rename is atomic on the same filesystem), so a crash mid-write can
-   * never leave a truncated/half-written JSON file for readers to trip over.
+   * Atomically write text or (compressed) binary data: write to a unique temp
+   * file then rename over the target (rename is atomic on the same
+   * filesystem), so a crash mid-write can never leave a truncated/half-written
+   * file for readers to trip over.
    */
-  private async writeJsonAtomic(file: string, data: string): Promise<void> {
+  private async writeAtomic(file: string, data: string | Uint8Array | Buffer): Promise<void> {
     const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
-    await writeFile(tmp, data);
+    // Normalize to a plain Uint8Array: Buffer's SharedArrayBuffer-typed backing
+    // is not assignable to writeFile's ArrayBufferView in current @types/node.
+    const payload = typeof data === "string" ? data : new Uint8Array(data);
+    await writeFile(tmp, payload);
     await rename(tmp, file);
+  }
+
+  /**
+   * Read a file into a Buffer, transparently decompressing gzip payloads
+   * (`.gz` filenames). All turn-file reads go through here so compression is
+   * invisible to every caller.
+   */
+  private async readBufferMaybeGz(file: string): Promise<Buffer> {
+    const buf = await readFile(file);
+    // new Uint8Array(buf) copies into a plain ArrayBuffer (the zlib InputType
+    // rejects Buffer's SharedArrayBuffer-backed view) — negligible vs the
+    // decompression itself, and keeps gzip off the event loop (thread pool).
+    return file.endsWith(".gz") ? await gunzipAsync(new Uint8Array(buf)) : buf;
   }
 
   /**
@@ -362,7 +410,7 @@ export class LogStore {
    */
   private async readJsonSafe<T>(file: string): Promise<T | null> {
     try {
-      const parsed = JSON.parse(await readFile(file, "utf-8")) as unknown;
+      const parsed = JSON.parse((await this.readBufferMaybeGz(file)).toString("utf-8")) as unknown;
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         logger.warn("log-store skipping malformed file (not a JSON object)", { file });
         return null;
@@ -417,7 +465,7 @@ export class LogStore {
             count: 1,
             system,
           };
-      await this.writeJsonAtomic(file, JSON.stringify(record, null, 2));
+      await this.writeAtomic(file, JSON.stringify(record, null, 2));
     } catch (err) {
       // A dropped system prompt is data loss — surface at error level.
       logger.error("log-store failed to record system prompt", { message: errorMessage(err) });
@@ -434,7 +482,7 @@ export class LogStore {
       const seqStr = String(this.bumpSeq(sid)).padStart(5, "0");
       const stamp = turn.requestedAt.replace(/[:.]/g, "-");
       const file = join(dir, `${seqStr}-${stamp}.json`);
-      await this.writeJsonAtomic(file, JSON.stringify(turn, null, 2));
+      await this.writeAtomic(file, JSON.stringify(turn, null, 2));
       await this.appendTurnSummary(dir, turnMetaOf(`${seqStr}-${stamp}.json`, turn));
     } catch (err) {
       // A dropped turn is data loss — surface at error level (with session id).
@@ -476,7 +524,7 @@ export class LogStore {
           fileCount: turnFiles.length,
           turns: [...existing.turns, meta],
         };
-        await this.writeJsonAtomic(summaryFile, JSON.stringify(summary, null, 2));
+        await this.writeAtomic(summaryFile, JSON.stringify(summary, null, 2));
         return;
       }
       // Slow path (first turn of a session, retry with the same filename,
@@ -490,7 +538,7 @@ export class LogStore {
         summary.turns.push(meta);
         summary.fileCount += 1;
       }
-      await this.writeJsonAtomic(summaryFile, JSON.stringify(summary, null, 2));
+      await this.writeAtomic(summaryFile, JSON.stringify(summary, null, 2));
     });
   }
 
@@ -514,18 +562,43 @@ export class LogStore {
     } catch {
       return { fileCount: 0, turns: [] };
     }
+    // A basename can exist in BOTH forms on disk: a recordTurn overwrite of an
+    // already-compressed turn (seq re-use after a restart), or a crash between
+    // the sweep's .gz rename and its .json unlink. The plain file is always
+    // the newer write (and the .gz payload is byte-identical to the pre-rename
+    // .json), so prefer it and drop the stale .gz — keeping both would inflate
+    // the file count, re-trip the drift check on every listing, and surface
+    // the turn twice.
+    const byBasename = new Map<string, string>();
+    for (const f of turnFiles) {
+      const base = turnBasename(f);
+      const prev = byBasename.get(base);
+      if (prev === undefined) {
+        byBasename.set(base, f);
+        continue;
+      }
+      const jsonName = f.endsWith(".gz") ? prev : f;
+      byBasename.set(base, jsonName);
+      const staleGz = join(dir, f.endsWith(".gz") ? f : prev);
+      try {
+        await unlink(staleGz);
+      } catch {
+        // best-effort: a failed unlink only costs one extra rescan later
+      }
+    }
+    const turnList = [...byBasename.values()].sort();
     const existing = parseSummaryFile(await this.readJsonSafe<unknown>(join(dir, SUMMARY_FILE)));
-    if (existing && existing.fileCount === turnFiles.length) return existing;
-    const metas = await mapLimit(turnFiles, SCAN_CONCURRENCY, async (f) => {
+    if (existing && existing.fileCount === turnList.length) return existing;
+    const metas = await mapLimit(turnList, SCAN_CONCURRENCY, async (f) => {
       const rec = await this.readJsonSafe<TurnRecord>(join(dir, f));
       return rec ? turnMetaOf(f, rec) : null;
     });
     const summary: SessionSummaryFile = {
-      fileCount: turnFiles.length,
+      fileCount: turnList.length,
       turns: metas.filter((m): m is SessionTurnMeta => m !== null),
     };
     try {
-      await this.writeJsonAtomic(join(dir, SUMMARY_FILE), JSON.stringify(summary, null, 2));
+      await this.writeAtomic(join(dir, SUMMARY_FILE), JSON.stringify(summary, null, 2));
     } catch (err) {
       // The in-memory result is still returned; only persistence failed —
       // the next listing rebuilds again (best-effort, like all log writes).
@@ -644,13 +717,15 @@ export class LogStore {
     return summary.turns;
   }
 
-  /** Read one turn's full record. */
+  /** Read one turn's full record (plain or background-compressed). */
   async getTurn(sessionId: string, turn: string): Promise<TurnRecord | null> {
     if (!this.enabled) return null;
     const dir = this.sessionDir(sessionId);
     if (turn === SUMMARY_TURN) return null;
     if (!/^[a-zA-Z0-9._-]+$/.test(turn)) return null;
-    return this.readJsonSafe<TurnRecord>(join(dir, `${turn}.json`));
+    const plain = await this.readJsonSafe<TurnRecord>(join(dir, `${turn}.json`));
+    if (plain !== null) return plain;
+    return this.readJsonSafe<TurnRecord>(join(dir, `${turn}.json.gz`));
   }
 
   /* ---------------- export (for ZIP download) ---------------- */
@@ -716,7 +791,9 @@ export class LogStore {
                 }
                 if (!requestedAt || Date.parse(requestedAt) < cutoff) return null;
               }
-              return { name: `sessions/${sid}/${f}`, content };
+              // ZIP members always carry the plain `.json` name and
+              // decompressed content, regardless of on-disk compression.
+              return { name: `sessions/${sid}/${f.replace(/\.gz$/, "")}`, content };
             }),
         );
         return entries.filter((e): e is { name: string; content: string } => e !== null);
@@ -725,10 +802,109 @@ export class LogStore {
     return perSession.flat();
   }
 
-  /** Read a file to a string, logging (not throwing) on non-ENOENT failure. */
+  /* ---------------- background compression ---------------- */
+
+  /** Timer tick: skip when stopped or a previous sweep is still running. */
+  private async tickCompress(): Promise<void> {
+    if (this.stopped || this.sweeping) return;
+    this.sweeping = true;
+    try {
+      const { files, bytes } = await this.sweepCompress();
+      if (files > 0) logger.debug("log-store compressed turn files", { files, bytes });
+    } catch (err) {
+      // Best-effort like every log operation; the next tick retries.
+      logger.warn("log-store compression sweep failed", { message: errorMessage(err) });
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  /**
+   * Compress plain turn files to `.json.gz`, oldest work first encountered,
+   * within per-sweep file/byte budgets. Also eats the pre-compression backlog
+   * of an existing logs dir incrementally (tens of GB across many ticks).
+   * Each file is compressed under the per-session summary lock and atomically
+   * (tmp+rename of the `.gz`, then unlink of the plain file), so a concurrent
+   * listing or index rebuild never observes the both-forms intermediate state.
+   */
+  async sweepCompress(opts?: {
+    minAgeMs?: number;
+    maxFiles?: number;
+    maxBytes?: number;
+  }): Promise<{ files: number; bytes: number }> {
+    const result = { files: 0, bytes: 0 };
+    if (!this.enabled) return result;
+    const minAgeMs = opts?.minAgeMs ?? this.compressionMinAgeMs;
+    let filesLeft = opts?.maxFiles ?? COMPRESS_MAX_FILES_PER_SWEEP;
+    let bytesLeft = opts?.maxBytes ?? COMPRESS_MAX_BYTES_PER_SWEEP;
+    const cutoff = Date.now() - minAgeMs;
+    let sessionDirs: string[];
+    try {
+      sessionDirs = await readdir(this.sessionPath);
+    } catch {
+      return result;
+    }
+    for (const sid of sessionDirs) {
+      if (filesLeft <= 0 || bytesLeft <= 0) break;
+      const dir = join(this.sessionPath, sid);
+      let files: string[];
+      try {
+        files = await readdir(dir);
+      } catch {
+        continue; // not a session dir (or unreadable): skip, keep walking
+      }
+      for (const f of files) {
+        if (filesLeft <= 0 || bytesLeft <= 0) break;
+        if (!f.endsWith(".json") || !TURN_FILE_RE.test(f)) continue;
+        const file = join(dir, f);
+        let size = 0;
+        try {
+          const st = await stat(file);
+          if (st.mtimeMs > cutoff) continue;
+          size = st.size;
+        } catch {
+          continue;
+        }
+        // Lock on the resolved dir — the same key listTurns/appendTurnSummary
+        // use — so compression serializes with listings and index writes.
+        const ok = await runLocked(this.summaryLocks, resolve(dir), () =>
+          this.compressTurnFile(dir, f),
+        );
+        if (ok) {
+          result.files += 1;
+          result.bytes += size;
+          filesLeft -= 1;
+          bytesLeft -= size;
+        }
+      }
+    }
+    return result;
+  }
+
+  /** Gzip one turn file in place: atomic `.gz` write, then unlink the plain
+   *  file. Contents are byte-identical before/after, so any crash window (both
+   *  forms on disk) is resolved losslessly by the listing's prefer-.json dedup. */
+  private async compressTurnFile(dir: string, file: string): Promise<boolean> {
+    const plain = join(dir, file);
+    try {
+      const buf = await readFile(plain);
+      await this.writeAtomic(`${plain}.gz`, await gzipAsync(new Uint8Array(buf)));
+      await unlink(plain);
+      return true;
+    } catch (err) {
+      logger.warn("log-store failed to compress turn file", {
+        file: plain,
+        message: errorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /** Read a file to a string (gzip-transparent), logging (not throwing) on
+   *  non-ENOENT failure. */
   private async readTextSafe(file: string): Promise<string | null> {
     try {
-      return await readFile(file, "utf-8");
+      return (await this.readBufferMaybeGz(file)).toString("utf-8");
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") {

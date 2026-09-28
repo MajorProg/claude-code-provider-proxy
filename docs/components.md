@@ -295,8 +295,9 @@ for best-effort diagnostics. Never logs secrets — callers pass identifiers onl
 `LogStore` persists, when enabled, deduplicated system prompts (by sha256 hash)
 and per-turn session files. Types: `TurnRecord`, `TurnUsage`, `SystemPromptMeta`.
 Every method is a no-op when logging is disabled; writes are best-effort. Writes
-go through `writeJsonAtomic` (write to a unique temp file then `rename` over the
-target, so a crash mid-write can never leave a truncated JSON file for readers).
+go through `writeAtomic` (write to a unique temp file then `rename` over the
+target, so a crash mid-write can never leave a truncated/half-written file for
+readers).
 `stop()` (idempotent) marks the store stopped so `isEnabled()` returns false and
 `record*` calls become no-ops — called on hot-reload before the replacement
 runtime swaps in, mirroring `CatalogManager.stop()`; in-flight writes settle.
@@ -304,7 +305,12 @@ A per-session `_summary.json` index (mirrored on every `recordTurn`) serves the
 listing endpoints (`listSessions`/`listTurns`) from lightweight metadata instead
 of turn-file bodies, which total many GB on a long-lived deployment and OOM the
 process when read per request; a bounded-concurrency rebuild backfills sessions
-recorded before the index existed and heals count drift.
+recorded before the index existed and heals count drift. Turn files are
+gzip-compressed in the background (`.json` -> `.json.gz`, config-gated via
+`logging.compression`, age-bounded and budgeted per sweep so a pre-existing
+multi-GB backlog is compressed incrementally); all readers (listings, `getTurn`,
+ZIP export) decompress transparently, and a basename found in both forms
+resolves to the plain file (the newer write) with the stale `.gz` dropped.
 
 ### `logging/capture.ts`
 `captureTurn` builds a `TurnRecord` from a proxy `Response`. For streaming, it
