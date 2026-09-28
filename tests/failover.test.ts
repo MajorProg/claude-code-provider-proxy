@@ -781,6 +781,12 @@ describe("z.ai 1210 conversion-bug failover", () => {
 });
 
 describe("quota-reset-aware cooldown (z.ai 1310)", () => {
+  // The reset stamp is computed relative to now (3 days out) so the fixture
+  // never rots: a hardcoded date eventually falls inside the 24h cooldown
+  // clamp and flips the expected expiry from now+24h to the stamp itself.
+  // Seconds-precision (the z.ai stamp has no ms) so the parsed epoch is exact.
+  const resetAt = new Date((Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60) * 1000);
+  const stamp = resetAt.toISOString().slice(0, 19).replace("T", " "); // z.ai format
   const ZAI_429_RESET = {
     status: 429,
     json: {
@@ -788,8 +794,7 @@ describe("quota-reset-aware cooldown (z.ai 1310)", () => {
       error: {
         type: "rate_limit_error",
         code: "1310",
-        message:
-          "[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-13 15:29:17][x]",
+        message: `[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at ${stamp}][x]`,
       },
     },
   };
@@ -798,7 +803,7 @@ describe("quota-reset-aware cooldown (z.ai 1310)", () => {
     const { parseQuotaResetAt } = await import("../src/failover.ts");
     const body = ZAI_429_RESET.json.error?.message ?? "";
     const parsed = parseQuotaResetAt(body);
-    expect(parsed).toBe(Date.parse("2026-09-13T15:29:17Z"));
+    expect(parsed).toBe(Date.parse(resetAt.toISOString()));
     expect(parseQuotaResetAt("[429] slow down")).toBeUndefined();
     expect(parseQuotaResetAt("reset at not-a-date")).toBeUndefined();
   });
