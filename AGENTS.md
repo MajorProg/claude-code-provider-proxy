@@ -274,7 +274,14 @@ when wiring or debugging a provider.
   capped by `maxFailoverAttempts` (default 4), always primary first — except
   keys in the cross-request 429 cooldown (`CredentialCooldownStore` — TTL is
   the quota-reset time parsed from the 429 body when present (z.ai 1310
-  "limit will reset at", clamped to 24h), else 5 min; survives hot-reloads). The serving key's LABEL is logged + stored in
+  "limit will reset at", clamped to 24h), else 5 min ±45s per-key jitter so a
+  benched herd reinstates staggered, not as a synchronized burst; survives
+  hot-reloads). When EVERY usable key of every routable candidate is cooled,
+  the request answers **429 `rate_limit_error` + `Retry-After`** (the real
+  remaining window to the earliest reinstatement) — never a 404: z.ai's rate
+  shaping is ACCOUNT-scoped, so one burst benches the whole pool within
+  ~90s while the provider's dashboard still looks healthy (live-verified
+  2026-10-03/04, three same-key marks within 24 ms on cooldown expiry). The serving key's LABEL is logged + stored in
   `TurnRecord.servingKeyLabel` — never the key value. `servingChangePing`
   (config, default off) additionally emits a terminal BEL + marked warn line
   when the serving account CHANGES across requests (failover/cooldown

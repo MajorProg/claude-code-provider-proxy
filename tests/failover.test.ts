@@ -12,7 +12,12 @@
 import { describe, expect, test } from "bun:test";
 import { type ProxyConfig, validateConfig } from "../src/config.ts";
 import { UpstreamError } from "../src/errors.ts";
-import { CredentialCooldownStore, isContextTooLong } from "../src/failover.ts";
+import {
+  COOLDOWN_JITTER_MS,
+  COOLDOWN_MS,
+  CredentialCooldownStore,
+  isContextTooLong,
+} from "../src/failover.ts";
 import { Catalog } from "../src/model/catalog.ts";
 import { type Runtime, createFetchHandler } from "../src/server.ts";
 import { type FetchMock, installFetchMock } from "./helpers/fetch-mock.ts";
@@ -534,10 +539,12 @@ describe("cross-request 429 cooldown (CredentialCooldownStore)", () => {
     store.clear();
   });
 
-  test("a DIRECT model id whose provider is fully cooled gets a clean 404, not a 500", async () => {
+  test("a DIRECT model id whose provider is fully cooled gets a retryable 429 + Retry-After", async () => {
     const store = new CredentialCooldownStore();
-    store.mark("zai", "primary");
-    store.mark("zai", "secondary");
+    // Deterministic jitter (rng=0 → COOLDOWN_MS − jitter) so the expected
+    // Retry-After window is exact.
+    store.mark("zai", "primary", undefined, () => 0);
+    store.mark("zai", "secondary", undefined, () => 0);
     const mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
     try {
       const res = await poolHandlerWithStore(store)(
@@ -547,10 +554,44 @@ describe("cross-request 429 cooldown (CredentialCooldownStore)", () => {
           messages: [{ role: "user", content: "hi" }],
         }),
       );
-      expect(res.status).toBe(404);
+      // A cooldown is a RATE LIMIT, never a 404: clients retry 429s with
+      // backoff but treat 404 as fatal (live lesson 2026-10-03/04).
+      expect(res.status).toBe(429);
       expect(mock.requests).toHaveLength(0);
-      const body = (await res.json()) as { error?: { message?: string } };
+      const body = (await res.json()) as { error?: { type?: string; message?: string } };
+      expect(body.error?.type).toBe("rate_limit_error");
       expect(body.error?.message).toContain("cooldown");
+      expect(body.error?.message).toContain("zai");
+      const retryAfter = Number(res.headers.get("retry-after"));
+      const expected = Math.ceil((COOLDOWN_MS - COOLDOWN_JITTER_MS) / 1000);
+      expect(retryAfter).toBeGreaterThanOrEqual(expected - 2);
+      expect(retryAfter).toBeLessThanOrEqual(expected);
+    } finally {
+      mock.restore();
+    }
+    store.clear();
+  });
+
+  test("a fully-cooled TIER answers 429 naming every cooled provider (the 2026-10-04 incident shape)", async () => {
+    const store = new CredentialCooldownStore();
+    store.mark("zai", "primary", undefined, () => 0); // ~255s — the earliest
+    store.mark("zai", "secondary", undefined, () => 0.5); // ~300s
+    store.mark("alibaba", "default", undefined, () => 1); // ~345s
+    const mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await poolHandlerWithStore(store)(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(429);
+      expect(mock.requests).toHaveLength(0); // nothing burned on known-benched keys
+      const body = (await res.json()) as { error?: { type?: string; message?: string } };
+      expect(body.error?.type).toBe("rate_limit_error");
+      expect(body.error?.message).toContain("zai");
+      expect(body.error?.message).toContain("alibaba");
+      // Retry-After reflects the EARLIEST reinstatement (zai primary, ~255s).
+      const retryAfter = Number(res.headers.get("retry-after"));
+      expect(retryAfter).toBeGreaterThanOrEqual(253);
+      expect(retryAfter).toBeLessThanOrEqual(255);
     } finally {
       mock.restore();
     }
@@ -865,8 +906,60 @@ describe("quota-reset-aware cooldown (z.ai 1310)", () => {
     }
     const until = store.degradedUntil("zai", "primary");
     expect(until).toBeDefined();
-    expect(until ?? 0).toBeGreaterThan(Date.now() + 4 * 60 * 1000);
-    expect(until ?? 0).toBeLessThanOrEqual(Date.now() + 5 * 60 * 1000 + 10);
+    // Blind cooldown is jittered ±45s (herd desynchronization).
+    expect(until ?? 0).toBeGreaterThan(Date.now() + COOLDOWN_MS - COOLDOWN_JITTER_MS);
+    expect(until ?? 0).toBeLessThanOrEqual(Date.now() + COOLDOWN_MS + COOLDOWN_JITTER_MS + 10);
+    store.clear();
+  });
+});
+
+// ── cooldown jitter + earliest reinstatement ─────────────────────────────────
+
+describe("cooldown jitter (herd desynchronization)", () => {
+  test("rng extremes pin the blind cooldown to ±COOLDOWN_JITTER_MS", () => {
+    const store = new CredentialCooldownStore();
+    store.mark("p", "lo", undefined, () => 0);
+    store.mark("p", "hi", undefined, () => 1);
+    const now = Date.now();
+    const lo = store.degradedUntil("p", "lo") ?? 0;
+    const hi = store.degradedUntil("p", "hi") ?? 0;
+    expect(lo).toBeGreaterThanOrEqual(now + COOLDOWN_MS - COOLDOWN_JITTER_MS - 5);
+    expect(lo).toBeLessThanOrEqual(now + COOLDOWN_MS - COOLDOWN_JITTER_MS + 5);
+    expect(hi).toBeGreaterThanOrEqual(now + COOLDOWN_MS + COOLDOWN_JITTER_MS - 5);
+    expect(hi).toBeLessThanOrEqual(now + COOLDOWN_MS + COOLDOWN_JITTER_MS + 5);
+    store.clear();
+  });
+
+  test("default rng stays inside the jitter bounds", () => {
+    const store = new CredentialCooldownStore();
+    store.mark("p", "k");
+    const until = store.degradedUntil("p", "k") ?? 0;
+    const now = Date.now();
+    expect(until).toBeGreaterThanOrEqual(now + COOLDOWN_MS - COOLDOWN_JITTER_MS);
+    expect(until).toBeLessThanOrEqual(now + COOLDOWN_MS + COOLDOWN_JITTER_MS);
+    store.clear();
+  });
+
+  test("a parsed quota-reset stamp stays EXACT (jitter not applied)", () => {
+    const store = new CredentialCooldownStore();
+    const resetAt = Date.now() + 60 * 60 * 1000; // 1h out (inside the 24h clamp)
+    store.mark("p", "k", resetAt, () => 1); // rng=1 would add +45s if misapplied
+    const until = store.degradedUntil("p", "k") ?? 0;
+    expect(until).toBeGreaterThanOrEqual(resetAt + 60_000 - 10);
+    expect(until).toBeLessThanOrEqual(resetAt + 60_000 + 10);
+    store.clear();
+  });
+
+  test("earliestReinstatementMs = min over the named providers' keys; unknown → undefined", () => {
+    const store = new CredentialCooldownStore();
+    store.mark("a", "1", undefined, () => 0); // ~255s — earliest
+    store.mark("a", "2", undefined, () => 1); // ~345s
+    store.mark("b", "1", undefined, () => 0.5); // ~300s
+    const ms = store.earliestReinstatementMs(["a", "b"]);
+    expect(ms).toBeDefined();
+    expect(ms ?? 0).toBeGreaterThanOrEqual(COOLDOWN_MS - COOLDOWN_JITTER_MS - 2000);
+    expect(ms ?? 0).toBeLessThanOrEqual(COOLDOWN_MS - COOLDOWN_JITTER_MS + 2000);
+    expect(store.earliestReinstatementMs(["nonexistent"])).toBeUndefined();
     store.clear();
   });
 });

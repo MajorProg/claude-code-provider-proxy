@@ -161,7 +161,11 @@ export function errorResponse(
       // Client/routing errors (4xx) are expected — warn without a stack.
       logger.warn("request error", base);
     }
-    return Response.json(err.toAnthropicBody(), { status: err.status });
+    const headers = err.responseHeaders();
+    return Response.json(
+      err.toAnthropicBody(),
+      headers !== undefined ? { status: err.status, headers } : { status: err.status },
+    );
   }
   // Unexpected (non-ProxyError) errors — log at error with the full stack.
   // SEC-7: never surface raw `err.message` to the client (it can leak internal

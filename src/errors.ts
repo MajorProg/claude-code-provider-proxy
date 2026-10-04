@@ -12,6 +12,7 @@
 export type ProxyErrorType =
   | "authentication_error"
   | "invalid_request_error"
+  | "rate_limit_error"
   | "not_found_error"
   | "api_error"
   | "config_error";
@@ -38,6 +39,14 @@ export class ProxyError extends Error {
   /** Render as an Anthropic-style error body. */
   toAnthropicBody(): { type: "error"; error: { type: ProxyErrorType; message: string } } {
     return { type: "error", error: { type: this.type, message: this.message } };
+  }
+
+  /**
+   * Extra response headers for the error rendering (e.g. Retry-After on a
+   * rate limit). Subclasses override; the base renders none.
+   */
+  responseHeaders(): Record<string, string> | undefined {
+    return undefined;
   }
 }
 
@@ -96,6 +105,37 @@ export class UnsupportedProviderError extends ProxyError {
 export class ProviderDisabledError extends ProxyError {
   constructor(provider: string, reason: string) {
     super(404, "not_found_error", `Provider "${provider}" is disabled: ${reason}`);
+  }
+}
+
+/**
+ * 429 — every usable credential of the routable candidates is sitting in the
+ * cross-request 429 cooldown. The provider is not missing, it is temporarily
+ * saturated, so this renders as a RATE LIMIT (with Retry-After), never as a
+ * 404: Anthropic-shaped clients (Claude Code) retry 429s with backoff but
+ * treat 404 as fatal — a cooldown answered as 404 turns a ~5-minute rate
+ * window into an operator-visible outage (live 2026-10-03/04, z.ai
+ * account-scoped shaping benching every pool key within 87s).
+ */
+export class ProviderCooldownError extends ProxyError {
+  readonly retryAfterMs: number | undefined;
+
+  constructor(providers: readonly string[], retryAfterMs?: number) {
+    const names = providers.map((p) => `"${p}"`).join(", ");
+    const seconds =
+      retryAfterMs !== undefined ? Math.max(1, Math.ceil(retryAfterMs / 1000)) : undefined;
+    const window = seconds !== undefined ? `; earliest key reinstates in ~${seconds}s` : "";
+    super(
+      429,
+      "rate_limit_error",
+      `Provider ${names} rate-limited: all credential-pool keys are in 429 cooldown${window} — safe to retry with backoff`,
+    );
+    this.retryAfterMs = retryAfterMs;
+  }
+
+  override responseHeaders(): Record<string, string> | undefined {
+    if (this.retryAfterMs === undefined) return undefined;
+    return { "Retry-After": String(Math.max(1, Math.ceil(this.retryAfterMs / 1000))) };
   }
 }
 

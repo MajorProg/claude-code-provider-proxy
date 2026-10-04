@@ -26,7 +26,12 @@
  * cooldown expires automatically via a TTL map; no restart is needed.
  */
 import type { CredentialPoolEntry, ProxyConfig } from "./config.ts";
-import { BadRequestError, ProviderDisabledError, UpstreamError } from "./errors.ts";
+import {
+  BadRequestError,
+  ProviderCooldownError,
+  ProviderDisabledError,
+  UpstreamError,
+} from "./errors.ts";
 import { UpstreamRequestError } from "./http/upstream.ts";
 import { errorMessage, logger } from "./logging/logger.ts";
 import {
@@ -42,7 +47,16 @@ import { type RouteTarget, VIRTUAL_PROVIDER, route, routeCandidates } from "./ro
 const FAILOVER_STATUSES: readonly number[] = [401, 403, 429];
 
 /** How long (ms) a key is held out of rotation after receiving a 429. */
-const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+export const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+/**
+ * Per-key jitter on the blind cooldown (±this many ms). Without it, keys
+ * benched by one burst all reinstate at the same instant and the queued
+ * request herd hits a single key simultaneously — re-tripping an
+ * account-scoped rate limit (live 2026-10-03 16:22:58: three marks for the
+ * same key within 24 ms). Jitter spreads reinstatements. NOT applied to a
+ * parsed quota-reset time (that one is exact by definition).
+ */
+export const COOLDOWN_JITTER_MS = 45 * 1000;
 /**
  * Upper bound for a cooldown, even when the 429 body names a later reset
  * time: a renewed/changed plan gets re-probed within a day at the latest.
@@ -88,14 +102,16 @@ export class CredentialCooldownStore {
    * Mark a (provider, label) pair as degraded. `resetAtMs` (epoch ms, parsed
    * from the 429 body) makes the cooldown expire exactly then — clamped to
    * [0, MAX_COOLDOWN_MS]; a past/reset-imminent time falls back to the plain
-   * 5-minute cooldown.
+   * 5-minute cooldown. The blind default carries per-key jitter so keys
+   * benched by one burst reinstate at staggered times instead of as a herd.
+   * `rng` is injectable for deterministic tests (defaults to Math.random).
    */
-  mark(provider: string, label: string, resetAtMs?: number): void {
+  mark(provider: string, label: string, resetAtMs?: number, rng: () => number = Math.random): void {
     const key = `${provider}:${label}`;
     const existing = this.timers.get(key);
     if (existing !== undefined) clearTimeout(existing);
     const now = Date.now();
-    let ttl = COOLDOWN_MS;
+    let ttl = COOLDOWN_MS + (rng() - 0.5) * 2 * COOLDOWN_JITTER_MS;
     if (resetAtMs !== undefined) {
       const parsed = resetAtMs + RESET_MARGIN_MS - now;
       if (parsed > 0) ttl = Math.min(parsed, MAX_COOLDOWN_MS);
@@ -113,7 +129,7 @@ export class CredentialCooldownStore {
     logger.warn("credential marked degraded (429 cooldown)", {
       provider,
       keyLabel: label,
-      cooldownMs: ttl,
+      cooldownMs: Math.round(ttl),
       ...(resetAtMs !== undefined ? { quotaResetAt: new Date(resetAtMs).toISOString() } : {}),
     });
   }
@@ -126,6 +142,25 @@ export class CredentialCooldownStore {
   /** Epoch ms when this pair's cooldown expires, or undefined when clean. */
   degradedUntil(provider: string, label: string): number | undefined {
     return this.expiries.get(`${provider}:${label}`);
+  }
+
+  /**
+   * Milliseconds until the earliest of the named providers' degraded keys
+   * reinstates (min over their expiries, floor 0), or undefined when none of
+   * them is degraded. Feeds ProviderCooldownError's Retry-After with the REAL
+   * remaining window — never a static "retry shortly".
+   */
+  earliestReinstatementMs(providers: Iterable<string>): number | undefined {
+    let earliest: number | undefined;
+    for (const provider of providers) {
+      const prefix = `${provider}:`;
+      for (const [key, at] of this.expiries) {
+        if (!key.startsWith(prefix)) continue;
+        const remaining = at - Date.now();
+        if (earliest === undefined || remaining < earliest) earliest = remaining;
+      }
+    }
+    return earliest === undefined ? undefined : Math.max(0, earliest);
   }
 
   /** Clear all cooldowns (used in tests to reset state between cases). */
@@ -251,8 +286,9 @@ interface Attempt {
  * caller's exec via the entry (undefined = mint/handle externally).
  *
  * Entries currently in cooldown are skipped; if ALL entries for a target are
- * degraded the target itself is skipped (produces a log warning). This keeps
- * the attempt count predictable and avoids wasting the cap on known-bad keys.
+ * degraded the target itself is skipped (produces a log warning and records
+ * the provider in `cooledProviders`). This keeps the attempt count
+ * predictable and avoids wasting the cap on known-bad keys.
  */
 function buildAttempts(
   config: ProxyConfig,
@@ -260,7 +296,7 @@ function buildAttempts(
   id: CanonicalId,
   maxAttempts: number,
   cooldownStore?: CredentialCooldownStore | undefined,
-): Attempt[] {
+): { attempts: Attempt[]; cooledProviders: Set<string> } {
   const tierEntries =
     id.provider === VIRTUAL_PROVIDER ? (config.virtualModels?.[id.nativeModelId] ?? []) : null;
   // Per-candidate REAL canonical id (tier entry string, or the request's own
@@ -279,6 +315,7 @@ function buildAttempts(
   }
 
   const attempts: Attempt[] = [];
+  const cooledProviders = new Set<string>();
   for (let t = 0; t < targets.length; t++) {
     const target = targets[t] as RouteTarget;
     const sourceId = sourceIds[t] ?? formatCanonicalId(id);
@@ -294,9 +331,11 @@ function buildAttempts(
           continue;
         }
         attempts.push({ target, entry, sourceId });
-        if (attempts.length >= maxAttempts) return attempts.slice(0, maxAttempts);
+        if (attempts.length >= maxAttempts)
+          return { attempts: attempts.slice(0, maxAttempts), cooledProviders };
       }
       if (skipped > 0 && skipped === target.credentials.length) {
+        cooledProviders.add(target.provider);
         logger.warn("all credentials for provider are in cooldown, skipping candidate", {
           provider: target.provider,
           model: target.invocationId,
@@ -304,10 +343,11 @@ function buildAttempts(
       }
     } else {
       attempts.push({ target, entry: undefined, sourceId });
-      if (attempts.length >= maxAttempts) return attempts.slice(0, maxAttempts);
+      if (attempts.length >= maxAttempts)
+        return { attempts: attempts.slice(0, maxAttempts), cooledProviders };
     }
   }
-  return attempts.slice(0, maxAttempts);
+  return { attempts: attempts.slice(0, maxAttempts), cooledProviders };
 }
 
 /**
@@ -334,7 +374,7 @@ export async function executeWithFailover(opts: {
   cooldownStore?: CredentialCooldownStore | undefined;
 }): Promise<FailoverOutcome> {
   const { config, catalog, canonicalId, signal, exec, cooldownStore } = opts;
-  let attempts = buildAttempts(
+  let { attempts, cooledProviders } = buildAttempts(
     config,
     catalog,
     canonicalId,
@@ -353,9 +393,22 @@ export async function executeWithFailover(opts: {
     if (opts.countTokensOnly) {
       throw new BadRequestError("count_tokens is not supported for this backend/model");
     }
+    // An empty plan caused by cooldowns is a RATE LIMIT, not a missing
+    // provider: every usable key of every routable candidate is benched and
+    // will reinstate on its own. Answer 429 + Retry-After (real remaining
+    // window) so Anthropic-shaped clients back off and retry — a 404 here
+    // turns a minutes-long rate window into a fatal, operator-visible
+    // outage (live 2026-10-03/04: z.ai account-scoped shaping benched all
+    // three pool keys within 87s and every request 404'd until a restart).
+    if (cooledProviders.size > 0 && cooldownStore !== undefined) {
+      throw new ProviderCooldownError(
+        [...cooledProviders],
+        cooldownStore.earliestReinstatementMs(cooledProviders),
+      );
+    }
     const t = route(config, catalog, canonicalId);
-    // route() succeeded, yet the plan is empty: every usable pool key of the
-    // (first available) target is sitting in 429 cooldown. Actionable 404,
+    // route() succeeded, yet the plan is empty without cooldown involvement
+    // (e.g. an unlabeled pool that cooldown tracking skips). Actionable 404,
     // not an opaque 500.
     throw new ProviderDisabledError(
       t.provider,
