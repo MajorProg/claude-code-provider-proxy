@@ -217,6 +217,15 @@ export interface ExternalProviderConfig {
    */
   readonly strictTools?: boolean;
   /**
+   * True when every key in this provider's pool belongs to the SAME upstream
+   * account (e.g. one z.ai plan with several API keys). When set, a 429 whose
+   * body proves an account-level block (a parsed quota-reset stamp — z.ai
+   * 1308/1310/1316-1321 — or the Fair-Usage 1313 signature) benches the WHOLE
+   * pool at once instead of one 429 per key. Leave unset for pools spanning
+   * multiple accounts: a per-key 429 there really is per-key.
+   */
+  readonly accountScoped?: boolean;
+  /**
    * Discovery endpoint (an OpenAI-style `/models` URL). Model IDs are fetched
    * from here at runtime — NO model ids are ever hardcoded in source or config
    * (DESIGN §7). This is a discovery endpoint, exactly like Bedrock's control
@@ -953,6 +962,11 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     inactiveReason ??= `${where} credential pool is empty (unset env ref?) — provider inactive`;
   }
 
+  assert(
+    raw.accountScoped === undefined || typeof raw.accountScoped === "boolean",
+    `${where}.accountScoped must be a boolean`,
+  );
+
   return {
     type: ptype as "anthropic" | "openai",
     credential: credentials.length > 0 ? (credentials[0] as CredentialPoolEntry).credential : "",
@@ -965,6 +979,7 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     ...(typeof raw.region === "string" ? { region: raw.region } : {}),
     countTokens: raw.countTokens === true,
     ...(raw.strictTools === true ? { strictTools: true } : {}),
+    ...(raw.accountScoped === true ? { accountScoped: true } : {}),
     modelsUrl,
     ...(regions !== undefined ? { regions } : {}),
     ...(inactiveReason !== undefined ? { inactiveReason } : {}),
@@ -1467,6 +1482,7 @@ export function serializeConfig(
       ...(p.region !== undefined ? { region: p.region } : {}),
       countTokens: p.countTokens,
       ...(p.strictTools ? { strictTools: true } : {}),
+      ...(p.accountScoped ? { accountScoped: true } : {}),
       ...(p.modelsUrl !== "" || p.regions === undefined ? { modelsUrl: embed(p.modelsUrl) } : {}),
       ...(regions ? { regions } : {}),
     };

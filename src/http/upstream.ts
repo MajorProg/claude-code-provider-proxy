@@ -136,6 +136,17 @@ export interface PostJsonOptions {
    * processing occurred.
    */
   retryTransientStatus?: boolean;
+  /**
+   * Whether a 429 is retried in place (default `true`). Message-path callers
+   * pass `false` so 429s are owned by the failover engine instead: a 429 is the
+   * upstream's DECISION about this credential/account (quota, rate shaping —
+   * z.ai 1302/1308/1310/1313), not a transport hiccup, and re-sending the same
+   * body on the same key just hammers the rate limiter (up to 3 fetches per key
+   * × every pool key when the limit is account-scoped). The engine advances to
+   * the next key/candidate and starts the cooldown — strictly more available
+   * than sleeping on a throttled account. 5xx retries are unaffected.
+   */
+  retryRateLimit?: boolean;
 }
 
 /**
@@ -158,6 +169,7 @@ export async function postJson(
   const maxRetries = options.maxRetries ?? 2;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIME_TO_HEADERS_MS;
   const retryTransientStatus = options.retryTransientStatus ?? true;
+  const retryRateLimit = options.retryRateLimit ?? true;
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // If the client already went away, stop before spending another attempt.
@@ -186,7 +198,13 @@ export async function postJson(
       // Headers arrived — stop the time-to-headers timer immediately so it can
       // never fire against the streaming body that follows.
       clearTimeout(timer);
-      if (isTransientStatus(res.status) && retryTransientStatus && attempt < maxRetries) {
+      const rateLimited = res.status === 429 && !retryRateLimit;
+      if (
+        isTransientStatus(res.status) &&
+        !rateLimited &&
+        retryTransientStatus &&
+        attempt < maxRetries
+      ) {
         // PC3: honor a server-provided Retry-After (capped) over our own
         // backoff. Falls back to jittered backoff when the header is absent.
         const retryAfterMs = parseRetryAfter(res.headers.get("retry-after"));

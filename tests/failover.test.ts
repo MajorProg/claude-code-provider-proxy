@@ -29,7 +29,7 @@ const ZAI_POOL = [
   { credential: "secondary-key", label: "secondary" },
 ];
 
-function makeConfig(maxFailoverAttempts?: number): ProxyConfig {
+function makeConfig(maxFailoverAttempts?: number, zaiAccountScoped?: boolean): ProxyConfig {
   return validateConfig({
     server: { host: "127.0.0.1", port: 8787 },
     inboundAuth: { keys: [KEY] },
@@ -42,6 +42,7 @@ function makeConfig(maxFailoverAttempts?: number): ProxyConfig {
       zai: {
         type: "anthropic",
         credentials: ZAI_POOL,
+        ...(zaiAccountScoped ? { accountScoped: true } : {}),
         auth: "bearer",
         baseUrl: "https://api.z.ai/api/anthropic",
         countTokens: true,
@@ -147,6 +148,29 @@ describe("pre-stream failover via createFetchHandler", () => {
         "https://api.z.ai/api/anthropic/v1/messages",
         "https://dashscope-intl.aliyuncs.com/apps/anthropic/v1/messages",
       ]);
+      expect(mock.requests[2]?.headers["x-api-key"]).toBe("alibaba-key");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("non-streaming 429: exactly ONE fetch per attempt (postJson no longer absorbs it)", async () => {
+    // A 429 is the upstream's decision about the credential/account, so the
+    // engine advances immediately instead of re-sending the body on the same
+    // key (which would hammer the rate limiter up to 3x per pool key).
+    const mock = installFetchMock([
+      { status: 429, json: {} },
+      { status: 429, json: {} },
+      { status: 200, json: ANTHROPIC_OK },
+    ]);
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      // zai primary, zai secondary, alibaba — one fetch each, NOT 2 internal
+      // retries on top of every attempt.
+      expect(mock.requests).toHaveLength(3);
       expect(mock.requests[2]?.headers["x-api-key"]).toBe("alibaba-key");
     } finally {
       mock.restore();
@@ -312,6 +336,13 @@ describe("isContextTooLong", () => {
     expect(isContextTooLong(err400("prompt is too long for this model"))).toBe(true);
   });
 
+  test("z.ai 1261 'Prompt too long' matches (documented wording has no 'is')", () => {
+    expect(isContextTooLong(err400('{"error":{"code":"1261","message":"Prompt too long"}}'))).toBe(
+      true,
+    );
+    expect(isContextTooLong(err400("[1261][Prompt too long][x]"))).toBe(true);
+  });
+
   test("'too many tokens' message matches", () => {
     expect(isContextTooLong(err400("too many tokens in input"))).toBe(true);
   });
@@ -385,6 +416,36 @@ describe("context-too-long failover", () => {
       expect(mock.requests[0]?.url).toBe("https://api.z.ai/api/anthropic/v1/messages");
       expect(mock.requests[1]?.url).toBe("https://api.z.ai/api/anthropic/v1/messages");
       expect(mock.requests[1]?.headers.authorization).toBe("Bearer secondary-key");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("z.ai 1261 'Prompt too long' 400 advances to the next candidate", async () => {
+    const ZAI_1261 = {
+      status: 400,
+      json: {
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          code: "1261",
+          message: "[1261][Prompt too long][x]",
+        },
+      },
+    };
+    const mock = installFetchMock([ZAI_1261, ZAI_1261, { status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handler()(
+        postMessages({ model: TIER, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }),
+      );
+      expect(res.status).toBe(200);
+      // Both zai keys reject with the documented context-length wording, then
+      // the alibaba candidate (larger window) serves.
+      expect(mock.requests.map((r) => r.url)).toEqual([
+        "https://api.z.ai/api/anthropic/v1/messages",
+        "https://api.z.ai/api/anthropic/v1/messages",
+        "https://dashscope-intl.aliyuncs.com/apps/anthropic/v1/messages",
+      ]);
     } finally {
       mock.restore();
     }
@@ -960,6 +1021,135 @@ describe("cooldown jitter (herd desynchronization)", () => {
     expect(ms ?? 0).toBeGreaterThanOrEqual(COOLDOWN_MS - COOLDOWN_JITTER_MS - 2000);
     expect(ms ?? 0).toBeLessThanOrEqual(COOLDOWN_MS - COOLDOWN_JITTER_MS + 2000);
     expect(store.earliestReinstatementMs(["nonexistent"])).toBeUndefined();
+    store.clear();
+  });
+});
+
+// ── account-scoped 429 (provider accountScoped: true) ────────────────────────
+
+describe("account-scoped 429 cooldown (provider accountScoped)", () => {
+  const resetAt = new Date((Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60) * 1000);
+  const stamp = resetAt.toISOString().slice(0, 19).replace("T", " ");
+  const ZAI_1310 = {
+    status: 429,
+    json: {
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        code: "1310",
+        message: `[1310][Weekly/Monthly Limit Exhausted. Your limit will reset at ${stamp}][x]`,
+      },
+    },
+  };
+  const ZAI_1313 = {
+    status: 429,
+    json: {
+      type: "error",
+      error: {
+        type: "rate_limit_error",
+        code: "1313",
+        message:
+          "[1313][Your account's usage pattern does not comply with the Fair Usage Policy][x]",
+      },
+    },
+  };
+
+  function scopedHandler(store: CredentialCooldownStore, accountScoped: boolean) {
+    const runtime = {
+      ...makeRuntime(makeConfig(undefined, accountScoped)),
+      cooldownStore: store,
+    } as unknown as Runtime;
+    return createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+  }
+
+  test("a stamped quota 429 benches the WHOLE pool, not just the failing key", async () => {
+    const store = new CredentialCooldownStore();
+    const handle = scopedHandler(store, true);
+    // Request 1: primary 429s with a stamped body -> every zai key is marked
+    // at once. The plan was built upfront, so the secondary attempt still runs
+    // (and 429s again — same account); the alibaba candidate serves.
+    let mock = installFetchMock([ZAI_1310, ZAI_1310, { status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handle(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(mock.requests).toHaveLength(3);
+    } finally {
+      mock.restore();
+    }
+    expect(store.isDegraded("zai", "primary")).toBe(true);
+    expect(store.isDegraded("zai", "secondary")).toBe(true);
+
+    // Request 2: zai entirely benched — straight to alibaba, zero zai fetches.
+    mock = installFetchMock([{ status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handle(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect(mock.requests).toHaveLength(1);
+      expect(mock.requests[0]?.headers["x-api-key"]).toBe("alibaba-key");
+    } finally {
+      mock.restore();
+    }
+    store.clear();
+  });
+
+  test("Fair-Usage 1313 (no reset stamp) also benches the whole pool", async () => {
+    const store = new CredentialCooldownStore();
+    const handle = scopedHandler(store, true);
+    const mock = installFetchMock([ZAI_1313, ZAI_1313, { status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handle(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+    } finally {
+      mock.restore();
+    }
+    expect(store.isDegraded("zai", "primary")).toBe(true);
+    expect(store.isDegraded("zai", "secondary")).toBe(true);
+    store.clear();
+  });
+
+  test("WITHOUT the flag, a stamped 429 benches only the offending key", async () => {
+    const store = new CredentialCooldownStore();
+    const handle = scopedHandler(store, false);
+    const mock = installFetchMock([ZAI_1310, { status: 200, json: ANTHROPIC_OK }]);
+    try {
+      const res = await handle(
+        postMessages({
+          model: TIER,
+          max_tokens: 16,
+          ...STREAMING,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      );
+      expect(res.status).toBe(200); // the secondary key still serves
+    } finally {
+      mock.restore();
+    }
+    expect(store.isDegraded("zai", "primary")).toBe(true);
+    expect(store.isDegraded("zai", "secondary")).toBe(false);
     store.clear();
   });
 });

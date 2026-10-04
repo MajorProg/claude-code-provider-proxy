@@ -22,8 +22,10 @@
  * Cross-request cooldown: a 429 response marks the offending (provider, key
  * label) pair degraded for COOLDOWN_MS. Subsequent requests skip degraded
  * entries in buildAttempts, so they go straight to the next working key
- * without burning a live attempt on a known-rate-limited credential. The
- * cooldown expires automatically via a TTL map; no restart is needed.
+ * without burning a live attempt on a known-rate-limited credential. A
+ * provider opted into `accountScoped` whose 429 body proves an ACCOUNT-level
+ * block (parsed reset stamp / Fair-Usage 1313) benches every pool key at once.
+ * The cooldown expires automatically via a TTL map; no restart is needed.
  */
 import type { CredentialPoolEntry, ProxyConfig } from "./config.ts";
 import {
@@ -185,11 +187,14 @@ export class CredentialCooldownStore {
  *   - Alibaba/Qwen:  "range of input length should be [1, N]"
  *   - OpenAI-compat: error.code === "context_length_exceeded"
  *   - Anthropic-compat: "prompt is too long", "too many tokens"
+ *   - z.ai:          error code 1261, message "Prompt too long" (documented
+ *                    wording has no "is" — hence its own pattern)
  *   - Generic:       "input length" + "exceed" (catches "[1, N]" variants)
  */
 const CONTEXT_TOO_LONG_PATTERNS: readonly RegExp[] = [
   /context[_\s]length[_\s]exceeded/i,
   /prompt is too long/i,
+  /prompt too long/i,
   /too many tokens/i,
   /input length.*exceed/i,
   /range of input length/i,
@@ -224,6 +229,22 @@ export function isProviderConversionBug(err: UpstreamError): boolean {
   if (err.status !== 400) return false;
   const body = err.upstreamBody ?? "";
   return PROVIDER_BUG_400_PATTERNS.some((re) => re.test(body));
+}
+
+/**
+ * Body signature of z.ai's account-scoped Fair Usage 429 (code 1313): "Your
+ * account's current usage pattern does not comply with the Fair Usage Policy,
+ * and your request frequency has been limited" — applies to every key of the
+ * account, and (unlike the stamped quota codes) carries no reset time.
+ */
+const FAIR_USAGE_1313_PATTERN: readonly RegExp[] = [/\[1313\]/, /"code"\s*:\s*"1313"/];
+
+/** True when a 429 body proves an ACCOUNT-level block (not a per-key one). */
+function isAccountScopedLimitBody(body: string, resetAtMs: number | undefined): boolean {
+  // A parsed quota-reset stamp (z.ai 1308/1310/1316-1321) is plan-quota
+  // exhaustion — plan quota belongs to the ACCOUNT, not the API key.
+  if (resetAtMs !== undefined) return true;
+  return FAIR_USAGE_1313_PATTERN.some((re) => re.test(body));
 }
 
 /** True when the error qualifies for a failover attempt. */
@@ -463,13 +484,26 @@ export async function executeWithFailover(opts: {
       // When the 429 body names the quota-reset time (z.ai 1310 "Your limit
       // will reset at <UTC stamp>"), the cooldown expires exactly then —
       // clamped to MAX_COOLDOWN_MS — instead of the blind 5-minute default.
-      if (
-        cooldownStore !== undefined &&
-        err instanceof UpstreamError &&
-        err.status === 429 &&
-        entry?.label !== undefined
-      ) {
-        cooldownStore.mark(target.provider, entry.label, parseQuotaResetAt(err.upstreamBody ?? ""));
+      // Provider opted into `accountScoped` + a body that proves an
+      // ACCOUNT-level block (stamped quota exhaustion or Fair-Usage 1313):
+      // the limit applies to every pool key, so bench them ALL at once instead
+      // of burning one 429 per key to discover it (live 2026-10-04: the whole
+      // 3-key pool cascaded within 87s on one z.ai account).
+      if (cooldownStore !== undefined && err instanceof UpstreamError && err.status === 429) {
+        const body = err.upstreamBody ?? "";
+        const resetAtMs = parseQuotaResetAt(body);
+        const accountScoped =
+          config.providers.external[target.provider]?.accountScoped === true &&
+          isAccountScopedLimitBody(body, resetAtMs);
+        if (accountScoped && target.credentials !== undefined) {
+          for (const poolEntry of target.credentials) {
+            if (poolEntry.label !== undefined) {
+              cooldownStore.mark(target.provider, poolEntry.label, resetAtMs);
+            }
+          }
+        } else if (entry?.label !== undefined) {
+          cooldownStore.mark(target.provider, entry.label, resetAtMs);
+        }
       }
       if (!isFailoverEligible(err) || i === attempts.length - 1) throw err;
       logger.warn("failover attempt failed, advancing", {

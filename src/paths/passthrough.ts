@@ -151,10 +151,12 @@ export async function handlePassthroughMessages(
   const url = streaming ? route.streamPath : route.path;
 
   // PC2: never replay a streaming request body on a transient status (the
-  // upstream may already be generating); non-streaming keeps default retries.
+  // upstream may already be generating). Non-streaming keeps 5xx retries but
+  // hands 429s to the failover engine (a rate limit is a decision about the
+  // credential/account, not a transport blip — retrying in place hammers it).
   const opts = {
     ...(signal ? { signal } : {}),
-    ...(streaming ? { retryTransientStatus: false } : {}),
+    ...(streaming ? { retryTransientStatus: false } : { retryRateLimit: false }),
   };
   const upstream = await postJson(url, headers, outboundBody, opts);
 
@@ -190,12 +192,10 @@ export async function handlePassthroughCountTokens(
 
   const outboundBody = JSON.stringify(withModel(parsed, route.invocationId));
   const headers = buildAnthropicHeaders(inbound, bearer, authStyle);
-  const upstream = await postJson(
-    route.countTokensPath,
-    headers,
-    outboundBody,
-    signal ? { signal } : {},
-  );
+  const upstream = await postJson(route.countTokensPath, headers, outboundBody, {
+    ...(signal ? { signal } : {}),
+    retryRateLimit: false,
+  });
 
   await assertUpstreamOk(upstream, route);
   // Relay the same headers as the messages path (content-type + cache-control)

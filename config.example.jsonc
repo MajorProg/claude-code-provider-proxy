@@ -73,6 +73,11 @@
         { "credential": "${ZAI_API_KEY_SECONDARY:-}", "label": "secondary" },
         { "credential": "${ZAI_API_KEY_TERTIARY:-}", "label": "tertiary" }
       ],
+      // All pool keys belong to the SAME z.ai account: an account-level 429
+      // (quota-reset stamp 1308/1310/1316-1321, Fair-Usage 1313) benches the
+      // WHOLE pool at once instead of cascading one 429 per key. Leave this
+      // OFF for pools that span multiple accounts.
+      "accountScoped": true,
       "auth": "bearer",
       "baseUrl": "https://api.z.ai/api/anthropic",
       "countTokens": true,

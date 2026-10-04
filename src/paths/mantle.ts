@@ -425,7 +425,11 @@ export async function handleMantleMessages(
     });
   }
 
-  const upstream = await postJson(route.path, headers, JSON.stringify(openaiBody), opts);
+  // 429s are owned by the failover engine (see passthrough.ts) — 5xx retries stay.
+  const upstream = await postJson(route.path, headers, JSON.stringify(openaiBody), {
+    ...opts,
+    retryRateLimit: false,
+  });
   await assertUpstreamOk(upstream, route);
 
   const openaiJson = await parseUpstreamJson<OpenAIResponse>(upstream, route);

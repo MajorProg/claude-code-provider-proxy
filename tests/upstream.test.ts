@@ -125,6 +125,36 @@ describe("postJson", () => {
     // Retry-After:0 must not add a long backoff delay.
     expect(Date.now() - start).toBeLessThan(500);
   });
+
+  test("retryRateLimit:false returns a 429 WITHOUT retrying (failover engine owns it)", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return jsonResponse(429);
+    }) as typeof fetch;
+    const res = await postJson("https://x.test/api", {}, "{}", {
+      maxRetries: 2,
+      retryRateLimit: false,
+    });
+    // One fetch only — re-sending the same body on the same throttled key
+    // would just hammer the rate limiter.
+    expect(res.status).toBe(429);
+    expect(calls).toBe(1);
+  });
+
+  test("retryRateLimit:false still retries a transient 5xx", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return calls < 2 ? jsonResponse(503) : jsonResponse(200);
+    }) as typeof fetch;
+    const res = await postJson("https://x.test/api", {}, "{}", {
+      maxRetries: 2,
+      retryRateLimit: false,
+    });
+    expect(res.status).toBe(200);
+    expect(calls).toBe(2);
+  });
 });
 
 describe("parseRetryAfter (PC3)", () => {

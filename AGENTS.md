@@ -269,14 +269,22 @@ when wiring or debugging a provider.
   `virtual.anthropic.global.<tier>` expands to the first available candidate
   from the config `virtualModels` map; pre-stream failover advances next pool
   key → next candidate on upstream 401/403/429, connect exhaustion, or a 400
-  whose body matches known "context too long" wording or a known provider
-  conversion-bug signature (z.ai 1210) (never generic 5xx),
-  capped by `maxFailoverAttempts` (default 4), always primary first — except
+  whose body matches known "context too long" wording (incl. z.ai's documented
+  1261 "Prompt too long") or a known provider conversion-bug signature (z.ai
+  1210) (never generic 5xx), capped by `maxFailoverAttempts` (default 4),
+  always primary first — except
   keys in the cross-request 429 cooldown (`CredentialCooldownStore` — TTL is
-  the quota-reset time parsed from the 429 body when present (z.ai 1310
-  "limit will reset at", clamped to 24h), else 5 min ±45s per-key jitter so a
-  benched herd reinstates staggered, not as a synchronized burst; survives
-  hot-reloads). When EVERY usable key of every routable candidate is cooled,
+  the quota-reset time parsed from the 429 body when present (z.ai 1308/1310/
+  1316-1321 "limit will reset at", clamped to 24h), else 5 min ±45s per-key
+  jitter so a benched herd reinstates staggered, not as a synchronized burst;
+  survives hot-reloads). Message-path 429s are owned by the engine, not
+  `postJson`: a rate limit is the upstream's decision about the
+  credential/account, so the body is never re-sent on the same key (5xx keeps
+  in-place retries). A provider whose pool keys all belong to one account may
+  set `accountScoped: true` — then a 429 proving an ACCOUNT-level block (a
+  parsed reset stamp or the Fair-Usage 1313 signature) benches the whole pool
+  at once instead of cascading one 429 per key. When EVERY usable key of every
+  routable candidate is cooled,
   the request answers **429 `rate_limit_error` + `Retry-After`** (the real
   remaining window to the earliest reinstatement) — never a 404: z.ai's rate
   shaping is ACCOUNT-scoped, so one burst benches the whole pool within
@@ -304,7 +312,7 @@ Per-provider, verified live:
 | Provider | `type` | Auth | Endpoint | `count_tokens` | Discovery | Notes |
 |---|---|---|---|---|---|---|
 | DeepSeek | anthropic | x-api-key | `api.deepseek.com/anthropic` | ✅ | `api.deepseek.com/v1/models` | Single global endpoint. |
-| z.ai / GLM | anthropic | bearer | `api.z.ai/api/anthropic` | ✅ | `api.z.ai/api/paas/v4/models` | Single global endpoint. |
+| z.ai / GLM | anthropic | bearer | `api.z.ai/api/anthropic` | ✅ | `api.z.ai/api/paas/v4/models` | Documented Claude-Code endpoint (docs.z.ai devpack). Coding plan: glm-5.3 + glm-5.3-flash only; quota = 5h window + weekly; 429 error codes 1302/1305/1308/1310/1311/1313/1113 (reset stamps parsed; 1313 Fair-Usage is account-scoped); 1261 = context-length 400; public rate-limits page removed (console-only). Set `accountScoped: true` for single-account pools. |
 | Gemini | openai | bearer | `generativelanguage.googleapis.com/v1beta/openai` | ❌ | `.../v1beta/openai/models` | Discovery returns `models/gemini-…`; the `models/` prefix is stripped. |
 | Alibaba / Qwen | anthropic | x-api-key | `dashscope-intl.aliyuncs.com/apps/anthropic` | ✅ | `.../compatible-mode/v1/models` | Host-templated; EU (Frankfurt) by default. |
 | EUrouter | openai | bearer | `api.eurouter.ai/v1` | ❌ | `.../v1/models` | EU data-residency router (not openrouter.ai). |

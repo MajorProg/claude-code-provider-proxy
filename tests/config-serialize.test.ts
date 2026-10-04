@@ -381,6 +381,49 @@ describe("serializeConfig credential pools", () => {
     expect(JSON.stringify(out).includes(ENV.DEEPSEEK_API_KEY)).toBe(false);
   });
 
+  test("accountScoped round-trips; absent stays absent; a non-boolean fails validation", () => {
+    const cfg = validateConfig({
+      ...BASE,
+      providers: {
+        zai: {
+          type: "anthropic",
+          credentials: [
+            { credential: ENV.DEEPSEEK_API_KEY, label: "primary" },
+            { credential: ENV.PROXY_INBOUND_KEY, label: "secondary" },
+          ],
+          accountScoped: true,
+          auth: "bearer",
+          baseUrl: "https://api.z.ai/api/anthropic",
+          countTokens: true,
+          modelsUrl: "https://api.z.ai/api/paas/v4/models",
+        },
+      },
+    });
+    expect(cfg.providers.external.zai?.accountScoped).toBe(true);
+    const out = serializeConfig(cfg, ENV);
+    const zai = (out.providers as Record<string, Record<string, unknown>>).zai;
+    expect(zai?.accountScoped).toBe(true);
+    // Re-validating the serialized output round-trips the flag.
+    expect(validateConfig(out).providers.external.zai?.accountScoped).toBe(true);
+
+    expect(() =>
+      validateConfig({
+        ...BASE,
+        providers: {
+          zai: {
+            type: "anthropic",
+            credential: "k",
+            auth: "bearer",
+            baseUrl: "https://api.z.ai/api/anthropic",
+            countTokens: true,
+            modelsUrl: "https://api.z.ai/api/paas/v4/models",
+            accountScoped: "yes",
+          },
+        },
+      }),
+    ).toThrow(/accountScoped must be a boolean/);
+  });
+
   test("a labeled singleton stays an array; an unlabeled one flattens", () => {
     const cfg = validateConfig({
       ...BASE,
