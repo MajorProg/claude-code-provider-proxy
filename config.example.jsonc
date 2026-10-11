@@ -71,7 +71,9 @@
       "credentials": [
         { "credential": "${ZAI_API_KEY:-}", "label": "primary" },
         { "credential": "${ZAI_API_KEY_SECONDARY:-}", "label": "secondary" },
-        { "credential": "${ZAI_API_KEY_TERTIARY:-}", "label": "tertiary" }
+        { "credential": "${ZAI_API_KEY_TERTIARY:-}", "label": "tertiary" },
+        { "credential": "${ZAI_API_KEY_QUATERNARY:-}", "label": "quaternary" },
+        { "credential": "${ZAI_API_KEY_QUINARY:-}", "label": "quinary" }
       ],
       // All pool keys belong to the SAME z.ai account: an account-level 429
       // (quota-reset stamp 1308/1310/1316-1321, Fair-Usage 1313) benches the
