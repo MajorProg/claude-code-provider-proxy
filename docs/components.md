@@ -122,7 +122,7 @@ Bedrock disabled).
 
 Key exports: `loadConfig`, `saveConfig`, `serializeConfig`, `validateConfig`,
 `interpolateEnv`, `hostForRegion`, `awsRegionForPrefix`, `awsRegionForKey`,
-`externalProviderOrigin`, `DEFAULT_BEDROCK_HOSTS`. Types: `ProxyConfig`,
+`externalProviderOrigin`, `DEFAULT_BEDROCK_HOSTS`. Types: `ProxyConfig`, `ZaiWireConfig`,
 `BedrockProviderConfig`, `ExternalProviderConfig`, `RegionKey`,
 `ProfilePreference`, `LoggingConfig`.
 
@@ -209,8 +209,14 @@ mappers and `mapConverseStopReason` (also used by the streaming bridge). Uses
 `handleMantleMessages`. Translates Anthropic ⇄ OpenAI Chat Completions via the
 IR: `anthropicToOpenAIRequest`, `openAIResponseToIr`, plus `mapOpenAIFinishReason`
 (also used by the streaming bridge). Uses `assertUpstreamOk` / `parseUpstreamJson`
-and the shared `irToAnthropicResponse` (imported from `relay.ts`). Ignores
-Mantle's `obfuscation` padding field.
+and the shared `irToAnthropicResponse` (imported from `relay.ts`, with the
+OpenAI-inclusive input-token form normalized to Anthropic semantics). Ignores
+Mantle's `obfuscation` padding field. Providers with a `zaiWire` config block
+(z.ai over the OpenAI wire) additionally get: assistant thinking replay as
+`reasoning_content` + Preserved Thinking activation, `ccpp_reasoning_effort` →
+z.ai `reasoning_effort`, sanitized `request_id` forwarding (echoed as
+`x-ccpp-upstream-request-id`), a required `max_tokens`, and typed
+classification of z.ai error finish_reasons (stream + JSON).
 
 ---
 

@@ -85,6 +85,27 @@
       "countTokens": true,
       "modelsUrl": "https://api.z.ai/api/paas/v4/models"
     },
+    // ALTERNATIVE: z.ai over its OpenAI-compatible wire (chat/completions).
+    // Swap the block above to type "openai" + this origin and add "zaiWire"
+    // to unlock the z.ai-specific semantics: Preserved Thinking (assistant
+    // reasoning replay + clear_thinking activation), ccpp_reasoning_effort →
+    // z.ai reasoning_effort, request_id correlation (echoed back as
+    // x-ccpp-upstream-request-id), typed stream-error finish_reasons, and a
+    // required max_tokens (z.ai would default a missing field to a very
+    // large output budget). The regex lists are OPERATOR-side z.ai research
+    // (2026-10): which model families are forced-thinking / effort-capable —
+    // they are config, not code. ,"zai-openai": {
+    //   "type": "openai",
+    //   "credential": "${ZAI_API_KEY:-}",
+    //   "auth": "bearer",
+    //   "baseUrl": "https://api.z.ai/api/paas/v4",
+    //   "countTokens": false,
+    //   "modelsUrl": "https://api.z.ai/api/paas/v4/models",
+    //   "zaiWire": {
+    //     "forcedThinkingModels": ["^glm-4\\.7(?![\\d])", "^glm-5\\.3(?![\\d])"],
+    //     "reasoningEffortModels": ["^glm-5\\.[2-9]", "^glm-[6-9]"]
+    //   }
+    // }
     "deepseek": {
       "type": "anthropic",
       "credential": "${DEEPSEEK_API_KEY:-}",

@@ -4,6 +4,7 @@ import {
   awsRegionForPrefix,
   hostForRegion,
   loadConfig,
+  serializeConfig,
   validateConfig,
 } from "../src/config.ts";
 import { ConfigError } from "../src/errors.ts";
@@ -698,5 +699,69 @@ describe("loadConfig (JSONC + env interpolation)", () => {
 
   test("missing file throws ConfigError", async () => {
     await expect(loadConfig("nope.jsonc", {})).rejects.toThrow(ConfigError);
+  });
+});
+
+// zaiWire (z.ai OpenAI-wire controls): model regex sources validated at load,
+// preserved verbatim through serialization.
+describe("validateConfig — zaiWire", () => {
+  const ZAI_RAW = {
+    ...structuredClone(VALID_RAW),
+    providers: {
+      bedrock: VALID_RAW.providers.bedrock,
+      zai: {
+        type: "openai",
+        credential: "k",
+        auth: "bearer",
+        baseUrl: "https://api.z.ai/api/paas/v4",
+        countTokens: false,
+        modelsUrl: "https://api.z.ai/api/paas/v4/models",
+        zaiWire: {
+          forcedThinkingModels: ["^glm-4\\.7(?![\\d])", "^glm-5\\.3(?![\\d])"],
+          reasoningEffortModels: ["^glm-5\\.[2-9]", "^glm-[6-9]"],
+        },
+      },
+    },
+  };
+
+  test("parses the regex lists and round-trips them verbatim", () => {
+    const cfg = validateConfig(structuredClone(ZAI_RAW));
+    const zai = cfg.providers.external.zai;
+    expect(zai?.zaiWire?.forcedThinkingModels).toEqual([
+      "^glm-4\\.7(?![\\d])",
+      "^glm-5\\.3(?![\\d])",
+    ]);
+    const round = serializeConfig(cfg);
+    const zaiRound = (round.providers as Record<string, { zaiWire?: unknown }>).zai;
+    expect(zaiRound?.zaiWire).toEqual(cfg.providers.external.zai?.zaiWire);
+    // A re-validation of the serialized form accepts it unchanged.
+    const cfg2 = validateConfig(structuredClone(round));
+    expect(cfg2.providers.external.zai?.zaiWire ?? null).toEqual(zai?.zaiWire ?? null);
+  });
+
+  test("an empty zaiWire block defaults both lists to []", () => {
+    const raw = structuredClone(ZAI_RAW);
+    (raw.providers as { zai: { zaiWire: unknown } }).zai.zaiWire = {};
+    const cfg = validateConfig(raw);
+    expect(cfg.providers.external.zai?.zaiWire).toEqual({
+      forcedThinkingModels: [],
+      reasoningEffortModels: [],
+    });
+  });
+
+  test("an invalid regex fails fast (ConfigError names the path)", () => {
+    const raw = structuredClone(ZAI_RAW);
+    (
+      raw.providers as { zai: { zaiWire: { forcedThinkingModels: string[] } } }
+    ).zai.zaiWire.forcedThinkingModels = ["([unclosed"];
+    expect(() => validateConfig(raw)).toThrow(/zaiWire\.forcedThinkingModels/);
+  });
+
+  test("a non-array list is a structural error", () => {
+    const raw = structuredClone(ZAI_RAW);
+    (
+      raw.providers as unknown as { zai: { zaiWire: { reasoningEffortModels: number } } }
+    ).zai.zaiWire.reasoningEffortModels = 7;
+    expect(() => validateConfig(raw)).toThrow(ConfigError);
   });
 });

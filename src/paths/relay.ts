@@ -467,16 +467,32 @@ export function relayHeadersFrom(
 /** Headers relayed verbatim from a passthrough upstream response. */
 export const PASSTHROUGH_RELAY_HEADERS = ["content-type", "cache-control"] as const;
 
+/** Options for {@link irToAnthropicResponse}. */
+export interface IrToAnthropicOptions {
+  /**
+   * Set when the source wire reports input tokens INCLUSIVE of the cached
+   * subset (the OpenAI convention: `prompt_tokens` covers everything, with
+   * `prompt_tokens_details.cached_tokens` as the cached part). The Anthropic
+   * face must report `input_tokens` EXCLUDING cached reads, so the emitter
+   * subtracts `cacheReadInputTokens` before emitting. Sources that already
+   * exclude cached tokens (Converse) leave this unset.
+   */
+  inputTokensIncludeCached?: boolean;
+}
+
 /**
  * Serialize a provider-neutral IR response into an Anthropic Messages JSON body.
  *
  * Shared by Path C (converse) and Path M (mantle) — both produce the identical
  * envelope and content-block mapping. Prompt-cache usage counters
  * (`cache_read_input_tokens` / `cache_creation_input_tokens`) are emitted only
- * when the IR carries them; the mantle IR never sets them, so mantle output
- * stays flat `{ input_tokens, output_tokens }` — behavior preserved.
+ * when the IR carries them.
  */
-export function irToAnthropicResponse(ir: IRResponse, model: string): JsonObject {
+export function irToAnthropicResponse(
+  ir: IRResponse,
+  model: string,
+  opts?: IrToAnthropicOptions,
+): JsonObject {
   const content = ir.content.map((b) => {
     switch (b.type) {
       case "text":
@@ -504,7 +520,12 @@ export function irToAnthropicResponse(ir: IRResponse, model: string): JsonObject
     }
   });
   const usage: Record<string, number> = {
-    input_tokens: ir.usage.inputTokens,
+    // OpenAI-wire sources set inputTokensIncludeCached (prompt_tokens covers
+    // everything); Anthropic semantics want input_tokens WITHOUT cached reads.
+    input_tokens:
+      opts?.inputTokensIncludeCached === true && ir.usage.cacheReadInputTokens !== undefined
+        ? Math.max(0, ir.usage.inputTokens - ir.usage.cacheReadInputTokens)
+        : ir.usage.inputTokens,
     output_tokens: ir.usage.outputTokens,
   };
   if (ir.usage.cacheReadInputTokens !== undefined) {

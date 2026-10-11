@@ -100,6 +100,57 @@ function validateCredentialPool(raw: unknown): CredentialPoolEntry[] {
 const DEFAULT_POOL_LABEL = "default";
 
 /**
+ * Model-id regex sources (JS RegExp syntax, matched as written) marking z.ai
+ * model families. Kept as SOURCE strings so the frozen config round-trips
+ * through serialization; compiled at use time (see paths/mantle.ts).
+ */
+export interface ZaiWireConfig {
+  /** Forced-thinking models — a `thinking:{type:"disabled"}` request cannot be
+   *  honored there and is dropped (logged once per model). */
+  readonly forcedThinkingModels: readonly string[];
+  /** Models that accept the z.ai `reasoning_effort` request field. */
+  readonly reasoningEffortModels: readonly string[];
+}
+
+/**
+ * Validate a zaiWire model-regex list: absent → []; otherwise an array of
+ * strings that each compile as a RegExp (a typo fails fast as a ConfigError).
+ */
+function validateModelRegexList(raw: unknown, path: string): readonly string[] {
+  if (raw === undefined) return [];
+  assert(Array.isArray(raw), `${path} must be an array of regex strings`);
+  const out: string[] = [];
+  for (const entry of raw) {
+    assert(
+      typeof entry === "string" && entry.length > 0,
+      `${path} entries must be non-empty strings`,
+    );
+    try {
+      new RegExp(entry);
+    } catch (err) {
+      throw new ConfigError(`${path} entry "${entry}" is not a valid RegExp`, { cause: err });
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
+/** Validate the optional `zaiWire` block on an external provider. */
+function validateZaiWire(raw: unknown, path: string): ZaiWireConfig {
+  assert(isRecord(raw), `${path} must be an object`);
+  return {
+    forcedThinkingModels: validateModelRegexList(
+      raw.forcedThinkingModels,
+      `${path}.forcedThinkingModels`,
+    ),
+    reasoningEffortModels: validateModelRegexList(
+      raw.reasoningEffortModels,
+      `${path}.reasoningEffortModels`,
+    ),
+  };
+}
+
+/**
  * Regional endpoint configuration for multi-region external providers.
  * When present, the provider supports routing via region codes in the canonical ID
  * (e.g., "alibaba.anthropic.ap-southeast-1.qwen3-max"). Each region has its own
@@ -225,6 +276,18 @@ export interface ExternalProviderConfig {
    * multiple accounts: a per-key 429 there really is per-key.
    */
   readonly accountScoped?: boolean;
+  /**
+   * z.ai OpenAI-wire controls (only meaningful for `type: "openai"` providers
+   * whose endpoint is api.z.ai — see AGENTS.md "Verified provider facts").
+   * When present, the mantle translator gains the z.ai-specific request fields:
+   * Preserved Thinking (assistant `reasoning_content` replay +
+   * `thinking:{type:"enabled",clear_thinking:false}` activation), the inbound
+   * `ccpp_reasoning_effort` extension mapped to z.ai `reasoning_effort`, and a
+   * forwarded `request_id`. The model regex lists are OPERATOR-side research
+   * (which model families are forced-thinking / effort-capable) — model
+   * specifics live in config, never in source.
+   */
+  readonly zaiWire?: ZaiWireConfig;
   /**
    * Discovery endpoint (an OpenAI-style `/models` URL). Model IDs are fetched
    * from here at runtime — NO model ids are ever hardcoded in source or config
@@ -967,6 +1030,9 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     `${where}.accountScoped must be a boolean`,
   );
 
+  const zaiWire =
+    raw.zaiWire === undefined ? undefined : validateZaiWire(raw.zaiWire, `${where}.zaiWire`);
+
   return {
     type: ptype as "anthropic" | "openai",
     credential: credentials.length > 0 ? (credentials[0] as CredentialPoolEntry).credential : "",
@@ -980,6 +1046,7 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     countTokens: raw.countTokens === true,
     ...(raw.strictTools === true ? { strictTools: true } : {}),
     ...(raw.accountScoped === true ? { accountScoped: true } : {}),
+    ...(zaiWire !== undefined ? { zaiWire } : {}),
     modelsUrl,
     ...(regions !== undefined ? { regions } : {}),
     ...(inactiveReason !== undefined ? { inactiveReason } : {}),
@@ -1483,6 +1550,8 @@ export function serializeConfig(
       countTokens: p.countTokens,
       ...(p.strictTools ? { strictTools: true } : {}),
       ...(p.accountScoped ? { accountScoped: true } : {}),
+      // zaiWire regex sources round-trip verbatim (model research, not a secret).
+      ...(p.zaiWire ? { zaiWire: p.zaiWire } : {}),
       ...(p.modelsUrl !== "" || p.regions === undefined ? { modelsUrl: embed(p.modelsUrl) } : {}),
       ...(regions ? { regions } : {}),
     };

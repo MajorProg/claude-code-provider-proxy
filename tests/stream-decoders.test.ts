@@ -394,3 +394,145 @@ describe("openAiStreamToAnthropicSse PC7 usage fallback", () => {
     expect(Number(deltaMatch?.[1])).toBe(8);
   });
 });
+
+// Cached-input normalization: the Anthropic-facing stream must report
+// input_tokens EXCLUDING the cached subset (OpenAI-wire prompt_tokens includes
+// it) while cache_read_input_tokens carries the cached count.
+describe("openAiStreamToAnthropicSse cached-input normalization", () => {
+  async function drainCached(chunks: string[]): Promise<string> {
+    const enc = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of chunks) c.enqueue(enc.encode(ch));
+        c.close();
+      },
+    });
+    const sse = openAiStreamToAnthropicSse(body, "m");
+    const dec = new TextDecoder();
+    let out = "";
+    const rd = sse.getReader();
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      out += dec.decode(value, { stream: true });
+    }
+    return out;
+  }
+
+  test("final message_delta reports input minus cached + cache_read counter", async () => {
+    const out = await drainCached([
+      'data: {"choices":[{"delta":{"content":"hi"},"index":0}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":1700,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":1650}}}\n\n',
+      "data: [DONE]\n\n",
+    ]);
+    const deltaLine = out
+      .split("\n")
+      .filter((l) => l.startsWith("data:"))
+      .map((l) => l.slice(5).trim())
+      .filter((p) => p.startsWith("{") && p.includes('"message_delta"'))
+      .map((p) => JSON.parse(p) as { usage?: Record<string, unknown> })
+      .pop();
+    expect(deltaLine?.usage).toMatchObject({
+      input_tokens: 50, // 1700 - 1650 (Anthropic semantics)
+      output_tokens: 7,
+      cache_read_input_tokens: 1650,
+    });
+  });
+
+  test("a stream without cached_tokens reports input unchanged", async () => {
+    const out = await drainCached([
+      'data: {"choices":[{"delta":{"content":"hi"},"index":0}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop","index":0}]}\n\n',
+      'data: {"choices":[],"usage":{"prompt_tokens":1700,"completion_tokens":7}}\n\n',
+      "data: [DONE]\n\n",
+    ]);
+    const deltaLine = out
+      .split("\n")
+      .filter((l) => l.startsWith("data:"))
+      .map((l) => l.slice(5).trim())
+      .filter((p) => p.startsWith("{") && p.includes('"message_delta"'))
+      .map((p) => JSON.parse(p) as { usage?: Record<string, unknown> })
+      .pop();
+    expect(deltaLine?.usage).toMatchObject({ input_tokens: 1700, output_tokens: 7 });
+  });
+});
+
+// zai error finish_reasons → typed error events (zaiWire providers only).
+describe("openAiStreamToAnthropicSse zai error finish_reasons", () => {
+  async function drainZai(chunks: string[], zaiStreamErrors: boolean): Promise<string> {
+    const enc = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const ch of chunks) c.enqueue(enc.encode(ch));
+        c.close();
+      },
+    });
+    const sse = openAiStreamToAnthropicSse(body, "glm-5.3-flash", 0, zaiStreamErrors);
+    const dec = new TextDecoder();
+    let out = "";
+    const rd = sse.getReader();
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      out += dec.decode(value, { stream: true });
+    }
+    return out;
+  }
+
+  test("network_error → api_error error event; partial content flushed; no message_stop", async () => {
+    const out = await drainZai(
+      [
+        'data: {"choices":[{"delta":{"content":"par"},"index":0}]}\n\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"network_error","index":0}]}\n\n',
+        "data: [DONE]\n\n",
+      ],
+      true,
+    );
+    expect(out).toContain("event: error");
+    expect(out).toContain("network_error");
+    expect(out).toContain('"type":"api_error"');
+    expect(out).toContain("par");
+    expect(out).not.toContain("event: message_stop");
+  });
+
+  test("sensitive → invalid_request_error error event (non-retriable refusal)", async () => {
+    const out = await drainZai(
+      [
+        'data: {"choices":[{"delta":{},"finish_reason":"sensitive","index":0}]}\n\n',
+        "data: [DONE]\n\n",
+      ],
+      true,
+    );
+    expect(out).toContain("event: error");
+    expect(out).toContain("sensitive");
+    expect(out).toContain('"type":"invalid_request_error"');
+  });
+
+  test("model_context_window_exceeded → request_too_large error event", async () => {
+    const out = await drainZai(
+      [
+        'data: {"choices":[{"delta":{},"finish_reason":"model_context_window_exceeded","index":0}]}\n\n',
+        "data: [DONE]\n\n",
+      ],
+      true,
+    );
+    expect(out).toContain("event: error");
+    expect(out).toContain("model_context_window_exceeded");
+    expect(out).toContain('"type":"request_too_large"');
+  });
+
+  test("flag OFF keeps the generic mapper behavior (end_turn, no error event)", async () => {
+    const out = await drainZai(
+      [
+        'data: {"choices":[{"delta":{"content":"par"},"index":0}]}\n\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"network_error","index":0}]}\n\n',
+        "data: [DONE]\n\n",
+      ],
+      false,
+    );
+    expect(out).not.toContain("event: error");
+    expect(out).toContain("event: message_stop");
+    expect(out).toContain('"stop_reason":"end_turn"');
+  });
+});

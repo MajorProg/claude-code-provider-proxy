@@ -188,6 +188,51 @@ describe("irToAnthropicResponse", () => {
     });
   });
 
+  // OpenAI-wire prompt_tokens INCLUDES the cached subset; the Anthropic face
+  // must report input_tokens EXCLUDING it (the mantle path passes the flag).
+  test("inputTokensIncludeCached subtracts the cached subset at the emitter (Path M)", () => {
+    const ir: IRResponse = {
+      role: "assistant",
+      content: [{ type: "text", text: "x" }],
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 1700, // raw OpenAI prompt_tokens (cached 1650 included)
+        outputTokens: 7,
+        cacheReadInputTokens: 1650,
+      },
+    };
+    const out = irToAnthropicResponse(ir, "m", { inputTokensIncludeCached: true });
+    expect(out.usage).toEqual({
+      input_tokens: 50, // 1700 - 1650 — Anthropic semantics
+      output_tokens: 7,
+      cache_read_input_tokens: 1650,
+    });
+    // The raw IR is never modified — only the emitted body normalizes.
+    expect(ir.usage.inputTokens).toBe(1700);
+  });
+
+  test("inputTokensIncludeCached with no cached subset emits input unchanged", () => {
+    const ir: IRResponse = {
+      role: "assistant",
+      content: [{ type: "text", text: "x" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 1700, outputTokens: 7 },
+    };
+    const out = irToAnthropicResponse(ir, "m", { inputTokensIncludeCached: true });
+    expect(out.usage).toEqual({ input_tokens: 1700, output_tokens: 7 });
+  });
+
+  test("inputTokensIncludeCached clamps at zero when cached exceeds input (defensive)", () => {
+    const ir: IRResponse = {
+      role: "assistant",
+      content: [{ type: "text", text: "x" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 100, outputTokens: 1, cacheReadInputTokens: 300 },
+    };
+    const out = irToAnthropicResponse(ir, "m", { inputTokensIncludeCached: true });
+    expect((out.usage as Record<string, unknown>).input_tokens).toBe(0);
+  });
+
   test("serializes a thinking block WITH its signature (signed, e.g. Converse)", () => {
     const ir: IRResponse = {
       role: "assistant",

@@ -10,6 +10,7 @@ import {
   type CredentialPoolEntry,
   type ProxyConfig,
   type RegionKey,
+  type ZaiWireConfig,
   assertSafeExternalOrigin,
   awsRegionForPrefix,
   externalProviderOrigin,
@@ -46,6 +47,12 @@ export interface RouteTarget {
   readonly isAnthropic: boolean;
   /** OpenAI strict function-calling opt-in (TC3); only set for external openai providers. */
   readonly strictTools?: boolean;
+  /**
+   * z.ai OpenAI-wire controls; only set for external openai providers whose
+   * endpoint is api.z.ai (see ExternalProviderConfig.zaiWire). Drives the
+   * mantle translator's z.ai-specific request fields.
+   */
+  readonly zaiWire?: ZaiWireConfig;
   /**
    * Usable (non-empty, non-placeholder) credential pool for external targets,
    * in failover order (docs/VIRTUAL_MODELS.md). Absent for Bedrock targets (their
@@ -181,6 +188,7 @@ function routeExternal(config: ProxyConfig, id: CanonicalId): RouteTarget {
     isAnthropic: false,
     credentials: usable,
     ...(provider.strictTools ? { strictTools: true } : {}),
+    ...(provider.zaiWire ? { zaiWire: provider.zaiWire } : {}),
   });
 }
 

@@ -13,7 +13,7 @@ import { logger } from "../logging/logger.ts";
  * Text and tool_use occupy separate Anthropic blocks; a text block (index 0) is
  * opened lazily on first content, tool_use blocks follow by OpenAI tool-call index.
  */
-import { mapOpenAIFinishReason } from "../paths/mantle.ts";
+import { classifyZaiStreamFinishError, mapOpenAIFinishReason } from "../paths/mantle.ts";
 import { estimateTokensFromChars, sanitizeToolCallId } from "../paths/relay.ts";
 import { AnthropicSseEmitter } from "./anthropic-sse.ts";
 
@@ -176,11 +176,21 @@ export class SseLineParser {
 
 /**
  * Bridge an OpenAI/Mantle SSE byte stream to an Anthropic SSE Response body.
+ *
+ * `zaiStreamErrors`: when true (z.ai openai-wire providers), z.ai's abnormal
+ * in-stream termination `finish_reason` values (network_error / sensitive /
+ * model_context_window_exceeded) are classified and surfaced as TYPED
+ * Anthropic-wire `error` events — api_error (transient), invalid_request_error
+ * (content refusal), request_too_large (context overflow) — with the z.ai
+ * reason preserved. Without the flag these reasons keep the generic mapper
+ * behavior (unknown → end_turn + warn), which would end the stream looking
+ * like a normal completion — a silent data-loss failure mode.
  */
 export function openAiStreamToAnthropicSse(
   upstreamBody: ReadableStream<Uint8Array>,
   model: string,
   inputTokensSeed = 0,
+  zaiStreamErrors = false,
 ): ReadableStream<Uint8Array> {
   const emitter = new AnthropicSseEmitter();
   const parser = new SseLineParser();
@@ -204,6 +214,14 @@ export function openAiStreamToAnthropicSse(
   let outputTokens = 0;
   let inputTokens = 0;
   let cacheReadTokens: number | undefined;
+  // OpenAI-wire prompt_tokens INCLUDES the cached subset; the Anthropic face
+  // (message_delta / final usage) must report input_tokens EXCLUDING cached
+  // reads — subtract before handing counts to the emitter. The raw upstream
+  // totals stay on the locals above.
+  const reportedInputTokens = (): number =>
+    inputTokens > 0 && cacheReadTokens !== undefined && cacheReadTokens > 0
+      ? Math.max(0, inputTokens - cacheReadTokens)
+      : inputTokens;
   // PC7: accumulate emitted output characters (text + thinking + tool args) so
   // we can estimate output tokens if the upstream never sends usage.
   let outputChars = 0;
@@ -356,6 +374,22 @@ export function openAiStreamToAnthropicSse(
     }
 
     if (choice.finish_reason) {
+      // z.ai wire: abnormal in-flight termination surfaces as an ERROR
+      // finish_reason, not an HTTP code — classified and emitted as a typed
+      // Anthropic-wire error event (accrued usage rides along per SR3).
+      // Never a normal-looking end_turn completion.
+      if (zaiStreamErrors) {
+        const zaiErr = classifyZaiStreamFinishError(choice.finish_reason);
+        if (zaiErr !== undefined) {
+          logger.error("zai_finish_reason_error", {
+            finish_reason: choice.finish_reason,
+            kind: zaiErr.kind,
+            model,
+          });
+          emitter.fail(zaiErr.message, zaiErr.anthropicErrorType);
+          return;
+        }
+      }
       stopReason = mapOpenAIFinishReason(choice.finish_reason);
       finished = true; // SR11: subsequent late deltas are ignored (R4 ordering)
     }
@@ -364,7 +398,8 @@ export function openAiStreamToAnthropicSse(
     // periodic message_delta (and any early-death usage) reflects progress.
     // Prefer real upstream output tokens; fall back to the char estimate.
     const runningOutput = outputTokens > 0 ? outputTokens : estimateTokensFromChars(outputChars);
-    emitter.updateUsage(runningOutput, inputTokens > 0 ? inputTokens : undefined, {
+    const reportedInput = reportedInputTokens();
+    emitter.updateUsage(runningOutput, reportedInput > 0 ? reportedInput : undefined, {
       ...(cacheReadTokens !== undefined ? { cacheReadInputTokens: cacheReadTokens } : {}),
     });
   };
@@ -405,7 +440,7 @@ export function openAiStreamToAnthropicSse(
         outputTokens > 0 ? outputTokens : estimateTokensFromChars(outputChars);
       emitter.finish(stopReason, {
         outputTokens: finalOutputTokens,
-        inputTokens,
+        inputTokens: reportedInputTokens(),
         ...(cacheReadTokens !== undefined ? { cacheReadInputTokens: cacheReadTokens } : {}),
       });
     } catch (err) {

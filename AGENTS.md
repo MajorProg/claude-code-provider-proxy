@@ -296,6 +296,10 @@ when wiring or debugging a provider.
   reinstatement/provider shift), exposes `servingAccount` on /status.json,
   and pairs with the host-side `bun run cli ping [sound]` watcher (afplay on
   macOS) that plays a real sound on the default audio device on change.
+- **Usage semantics on the mantle path:** OpenAI-wire `prompt_tokens` INCLUDES
+  the cached subset; the Anthropic face reports `input_tokens` EXCLUDING cached
+  reads (subtracted at the emitter, streaming and JSON alike). Converse /
+  passthrough are already exclusive and unchanged.
 - **Discovery always uses bearer.** External-provider `/models` discovery sends
   `Authorization: Bearer` regardless of the provider's message-path `auth` —
   some providers reject `x-api-key` on `/models` (`401`), but the OpenAI
@@ -306,13 +310,31 @@ when wiring or debugging a provider.
   may set `hostTemplate` (`{workspaceId}`/`{region}` placeholders) + `workspaceId`
   + `region` + `basePath` instead of a flat `baseUrl`; `externalProviderOrigin()`
   builds the origin.
+- **z.ai openai wire (`zaiWire` provider block):** a `type: "openai"` z.ai
+  provider may set `zaiWire` with model-regex lists (`forcedThinkingModels`,
+  `reasoningEffortModels`) — the model families are operator-side research in
+  config, never source. Ported from the chimera-employee llm-router
+  (live-verified there 2026-10-10), the mantle translator then: replays
+  assistant `thinking` blocks as `reasoning_content` and always sends
+  `thinking:{type:"enabled",clear_thinking:false}` (Preserved Thinking
+  activation — the standard endpoint ships it OFF); forwards a `disabled`
+  request only on optional-thinking models (dropped + logged-once on forced
+  families); maps an inbound `ccpp_reasoning_effort` ladder value
+  (low|medium|high|xhigh|max → low|high|max) onto `reasoning_effort`; forwards
+  a sanitized `request_id` (6–64 chars `[A-Za-z0-9_-]`, echoed to the client
+  as `x-ccpp-upstream-request-id`); REQUIRES inbound `max_tokens` (z.ai
+  defaults a missing field to 65,536 output tokens); and classifies abnormal
+  in-stream termination finish_reasons into typed Anthropic errors
+  (network_error→`api_error`, sensitive→`invalid_request_error`,
+  model_context_window_exceeded→`request_too_large`) — typed SSE error event
+  (streaming) / 502 UpstreamError with the raw body (JSON).
 
 Per-provider, verified live:
 
 | Provider | `type` | Auth | Endpoint | `count_tokens` | Discovery | Notes |
 |---|---|---|---|---|---|---|
 | DeepSeek | anthropic | x-api-key | `api.deepseek.com/anthropic` | ✅ | `api.deepseek.com/v1/models` | Single global endpoint. |
-| z.ai / GLM | anthropic | bearer | `api.z.ai/api/anthropic` | ✅ | `api.z.ai/api/paas/v4/models` | Documented Claude-Code endpoint (docs.z.ai devpack). Coding plan: glm-5.3 + glm-5.3-flash only; quota = 5h window + weekly; 429 error codes 1302/1305/1308/1310/1311/1313/1113 (reset stamps parsed; 1313 Fair-Usage is account-scoped); 1261 = context-length 400; public rate-limits page removed (console-only). Set `accountScoped: true` for single-account pools. |
+| z.ai / GLM | anthropic | bearer | `api.z.ai/api/anthropic` | ✅ | `api.z.ai/api/paas/v4/models` | Documented Claude-Code endpoint (docs.z.ai devpack). Coding plan: glm-5.3 + glm-5.3-flash only; quota = 5h window + weekly; 429 error codes 1302/1305/1308/1310/1311/1313/1113 (reset stamps parsed; 1313 Fair-Usage is account-scoped); 1261 = context-length 400; public rate-limits page removed (console-only). Set `accountScoped: true` for single-account pools. OpenAI wire: see the `zaiWire` bullet above (Preserved Thinking, effort, request_id, stream-error finish_reasons, inclusive prompt_tokens). |
 | Gemini | openai | bearer | `generativelanguage.googleapis.com/v1beta/openai` | ❌ | `.../v1beta/openai/models` | Discovery returns `models/gemini-…`; the `models/` prefix is stripped. |
 | Alibaba / Qwen | anthropic | x-api-key | `dashscope-intl.aliyuncs.com/apps/anthropic` | ✅ | `.../compatible-mode/v1/models` | Host-templated; EU (Frankfurt) by default. |
 | EUrouter | openai | bearer | `api.eurouter.ai/v1` | ❌ | `.../v1/models` | EU data-residency router (not openrouter.ai). |
