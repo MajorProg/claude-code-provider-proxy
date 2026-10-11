@@ -17,6 +17,7 @@ config.local.jsonc
 *.log
 /tmp/
 logs/
+logs.archive-*/
 
 # OS
 .DS_Store
