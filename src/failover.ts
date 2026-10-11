@@ -61,9 +61,11 @@ export const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 export const COOLDOWN_JITTER_MS = 45 * 1000;
 /**
  * Upper bound for a cooldown, even when the 429 body names a later reset
- * time: a renewed/changed plan gets re-probed within a day at the latest.
+ * time: the front key is re-probed within an hour at the latest, so a
+ * recharged account, a renewed plan, or an over-pessimistic stamp returns
+ * to the front of the pool automatically — without a restart.
  */
-const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const MAX_COOLDOWN_MS = 60 * 60 * 1000;
 /** Safety margin past a parsed reset time (clock skew, second-granularity). */
 const RESET_MARGIN_MS = 60 * 1000;
 
@@ -120,6 +122,7 @@ export class CredentialCooldownStore {
     }
     const timer = setTimeout(() => {
       this.timers.delete(key);
+      this.expiries.delete(key);
       logger.info("credential cooldown expired, reinstating key", { provider, keyLabel: label });
     }, ttl);
     // Don't keep the process alive if the server shuts down between requests.

@@ -884,8 +884,8 @@ describe("z.ai 1210 conversion-bug failover", () => {
 
 describe("quota-reset-aware cooldown (z.ai 1310)", () => {
   // The reset stamp is computed relative to now (3 days out) so the fixture
-  // never rots: a hardcoded date eventually falls inside the 24h cooldown
-  // clamp and flips the expected expiry from now+24h to the stamp itself.
+  // never rots: a hardcoded date eventually falls inside the 1h cooldown
+  // clamp and flips the expected expiry from now+1h to the stamp itself.
   // Seconds-precision (the z.ai stamp has no ms) so the parsed epoch is exact.
   const resetAt = new Date((Math.floor(Date.now() / 1000) + 3 * 24 * 60 * 60) * 1000);
   const stamp = resetAt.toISOString().slice(0, 19).replace("T", " "); // z.ai format
@@ -932,12 +932,13 @@ describe("quota-reset-aware cooldown (z.ai 1310)", () => {
       mock.restore();
     }
     expect(store.isDegraded("zai", "primary")).toBe(true);
-    // Reset is 2026-09-13 — far beyond the 24h clamp: expiry = now + 24h.
+    // Reset is 3 days out — far beyond the 1h clamp: expiry = now + 1h, so
+    // the front key returns to rotation within the hour (b/ shorter clamp).
     const until = store.degradedUntil("zai", "primary");
     expect(until).toBeDefined();
-    const in24h = Date.now() + 24 * 60 * 60 * 1000;
-    expect(until ?? 0).toBeGreaterThan(Date.now() + 23 * 60 * 60 * 1000);
-    expect(until ?? 0).toBeLessThanOrEqual(in24h + 5);
+    const in1h = Date.now() + 60 * 60 * 1000;
+    expect(until ?? 0).toBeGreaterThan(Date.now() + 55 * 60 * 1000);
+    expect(until ?? 0).toBeLessThanOrEqual(in1h + 5);
     store.clear();
   });
 
@@ -1003,7 +1004,7 @@ describe("cooldown jitter (herd desynchronization)", () => {
 
   test("a parsed quota-reset stamp stays EXACT (jitter not applied)", () => {
     const store = new CredentialCooldownStore();
-    const resetAt = Date.now() + 60 * 60 * 1000; // 1h out (inside the 24h clamp)
+    const resetAt = Date.now() + 30 * 60 * 1000; // 30min out (inside the 1h clamp)
     store.mark("p", "k", resetAt, () => 1); // rng=1 would add +45s if misapplied
     const until = store.degradedUntil("p", "k") ?? 0;
     expect(until).toBeGreaterThanOrEqual(resetAt + 60_000 - 10);

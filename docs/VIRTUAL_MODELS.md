@@ -110,8 +110,9 @@ ids alongside real ones; the registry page shows each tier's current resolution.
 re-walks the list from the top — EXCEPT keys currently in cooldown: a 429
 marks the (provider, key-label) pair degraded — until the quota-reset time
 when the 429 body names one (z.ai 1310 `"Your limit will reset at <UTC
-stamp>"` — parsed via `parseQuotaResetAt`, clamped to 24h so a renewed plan
-is re-probed within a day), else for 5 minutes (`CredentialCooldownStore`
+stamp>"` — parsed via `parseQuotaResetAt`, clamped to 1h so a recharged
+account or renewed plan is re-probed within the hour and returns to the front
+automatically), else for 5 minutes (`CredentialCooldownStore`
 in src/failover.ts, unref'd TTL timers, shared across hot-reloads) — and
 `buildAttempts` skips degraded entries. A key whose
 whole provider-pool is cooled is skipped as a candidate; a direct-model

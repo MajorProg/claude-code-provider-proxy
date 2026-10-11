@@ -275,7 +275,7 @@ when wiring or debugging a provider.
   always primary first — except
   keys in the cross-request 429 cooldown (`CredentialCooldownStore` — TTL is
   the quota-reset time parsed from the 429 body when present (z.ai 1308/1310/
-  1316-1321 "limit will reset at", clamped to 24h), else 5 min ±45s per-key
+  1316-1321 "limit will reset at", clamped to 1h), else 5 min ±45s per-key
   jitter so a benched herd reinstates staggered, not as a synchronized burst;
   survives hot-reloads). Message-path 429s are owned by the engine, not
   `postJson`: a rate limit is the upstream's decision about the
