@@ -41,6 +41,8 @@ services:
       # z.ai credential-pool failover keys (VIRTUAL_MODELS.md) — optional.
       ZAI_API_KEY_SECONDARY: "${ZAI_API_KEY_SECONDARY:-}"
       ZAI_API_KEY_TERTIARY: "${ZAI_API_KEY_TERTIARY:-}"
+      ZAI_API_KEY_QUATERNARY: "${ZAI_API_KEY_QUATERNARY:-}"
+      ZAI_API_KEY_QUINARY: "${ZAI_API_KEY_QUINARY:-}"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       DASHSCOPE_API_KEY_INTL: "${DASHSCOPE_API_KEY_INTL:-}"
       DASHSCOPE_API_KEY_EU: "${DASHSCOPE_API_KEY_EU:-}"
@@ -58,7 +60,8 @@ services:
     volumes:
       # Mounted read-write so the built-in Config UI can save + hot-reload.
       - ./config.local.jsonc:/app/config.local.jsonc:rw
-      # Persist captured prompts/sessions (viewer at /logs, exports at /api/logs/export/*).
+      # Persist captured prompts/sessions (viewer at /logs, exports at /api/logs/export/*)
+      # and the cooldown/quota state file (survives restarts).
       - ./logs:/app/logs
     healthcheck:
       test: ["CMD", "bun", "-e", "await fetch('http://127.0.0.1:8787/api/hello',{method:'HEAD'})"]

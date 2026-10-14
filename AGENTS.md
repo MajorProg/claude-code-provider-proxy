@@ -271,7 +271,10 @@ when wiring or debugging a provider.
   key → next candidate on upstream 401/403/429, connect exhaustion, or a 400
   whose body matches known "context too long" wording (incl. z.ai's documented
   1261 "Prompt too long") or a known provider conversion-bug signature (z.ai
-  1210) (never generic 5xx), capped by `maxFailoverAttempts` (default 4),
+  1210) (never generic 5xx), capped by `maxFailoverAttempts` (default 8 —
+  sized to cover the shipped 5-key zai pool plus the remaining tier
+  candidates; keep it >= the largest tier plan or later keys/candidates are
+  never tried),
   always primary first — except
   keys in the cross-request 429 cooldown (`CredentialCooldownStore` — TTL is
   the quota-reset time parsed from the 429 body when present (z.ai 1308/1310/
@@ -289,7 +292,16 @@ when wiring or debugging a provider.
   remaining window to the earliest reinstatement) — never a 404: z.ai's rate
   shaping is ACCOUNT-scoped, so one burst benches the whole pool within
   ~90s while the provider's dashboard still looks healthy (live-verified
-  2026-10-03/04, three same-key marks within 24 ms on cooldown expiry). The serving key's LABEL is logged + stored in
+  2026-10-03/04, three same-key marks within 24 ms on cooldown expiry). Each
+  429 also records a QUOTA MARK (parsed reset stamp + arrival time,
+  `CredentialCooldownStore.quotaSnapshot()`) that OUTLIVES the clamped
+  cooldown — the Providers tab shows the real provider-side reset date (z.ai
+  weekly stamps can be days out) under each key even after it reinstates.
+  Live cooldowns + quota marks persist across restarts/reboots via
+  `<logging.dir>/cooldown-state.json` (labels + epoch ms only, atomic
+  tmp+rename write, loaded at boot; absent/corrupt => warn + fresh — never
+  a boot dependency; inside the Docker-mounted ./logs volume).
+  The serving key's LABEL is logged + stored in
   `TurnRecord.servingKeyLabel` — never the key value. `servingChangePing`
   (config, default off) additionally emits a terminal BEL + marked warn line
   when the serving account CHANGES across requests (failover/cooldown
@@ -361,8 +373,9 @@ Per-provider, verified live:
 
 ### Threat model (operator-trust boundary)
 
-The management surface (`/api/config*`, `/api/logs/*`, `/api/chat`, and the
-`/config`/`/logs`/`/chat` HTML shells' API calls) is gated behind the inbound
+The management surface (`/api/config*`, `/api/providers/status`, `/api/logs/*`,
+`/api/chat`, and the `/config`/`/providers`/`/logs`/`/chat` HTML shells' API
+calls) is gated behind the inbound
 key (`authenticateInbound`); `POST /api/config` and `POST /api/chat` additionally
 require the CSRF header + same-origin `Origin`. Within that gate, two exposures
 are **accepted by design** — the holder of a valid inbound key is treated as a

@@ -72,13 +72,19 @@ export type ProviderAuthStyle = "x-api-key" | "bearer";
 export interface CredentialPoolEntry {
   readonly credential: string;
   readonly label?: string;
+  /**
+   * Optional human-readable account/plan name (e.g. "Chimera Developer 2") —
+   * display-only metadata for the Providers UI; never used for matching,
+   * logging identity (that's `label`), or the cooldown store.
+   */
+  readonly name?: string;
 }
 
 /**
  * Normalize a raw `credentials` array (unknown shape) into a pool: keep record
  * entries with a non-empty string credential; non-records / empty credentials
- * are dropped (missing-info tolerance); labels kept verbatim when non-empty
- * strings. Shared by the provider and region validators.
+ * are dropped (missing-info tolerance); labels and names kept verbatim when
+ * non-empty strings. Shared by the provider and region validators.
  */
 function validateCredentialPool(raw: unknown): CredentialPoolEntry[] {
   if (!Array.isArray(raw)) return [];
@@ -88,9 +94,11 @@ function validateCredentialPool(raw: unknown): CredentialPoolEntry[] {
     const credential = entry.credential;
     if (typeof credential !== "string" || credential === "") continue;
     const label = entry.label;
+    const name = entry.name;
     pool.push({
       credential,
       ...(typeof label === "string" && label !== "" ? { label } : {}),
+      ...(typeof name === "string" && name !== "" ? { name } : {}),
     });
   }
   return pool;
@@ -550,8 +558,13 @@ export interface ProxyConfig {
   readonly servingChangePing: boolean;
 }
 
-/** Default pre-stream failover attempt cap (docs/VIRTUAL_MODELS.md). */
-export const DEFAULT_FAILOVER_ATTEMPTS = 4;
+/**
+ * Default pre-stream failover attempt cap (docs/VIRTUAL_MODELS.md). Sized to
+ * cover the shipped example shape — a 5-key z.ai pool plus the two remaining
+ * tier candidates (7 slots) — so a pool is never silently truncated: the cap
+ * is a safety bound on pathological configs, not a participant limiter.
+ */
+export const DEFAULT_FAILOVER_ATTEMPTS = 8;
 
 /**
  * Configurable caps on inbound request size dimensions (SEC-4). These bound the
@@ -1472,17 +1485,21 @@ export function serializeConfig(
 
   /**
    * Pool serialization rule: a one-entry pool with the default (or no) label
-   * round-trips as a flat `credential:` — byte-identical to every existing
-   * single-key config, so a UI save churns nothing. A labeled singleton or a
-   * multi-entry pool serializes as a `credentials` array (labels preserved,
-   * secrets restored to ${VAR} refs per entry). An empty pool round-trips as
-   * `credential: ""` (the "${VAR:-}" unset form — next boot still loads).
+   * AND no display name round-trips as a flat `credential:` — byte-identical
+   * to every existing single-key config, so a UI save churns nothing. A
+   * labeled/named singleton or a multi-entry pool serializes as a
+   * `credentials` array (labels + names preserved, secrets restored to
+   * ${VAR} refs per entry). An empty pool round-trips as `credential: ""`
+   * (the "${VAR:-}" unset form — next boot still loads).
    */
   const serializePool = (pool: readonly CredentialPoolEntry[]): Record<string, unknown> => {
     if (pool.length === 0) return { credential: "" };
     if (pool.length === 1) {
       const only = pool[0] as CredentialPoolEntry;
-      if (only.label === undefined || only.label === DEFAULT_POOL_LABEL) {
+      if (
+        (only.label === undefined || only.label === DEFAULT_POOL_LABEL) &&
+        only.name === undefined
+      ) {
         return { credential: exact(only.credential) };
       }
     }
@@ -1490,6 +1507,7 @@ export function serializeConfig(
       credentials: pool.map((e) => ({
         credential: exact(e.credential),
         ...(e.label ? { label: e.label } : {}),
+        ...(e.name ? { name: e.name } : {}),
       })),
     };
   };

@@ -11,7 +11,7 @@
 
 export interface ShellOptions {
   readonly title: string;
-  readonly active: "registry" | "chat" | "logs" | "config";
+  readonly active: "registry" | "chat" | "providers" | "logs" | "config";
   readonly chatEnabled: boolean;
   /** Alpine x-data expression for the page root. */
   readonly xData: string;
@@ -83,6 +83,7 @@ export function renderShell(opts: ShellOptions): string {
     <nav class="flex gap-1">
       ${navLink("/", "Registry", "registry", opts.active)}
       ${chatTab}
+      ${navLink("/providers", "Providers", "providers", opts.active)}
       ${navLink("/logs", "Logs", "logs", opts.active)}
       ${navLink("/config", "Config", "config", opts.active)}
     </nav>

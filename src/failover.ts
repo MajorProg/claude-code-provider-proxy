@@ -27,6 +27,7 @@
  * block (parsed reset stamp / Fair-Usage 1313) benches every pool key at once.
  * The cooldown expires automatically via a TTL map; no restart is needed.
  */
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { CredentialPoolEntry, ProxyConfig } from "./config.ts";
 import {
   BadRequestError,
@@ -84,6 +85,31 @@ export function parseQuotaResetAt(body: string): number | undefined {
   return Number.isNaN(t) ? undefined : t;
 }
 
+/** One benched (provider, key label) pair, as shown by the providers status UI. */
+export interface CooldownEntry {
+  readonly provider: string;
+  readonly label: string;
+  /** Epoch ms when the key reinstates. */
+  readonly untilMs: number;
+}
+
+/**
+ * Last-known quota picture for a (provider, key label) pair, as shown by the
+ * providers status UI. Outlives the cooldown itself: the operational cooldown
+ * is clamped to MAX_COOLDOWN_MS so the front key is re-probed hourly, but the
+ * REAL provider-side quota-reset stamp (z.ai weekly limits can be days out)
+ * stays visible after the key reinstates — an operator seeing "ready" must
+ * still be able to tell WHY the key keeps 429ing.
+ */
+export interface QuotaMarkRecord {
+  readonly provider: string;
+  readonly label: string;
+  /** Parsed quota-reset stamp (epoch ms); undefined for a blind 429 (no stamp). */
+  readonly quotaResetAt?: number;
+  /** When the 429 that produced this record arrived (epoch ms). */
+  readonly last429At: number;
+}
+
 /**
  * Cross-request cooldown store for rate-limited credentials.
  *
@@ -99,9 +125,49 @@ export function parseQuotaResetAt(body: string): number | undefined {
  * never the credential value itself.
  */
 export class CredentialCooldownStore {
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly expiries = new Map<string, number>();
+  private readonly entries = new Map<
+    string,
+    { entry: CooldownEntry; timer: ReturnType<typeof setTimeout> }
+  >();
+  /**
+   * Quota marks are NOT timer-cleared — they persist after the cooldown
+   * expires (overwritten by the next 429) so the UI keeps showing the real
+   * provider-side reset date, and (with {@link statePath}) across restarts.
+   */
+  private readonly quotaMarks = new Map<string, QuotaMarkRecord>();
+  /**
+   * Optional persistence file (labels + epoch ms only — never credentials).
+   * When set, live cooldowns and quota marks survive a restart/reboot: they
+   * are loaded in the constructor and rewritten (atomic tmp+rename) on every
+   * mutation. Absent/unreadable/corrupt file => start fresh with a warning —
+   * persistence is an observability nicety, never a boot dependency.
+   */
+  private readonly statePath: string | undefined;
+  private persistWarned = false;
 
+  constructor(opts: { statePath?: string } = {}) {
+    this.statePath = opts.statePath;
+    if (this.statePath !== undefined) this.loadFromDisk(this.statePath);
+  }
+
+  /** (Re)arm a cooldown entry with its own unref'd expiry timer. */
+  private schedule(provider: string, label: string, untilMs: number): void {
+    const key = `${provider}:${label}`;
+    const existing = this.entries.get(key);
+    if (existing !== undefined) clearTimeout(existing.timer);
+    const timer = setTimeout(
+      () => {
+        this.entries.delete(key);
+        logger.info("credential cooldown expired, reinstating key", { provider, keyLabel: label });
+      },
+      Math.max(0, untilMs - Date.now()),
+    );
+    // Don't keep the process alive if the server shuts down between requests.
+    if (typeof timer === "object" && timer !== null && "unref" in timer) {
+      (timer as { unref(): void }).unref();
+    }
+    this.entries.set(key, { entry: { provider, label, untilMs }, timer });
+  }
   /**
    * Mark a (provider, label) pair as degraded. `resetAtMs` (epoch ms, parsed
    * from the 429 body) makes the cooldown expire exactly then — clamped to
@@ -112,25 +178,20 @@ export class CredentialCooldownStore {
    */
   mark(provider: string, label: string, resetAtMs?: number, rng: () => number = Math.random): void {
     const key = `${provider}:${label}`;
-    const existing = this.timers.get(key);
-    if (existing !== undefined) clearTimeout(existing);
     const now = Date.now();
     let ttl = COOLDOWN_MS + (rng() - 0.5) * 2 * COOLDOWN_JITTER_MS;
     if (resetAtMs !== undefined) {
       const parsed = resetAtMs + RESET_MARGIN_MS - now;
       if (parsed > 0) ttl = Math.min(parsed, MAX_COOLDOWN_MS);
     }
-    const timer = setTimeout(() => {
-      this.timers.delete(key);
-      this.expiries.delete(key);
-      logger.info("credential cooldown expired, reinstating key", { provider, keyLabel: label });
-    }, ttl);
-    // Don't keep the process alive if the server shuts down between requests.
-    if (typeof timer === "object" && timer !== null && "unref" in timer) {
-      (timer as { unref(): void }).unref();
-    }
-    this.timers.set(key, timer);
-    this.expiries.set(key, now + ttl);
+    this.schedule(provider, label, now + ttl);
+    this.quotaMarks.set(key, {
+      provider,
+      label,
+      last429At: now,
+      ...(resetAtMs !== undefined ? { quotaResetAt: resetAtMs } : {}),
+    });
+    this.persist();
     logger.warn("credential marked degraded (429 cooldown)", {
       provider,
       keyLabel: label,
@@ -141,12 +202,12 @@ export class CredentialCooldownStore {
 
   /** True when this (provider, label) pair is currently in cooldown. */
   isDegraded(provider: string, label: string): boolean {
-    return this.timers.has(`${provider}:${label}`);
+    return this.entries.has(`${provider}:${label}`);
   }
 
   /** Epoch ms when this pair's cooldown expires, or undefined when clean. */
   degradedUntil(provider: string, label: string): number | undefined {
-    return this.expiries.get(`${provider}:${label}`);
+    return this.entries.get(`${provider}:${label}`)?.entry.untilMs;
   }
 
   /**
@@ -156,24 +217,153 @@ export class CredentialCooldownStore {
    * remaining window — never a static "retry shortly".
    */
   earliestReinstatementMs(providers: Iterable<string>): number | undefined {
+    const wanted = new Set(providers);
     let earliest: number | undefined;
-    for (const provider of providers) {
-      const prefix = `${provider}:`;
-      for (const [key, at] of this.expiries) {
-        if (!key.startsWith(prefix)) continue;
-        const remaining = at - Date.now();
-        if (earliest === undefined || remaining < earliest) earliest = remaining;
-      }
+    for (const { entry } of this.entries.values()) {
+      if (!wanted.has(entry.provider)) continue;
+      const remaining = entry.untilMs - Date.now();
+      if (earliest === undefined || remaining < earliest) earliest = remaining;
     }
     return earliest === undefined ? undefined : Math.max(0, earliest);
   }
 
+  /**
+   * Live cooldown entries (benched right now), for the providers status UI.
+   * Copy-on-read: the caller gets plain data decoupled from internal timers.
+   */
+  snapshot(): CooldownEntry[] {
+    const now = Date.now();
+    const out: CooldownEntry[] = [];
+    for (const { entry } of this.entries.values()) {
+      if (entry.untilMs > now) out.push({ ...entry });
+    }
+    return out;
+  }
+
+  /**
+   * Last-known quota marks (most recent 429 per key), for the providers
+   * status UI — includes keys that are NOT currently benched, so the real
+   * quota-reset date stays visible after the clamped cooldown expires.
+   */
+  quotaSnapshot(): QuotaMarkRecord[] {
+    return [...this.quotaMarks.values()].map((r) => ({ ...r }));
+  }
+
+  /**
+   * Restore state written by a previous process. A missing file is the
+   * normal first-boot case (silent); anything unreadable or structurally
+   * unexpected logs one warning and starts fresh — persistence must never
+   * gate the boot. Cooldowns already past their expiry are dropped (the
+   * point is honoring REMAINING windows, not resurrecting stale ones).
+   */
+  private loadFromDisk(statePath: string): void {
+    let raw: string;
+    try {
+      raw = readFileSync(statePath, "utf8");
+    } catch {
+      return; // absent = first boot (or never marked) — nothing to restore
+    }
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== "object") throw new Error("not an object");
+      const doc = parsed as { cooldowns?: unknown; quotaMarks?: unknown };
+      const now = Date.now();
+      let restoredCooldowns = 0;
+      if (Array.isArray(doc.cooldowns)) {
+        for (const c of doc.cooldowns) {
+          if (!isPersistedCooldown(c) || c.untilMs <= now) continue;
+          this.schedule(c.provider, c.label, c.untilMs);
+          restoredCooldowns++;
+        }
+      }
+      let restoredMarks = 0;
+      if (Array.isArray(doc.quotaMarks)) {
+        for (const q of doc.quotaMarks) {
+          if (!isPersistedQuotaMark(q)) continue;
+          this.quotaMarks.set(`${q.provider}:${q.label}`, {
+            provider: q.provider,
+            label: q.label,
+            last429At: q.last429At,
+            ...(q.quotaResetAt !== undefined ? { quotaResetAt: q.quotaResetAt } : {}),
+          });
+          restoredMarks++;
+        }
+      }
+      if (restoredCooldowns + restoredMarks > 0) {
+        logger.info("restored cooldown state from previous run", {
+          statePath,
+          cooldowns: restoredCooldowns,
+          quotaMarks: restoredMarks,
+        });
+      }
+    } catch (err) {
+      logger.warn("cooldown state file unreadable, starting fresh", {
+        statePath,
+        error: errorMessage(err),
+      });
+    }
+  }
+
+  /** Atomically write current state (tmp file + rename); warn once on failure. */
+  private persist(): void {
+    if (this.statePath === undefined || this.persistWarned) return;
+    const now = Date.now();
+    const doc = {
+      version: 1,
+      cooldowns: [...this.entries.values()]
+        .filter(({ entry }) => entry.untilMs > now)
+        .map(({ entry: { provider, label, untilMs } }) => ({ provider, label, untilMs })),
+      quotaMarks: this.quotaSnapshot(),
+    };
+    const tmp = `${this.statePath}.tmp`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify(doc)}\n`);
+      renameSync(tmp, this.statePath);
+    } catch (err) {
+      this.persistWarned = true;
+      logger.warn("cooldown state persistence unavailable (continuing in-memory)", {
+        statePath: this.statePath,
+        error: errorMessage(err),
+      });
+    }
+  }
+
   /** Clear all cooldowns (used in tests to reset state between cases). */
   clear(): void {
-    for (const timer of this.timers.values()) clearTimeout(timer);
-    this.timers.clear();
-    this.expiries.clear();
+    for (const { timer } of this.entries.values()) clearTimeout(timer);
+    this.entries.clear();
+    this.quotaMarks.clear();
+    this.persist();
   }
+}
+
+function isPersistedCooldown(
+  v: unknown,
+): v is { provider: string; label: string; untilMs: number } {
+  if (v === null || typeof v !== "object") return false;
+  const r = v as Record<string, unknown>;
+  return (
+    typeof r.provider === "string" &&
+    r.provider !== "" &&
+    typeof r.label === "string" &&
+    r.label !== "" &&
+    typeof r.untilMs === "number" &&
+    Number.isFinite(r.untilMs)
+  );
+}
+
+function isPersistedQuotaMark(
+  v: unknown,
+): v is { provider: string; label: string; last429At: number; quotaResetAt?: number } {
+  if (v === null || typeof v !== "object") return false;
+  const r = v as Record<string, unknown>;
+  if (typeof r.provider !== "string" || r.provider === "") return false;
+  if (typeof r.label !== "string" || r.label === "") return false;
+  if (typeof r.last429At !== "number" || !Number.isFinite(r.last429At)) return false;
+  return (
+    r.quotaResetAt === undefined ||
+    (typeof r.quotaResetAt === "number" && Number.isFinite(r.quotaResetAt))
+  );
 }
 
 /**

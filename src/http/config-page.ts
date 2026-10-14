@@ -186,7 +186,7 @@ export function renderConfigPageHtml(chatEnabled: boolean): string {
             </template>
             <div x-show="cfg.providers[key].credentials && cfg.providers[key].credentials.length>0" class="text-xs text-slate-500">
               key pool: <b x-text="cfg.providers[key].credentials.length"></b> key(s) — labels
-              <span class="font-mono" x-text="(cfg.providers[key].credentials||[]).map(e=>e.label||'default').join(' → ')"></span>
+              <span class="font-mono" x-text="(cfg.providers[key].credentials||[]).map(e=>(e.label||'default')+(e.name?' ('+e.name+')':'')).join(' → ')"></span>
               (edit in config.local.jsonc)
             </div>
             <label class="flex items-center gap-2 text-sm"><input type="checkbox" x-model="cfg.providers[key].countTokens" /> countTokens (upstream supports Anthropic count_tokens)</label>

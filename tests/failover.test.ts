@@ -247,6 +247,105 @@ describe("pre-stream failover via createFetchHandler", () => {
     }
   });
 
+  // Regression (live 2026-10-12): the shipped zai pool has FIVE keys, but the
+  // old default cap of 4 truncated the plan mid-pool — the quinary key was
+  // never tried, and in a tier the zai slots alone consumed the whole cap so
+  // failover to the next candidate never happened.
+  describe("default cap covers the full 5-key pool (shipped .env shape)", () => {
+    const POOL5 = ["primary", "secondary", "tertiary", "quaternary", "quinary"].map((label) => ({
+      credential: `${label}-key`,
+      label,
+    }));
+
+    function config5(): ProxyConfig {
+      return validateConfig({
+        server: { host: "127.0.0.1", port: 8787 },
+        inboundAuth: { keys: [KEY] },
+        primaryRegion: "us",
+        profilePreference: "global",
+        refreshIntervalMinutes: 60,
+        claudeFallbackToMantle: false,
+        regions: [{ key: "us", awsRegion: "us-east-1" }],
+        providers: {
+          zai: {
+            type: "anthropic",
+            credentials: POOL5,
+            auth: "bearer",
+            baseUrl: "https://api.z.ai/api/anthropic",
+            countTokens: true,
+            modelsUrl: "https://api.z.ai/api/paas/v4/models",
+          },
+          alibaba: {
+            type: "anthropic",
+            credential: "alibaba-key",
+            auth: "x-api-key",
+            baseUrl: "https://dashscope-intl.aliyuncs.com/apps/anthropic",
+            countTokens: true,
+            modelsUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models",
+          },
+        },
+        virtualModels: {
+          "sonnet-like": ["zai.anthropic.global.glm-5.3", "alibaba.anthropic.global.qwen3-max"],
+        },
+        // maxFailoverAttempts intentionally ABSENT -> exercises the default.
+        logging: { enabled: false },
+        chatPage: { enabled: false },
+      });
+    }
+
+    test("the fifth (quinary) key still gets its attempt under the default cap", async () => {
+      const mock = installFetchMock([
+        { status: 429, json: {} },
+        { status: 429, json: {} },
+        { status: 429, json: {} },
+        { status: 429, json: {} },
+        { status: 200, json: ANTHROPIC_OK },
+      ]);
+      try {
+        const res = await handler(config5())(
+          postMessages({
+            model: TIER,
+            max_tokens: 16,
+            ...STREAMING,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        );
+        expect(res.status).toBe(200);
+        expect(mock.requests).toHaveLength(5);
+        expect(mock.requests[4]?.headers.authorization).toBe("Bearer quinary-key");
+      } finally {
+        mock.restore();
+      }
+    });
+
+    test("after the whole pool 429s, the tier still reaches the next candidate", async () => {
+      const mock = installFetchMock([
+        { status: 429, json: {} },
+        { status: 429, json: {} },
+        { status: 429, json: {} },
+        { status: 429, json: {} },
+        { status: 429, json: {} },
+        { status: 200, json: ANTHROPIC_OK },
+      ]);
+      try {
+        const res = await handler(config5())(
+          postMessages({
+            model: TIER,
+            max_tokens: 16,
+            ...STREAMING,
+            messages: [{ role: "user", content: "hi" }],
+          }),
+        );
+        expect(res.status).toBe(200);
+        expect(mock.requests).toHaveLength(6);
+        expect(mock.requests[5]?.url).toContain("dashscope-intl.aliyuncs.com");
+        expect(mock.requests[5]?.headers["x-api-key"]).toBe("alibaba-key");
+      } finally {
+        mock.restore();
+      }
+    });
+  });
+
   test("count_tokens through a virtual tier failovers across keys", async () => {
     const mock = installFetchMock([
       { status: 401, json: {} },
@@ -563,6 +662,44 @@ describe("cross-request 429 cooldown (CredentialCooldownStore)", () => {
     }
   });
 
+  test("snapshot() lists benched keys with provider/label/untilMs; empty when clean", () => {
+    const store = new CredentialCooldownStore();
+    expect(store.snapshot()).toEqual([]);
+    store.mark("zai", "primary", undefined, () => 0);
+    store.mark("alibaba", "default", undefined, () => 0);
+    const snap = store.snapshot();
+    expect(snap).toHaveLength(2);
+    const zai = snap.find((e) => e.provider === "zai");
+    expect(zai?.label).toBe("primary");
+    expect(zai?.untilMs).toBe(store.degradedUntil("zai", "primary") ?? 0);
+    const alibaba = snap.find((e) => e.provider === "alibaba");
+    expect(alibaba?.label).toBe("default");
+    store.clear();
+    expect(store.snapshot()).toEqual([]);
+  });
+
+  test("quotaSnapshot keeps the REAL reset stamp after clamping, and blind marks record no stamp", () => {
+    const store = new CredentialCooldownStore();
+    const weeklyReset = Date.now() + 4 * 24 * 3600 * 1000; // days out -> clamped cooldown
+    store.mark("zai", "primary", weeklyReset, () => 0);
+    store.mark("zai", "secondary", undefined, () => 0);
+
+    // The operational cooldown is clamped to 1h — but the quota mark keeps the
+    // real (unclamped) provider-side reset date for the status UI.
+    expect(store.degradedUntil("zai", "primary")).toBeLessThanOrEqual(Date.now() + 3600_000 + 1);
+    const marks = store.quotaSnapshot();
+    expect(marks).toHaveLength(2);
+    const primary = marks.find((m) => m.label === "primary");
+    expect(primary?.quotaResetAt).toBe(weeklyReset);
+    expect(primary?.last429At).toBeGreaterThan(Date.now() - 5000);
+    const secondary = marks.find((m) => m.label === "secondary");
+    expect(secondary?.quotaResetAt).toBeUndefined();
+    expect(secondary?.last429At).toBeGreaterThan(Date.now() - 5000);
+
+    store.clear();
+    expect(store.quotaSnapshot()).toEqual([]);
+  });
+
   test("a 401 does NOT start a cooldown (only 429 does)", async () => {
     const store = new CredentialCooldownStore();
     const mock = installFetchMock([
@@ -772,15 +909,14 @@ describe("request-completed log enrichment (serving info)", () => {
     }
   });
 
-  test("a non-inference request (health probe) has no serving fields", async () => {
+  test("the connection-warming probe (HEAD /api/hello) is not logged at all", async () => {
     const lines = await captureLogs(async () => {
       const res = await handler()(new Request("http://localhost/api/hello", { method: "HEAD" }));
       expect(res.status).toBe(204);
     });
-    const completed = lines.find((l) => l.includes("request completed"));
-    expect(completed).toBeDefined();
-    expect(completed?.includes("served=")).toBe(false);
-    expect(completed?.includes("key=")).toBe(false);
+    // The probe fires before every session; one completion line per probe is
+    // pure noise, so the completion log skips it entirely.
+    expect(lines.some((l) => l.includes("request completed"))).toBe(false);
   });
 });
 

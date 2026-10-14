@@ -84,6 +84,7 @@ function req(method: string, path: string, withKey: boolean): Request {
 const MANAGEMENT_GET = [
   "/api/config",
   "/api/config/status",
+  "/api/providers/status",
   "/api/config/auth",
   "/api/logs/system",
   "/api/logs/sessions",
@@ -128,7 +129,12 @@ describe("management surface requires the inbound key", () => {
 
   test("management GETs are reachable (not 401) with a valid key", async () => {
     const h = handler();
-    for (const path of ["/api/config", "/api/config/status", "/api/config/auth"]) {
+    for (const path of [
+      "/api/config",
+      "/api/config/status",
+      "/api/providers/status",
+      "/api/config/auth",
+    ]) {
       const res = await h(req("GET", path, true));
       expect(res.status).not.toBe(401);
     }

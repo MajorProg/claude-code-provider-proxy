@@ -8,7 +8,9 @@
  *   - GET  /v1/models                discovered canonical model ids
  *   - POST /v1/messages              inference (translation paths P/C/M)
  *   - POST /v1/messages/count_tokens token counting
- *   - HEAD /api/hello                connection-warming probe -> 204
+ *   - HEAD /api/hello                connection-warming probe -> 204 (unlogged)
+ *   - GET  /providers                providers status page (HTML)
+ *   - GET  /api/providers/status     per-provider discovery + key-cooldown state
  *
  * All inference translation handlers (Paths P/C/M) are fully wired. All
  * model/registry data shown is real, discovered at runtime — never hardcoded.
@@ -42,6 +44,7 @@ import { CredentialCooldownStore, executeWithFailover, isClientDisconnect } from
 import { renderChatPageHtml } from "./http/chat-page.ts";
 import { renderConfigPageHtml } from "./http/config-page.ts";
 import { renderLogViewerHtml } from "./http/log-viewer-page.ts";
+import { renderProvidersPageHtml } from "./http/providers-page.ts";
 import { buildRegistrySnapshot, renderRegistryHtml } from "./http/registry-page.ts";
 import { preconnectOrigin } from "./http/upstream.ts";
 import { ZipLimitError, buildZip } from "./http/zip.ts";
@@ -710,8 +713,13 @@ export async function buildRuntime(
   await logStore.verifyWritable();
   // Reuse an existing cooldown store across hot-reloads so in-flight cooldowns
   // are preserved when config changes (e.g. a UI save). On first boot, create
-  // a new one.
-  const cooldownStore = existingCooldownStore ?? new CredentialCooldownStore();
+  // a new one backed by a state file in the (mounted, persistent) logging
+  // dir, so cooldowns + quota marks survive restarts/reboots too.
+  const cooldownStore =
+    existingCooldownStore ??
+    new CredentialCooldownStore({
+      statePath: `${config.logging.dir.replace(/\/+$/, "")}/cooldown-state.json`,
+    });
   return {
     config,
     tokenProvider: mode.enabled ? mode.tokenProvider : null,
@@ -1013,6 +1021,89 @@ function handleConfigStatus({ config, catalogManager }: RouteContext): Response 
   });
 }
 
+/**
+ * Serving-state view for the Providers UI tab: per external provider, the
+ * discovery state (joined from the catalog's source statuses) plus the LIVE
+ * per-key 429 cooldown state from the runtime cooldown store — a benched key
+ * carries its reinstatement time so the page can show a date + countdown.
+ * Key entries carry the LABEL only, never the credential. `serverNow` lets
+ * the page compute clock-skew-free countdowns.
+ */
+function handleProvidersStatus({ config, catalogManager, cooldownStore }: RouteContext): Response {
+  const cat = catalogManager.current();
+  const sources = new Map((cat.sources ?? []).map((s) => [s.source, s]));
+  const bedrockMode = resolveBedrockMode(config.providers.bedrock?.credential);
+  const cooled = cooldownStore.snapshot();
+  const quotaMarks = cooldownStore.quotaSnapshot();
+  const keyStatus = (provider: string, entry: CredentialPoolEntry) => {
+    const label = entry.label ?? "default";
+    const c = cooled.find((e) => e.provider === provider && e.label === label);
+    // Last-known quota picture (persists after the cooldown expires): the REAL
+    // provider-side reset stamp, e.g. z.ai's weekly "limit will reset at" date.
+    const q = quotaMarks.find((e) => e.provider === provider && e.label === label);
+    return {
+      label,
+      ...(entry.name !== undefined ? { name: entry.name } : {}),
+      status: c === undefined ? ("ok" as const) : ("cooldown" as const),
+      ...(c === undefined
+        ? {}
+        : {
+            cooldownUntilMs: c.untilMs,
+            cooldownUntilIso: new Date(c.untilMs).toISOString(),
+          }),
+      ...(q === undefined
+        ? {}
+        : {
+            last429At: q.last429At,
+            ...(q.quotaResetAt !== undefined
+              ? {
+                  quotaResetAt: q.quotaResetAt,
+                  quotaResetIso: new Date(q.quotaResetAt).toISOString(),
+                }
+              : {}),
+          }),
+    };
+  };
+  const providers = Object.entries(config.providers.external).map(([key, p]) => {
+    const models = cat.models.filter((m) => m.provider === key);
+    const src = sources.get(key);
+    const base = {
+      key,
+      type: p.type,
+      models: models.length,
+      state: (src?.state ?? "skipped") as "ok" | "error" | "skipped" | "disabled",
+      ...(src?.detail ? { detail: src.detail } : {}),
+      ...(p.inactiveReason ? { inactiveReason: p.inactiveReason } : {}),
+      ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}),
+    };
+    // Multi-region providers hold one credential pool per region; flat
+    // providers hold a single (possibly unlabeled "default") pool.
+    if (p.regions !== undefined) {
+      return {
+        ...base,
+        regions: Object.entries(p.regions).map(([regionKey, r]) => ({
+          region: regionKey,
+          state: (sources.get(`${key}:${regionKey}`)?.state ?? "skipped") as
+            | "ok"
+            | "error"
+            | "skipped"
+            | "disabled",
+          ...(r.inactiveReason ? { inactiveReason: r.inactiveReason } : {}),
+          keys: (r.credentials ?? []).map((e) => keyStatus(key, e)),
+        })),
+      };
+    }
+    return { ...base, keys: p.credentials.map((e) => keyStatus(key, e)) };
+  });
+  return Response.json({
+    serverNow: Date.now(),
+    bedrock: bedrockMode.enabled
+      ? { enabled: true }
+      : { enabled: false, reason: bedrockMode.reason },
+    providers,
+  });
+}
+
 async function handleConfigSave({ req, reloadRuntime }: RouteContext): Promise<Response> {
   const outcome = await reloadRuntime(await req.json());
   // An ephemeral inbound deployment rotates its key on every reload (the old
@@ -1138,6 +1229,15 @@ const ROUTES: Route[] = [
     handler: ({ config }) =>
       new Response(renderConfigPageHtml(config.chatPage.enabled), { headers: htmlHeaders }),
   },
+  // Providers serving-state page (discovery + per-key cooldown view).
+  {
+    method: "GET",
+    name: "providers-page",
+    match: exact("/providers"),
+    requiresAuth: false,
+    handler: ({ config }) =>
+      new Response(renderProvidersPageHtml(config.chatPage.enabled), { headers: htmlHeaders }),
+  },
   // Log observability API — gated.
   {
     method: "GET",
@@ -1195,6 +1295,13 @@ const ROUTES: Route[] = [
     match: exact("/api/config/status"),
     requiresAuth: true,
     handler: handleConfigStatus,
+  },
+  {
+    method: "GET",
+    name: "providers-status",
+    match: exact("/api/providers/status"),
+    requiresAuth: true,
+    handler: handleProvidersStatus,
   },
   {
     method: "POST",
@@ -1309,6 +1416,9 @@ export function createFetchHandler(
       }
 
       const isApi = pathname.startsWith("/v1/") || pathname.startsWith("/api/");
+      // The connection-warming probe fires before every session — one completion
+      // line per probe is pure noise, so it is never logged.
+      if (matched?.route.name === "hello") return res;
       logger[isApi ? "info" : "debug"]("request completed", {
         requestId,
         method,

@@ -68,8 +68,11 @@
       // Credential pool (docs/VIRTUAL_MODELS.md): request-time failover walks these
       // in order (401/403/429 or connect failure, pre-stream). Empty "${VAR:-}"
       // entries are filtered — an entirely-empty pool just skips the provider.
+      // "label" is the machine identity (logs, cooldowns); optional "name" is a
+      // human-readable account/plan label shown in the Providers UI, e.g.
+      //   { "credential": "${ZAI_API_KEY:-}", "label": "primary", "name": "Chimera Developer 2" }
       "credentials": [
-        { "credential": "${ZAI_API_KEY:-}", "label": "primary" },
+        { "credential": "${ZAI_API_KEY:-}", "label": "primary", "name": "Personal" },
         { "credential": "${ZAI_API_KEY_SECONDARY:-}", "label": "secondary" },
         { "credential": "${ZAI_API_KEY_TERTIARY:-}", "label": "tertiary" },
         { "credential": "${ZAI_API_KEY_QUATERNARY:-}", "label": "quaternary" },
@@ -142,14 +145,14 @@
     // }
     //
     // Mistral (OpenAI-compatible):
-    // ,"mistral": {
-    //   "type": "openai",
-    //   "credential": "${MISTRAL_API_KEY}",
-    //   "auth": "bearer",
-    //   "baseUrl": "https://api.mistral.ai/v1",
-    //   "countTokens": false,
-    //   "modelsUrl": "https://api.mistral.ai/v1/models"
-    // }
+    ,"mistral": {
+      "type": "openai",
+      "credential": "${MISTRAL_API_KEY:-}",
+      "auth": "bearer",
+      "baseUrl": "https://api.mistral.ai/v1",
+      "countTokens": true,
+      "modelsUrl": "https://api.mistral.ai/v1/models"
+    }
     //
     // Moonshot / Kimi (native Anthropic endpoint, bearer; no count_tokens):
     // ,"moonshot": {
@@ -191,25 +194,25 @@
   // Reorder the arrays to change provider/model priority.
   "virtualModels": {
     "sonnet-like": [
-      "zai.anthropic.global.glm-5.3",
-      "alibaba.anthropic.ap-southeast-1.qwen3-coder-480b-a35b-instruct",
-      "bedrock.mantle.us.zai.glm-5"
+      "deepseek.anthropic.global.deepseek-flash",
+      "zai.anthropic.global.glm-5.3"
+      // "mistral.openai.global.mistral-medium-latest"
     ],
     "haiku-like": [
-      "zai.anthropic.global.glm-5.3-flash",
-      "alibaba.anthropic.ap-southeast-1.qwen3-coder-flash",
-      "bedrock.mantle.us.zai.glm-4.7-flash"
+      "deepseek.anthropic.global.deepseek-flash",
+      "zai.anthropic.global.glm-5.3-flash"
     ],
     "opus-like": [
-      "alibaba.anthropic.ap-southeast-1.qwen3.8-max-0902",
-      "bedrock.mantle.us.moonshotai.kimi-k2.5",
-      "zai.anthropic.global.glm-5.3"
+      "zai.anthropic.global.glm-5.3",
+      "deepseek.anthropic.global.deepseek-v4-pro"
     ]
   },
 
   // Total upstream attempts (candidates x pool keys) per request before the
-  // last error is relayed. Default 4.
-  "maxFailoverAttempts": 4,
+  // last error is relayed. Default 8 — keep it >= your largest tier plan
+  // (pool keys of candidate 1 + candidates 2..n), or later keys/candidates
+  // are never tried.
+  "maxFailoverAttempts": 8,
 
   // Audible terminal alert when the serving ACCOUNT changes (failover to the
   // next key, cooldown expiry reinstating a key, a tier shifting providers):

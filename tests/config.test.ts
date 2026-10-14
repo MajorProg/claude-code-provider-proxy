@@ -340,7 +340,7 @@ describe("validateConfig", () => {
     expect(cfg.providers.external.zai?.inactiveReason).toBeUndefined();
   });
 
-  test("a credentials array wins over a flat credential; empty entries filtered; labels kept", () => {
+  test("a credentials array wins over a flat credential; empty entries filtered; labels + names kept", () => {
     const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
       providers: Record<string, unknown>;
     };
@@ -349,9 +349,9 @@ describe("validateConfig", () => {
       credential: "flat-ignored",
       credentials: [
         { credential: "", label: "unset-env-ref" },
-        { credential: "primary-key", label: "primary" },
+        { credential: "primary-key", label: "primary", name: "Chimera Developer 2" },
         "not-a-record",
-        { credential: "secondary-key" },
+        { credential: "secondary-key", name: "" },
       ],
       auth: "bearer",
       baseUrl: "https://api.z.ai/api/anthropic",
@@ -360,7 +360,7 @@ describe("validateConfig", () => {
     };
     const cfg = validateConfig(raw);
     expect(cfg.providers.external.zai?.credentials).toEqual([
-      { credential: "primary-key", label: "primary" },
+      { credential: "primary-key", label: "primary", name: "Chimera Developer 2" },
       { credential: "secondary-key" },
     ]);
     expect(cfg.providers.external.zai?.credential).toBe("primary-key");
@@ -639,8 +639,8 @@ describe("validateConfig — virtualModels + maxFailoverAttempts", () => {
     expect(validateConfig(TIER_RAW).virtualModels).toBeUndefined();
   });
 
-  test("maxFailoverAttempts defaults to 4 and validates [1, 16]", () => {
-    expect(validateConfig(TIER_RAW).maxFailoverAttempts).toBe(4);
+  test("maxFailoverAttempts defaults to 8 and validates [1, 16]", () => {
+    expect(validateConfig(TIER_RAW).maxFailoverAttempts).toBe(8);
     expect(validateConfig({ ...TIER_RAW, maxFailoverAttempts: 2 }).maxFailoverAttempts).toBe(2);
     for (const bad of [0, -1, 1.5, "4", 17]) {
       expect(() => validateConfig({ ...TIER_RAW, maxFailoverAttempts: bad })).toThrow(ConfigError);

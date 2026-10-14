@@ -424,7 +424,7 @@ describe("serializeConfig credential pools", () => {
     ).toThrow(/accountScoped must be a boolean/);
   });
 
-  test("a labeled singleton stays an array; an unlabeled one flattens", () => {
+  test("a labeled or named singleton stays an array; an unlabeled one flattens", () => {
     const cfg = validateConfig({
       ...BASE,
       providers: {
@@ -444,6 +444,14 @@ describe("serializeConfig credential pools", () => {
           countTokens: false,
           modelsUrl: "https://b.example.com/models",
         },
+        c: {
+          type: "anthropic",
+          credentials: [{ credential: "lone-key-3", name: "Chimera Developer 2" }],
+          auth: "bearer",
+          baseUrl: "https://c.example.com",
+          countTokens: false,
+          modelsUrl: "https://c.example.com/models",
+        },
       },
     });
     const out = serializeConfig(cfg, {});
@@ -451,6 +459,10 @@ describe("serializeConfig credential pools", () => {
     expect(providers.a?.credentials).toEqual([{ credential: "lone-key", label: "sponsor" }]);
     expect(providers.b?.credential).toBe("lone-key-2");
     expect(providers.b?.credentials).toBeUndefined();
+    // A display name alone also forces (and round-trips through) the array form.
+    expect(providers.c?.credentials).toEqual([
+      { credential: "lone-key-3", name: "Chimera Developer 2" },
+    ]);
   });
 
   test('an empty pool round-trips as credential:"" (next boot still loads)', () => {
@@ -541,6 +553,6 @@ describe("serializeConfig virtualModels + maxFailoverAttempts", () => {
     const cfg = validateConfig(rest);
     const out = serializeConfig(cfg, {});
     expect("virtualModels" in out).toBe(false);
-    expect(out.maxFailoverAttempts).toBe(4);
+    expect(out.maxFailoverAttempts).toBe(8);
   });
 });
