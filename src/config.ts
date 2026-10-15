@@ -444,8 +444,43 @@ export interface LoggingConfig {
    * (log viewer, API, ZIP export) decompress transparently; listings serve
    * from the summary index and never touch bodies. Defaults to
    * {@link DEFAULT_LOG_COMPRESSION} when absent.
+   *
+   * ACCEPTED-AND-IGNORED: turn bodies are now zstd-compressed at write, so this
+   * block no longer drives behavior. It is still parsed, validated and
+   * serialized so an on-disk config keeps loading and a UI save round-trips it
+   * verbatim (removing it would break boot).
    */
   readonly compression: LogCompressionConfig;
+  /**
+   * Retention window for turn BODIES, in days. Bodies older than this are
+   * pruned (file deleted, `body_state` set to `pruned`); the index rows and
+   * `prompt_versions` are kept forever. `0` = keep bodies forever. Defaults to
+   * {@link DEFAULT_LOG_RETENTION_DAYS} when absent.
+   */
+  readonly retentionDays: number;
+  /**
+   * Per-turn body byte cap. A larger body is written clipped and marked
+   * `truncated`. Defaults to {@link DEFAULT_LOG_MAX_TURN_BYTES} when absent.
+   */
+  readonly maxTurnBytes: number;
+  /**
+   * Global in-flight (queued-but-unwritten) body byte budget. Under pressure the
+   * writer sheds bodies (marked `shed`) while ALWAYS recording metadata; the
+   * client response is never affected. Defaults to
+   * {@link DEFAULT_LOG_IN_FLIGHT_BUDGET_BYTES} when absent.
+   */
+  readonly inFlightBudgetBytes: number;
+  /**
+   * Max delay before a batched index commit is flushed. Defaults to
+   * {@link DEFAULT_LOG_INDEX_FLUSH_MS} when absent.
+   */
+  readonly indexFlushMs: number;
+  /**
+   * zstd compression level for turn bodies. Defaults to
+   * {@link DEFAULT_LOG_ZSTD_LEVEL} when absent. Level 3 is the measured sweet
+   * spot (2.95 ms, 3.9x on 1.28 MB); level 19 is 176 ms and is never wanted.
+   */
+  readonly zstdLevel: number;
 }
 
 /** Knobs for background turn-file compression. */
@@ -468,6 +503,21 @@ export const DEFAULT_LOG_COMPRESSION: LogCompressionConfig = {
   enabled: true,
   minAgeMinutes: 10,
 };
+
+/** Default turn-body retention window (days); 0 would keep bodies forever. */
+export const DEFAULT_LOG_RETENTION_DAYS = 30;
+
+/** Default per-turn body byte cap (8 MiB). */
+export const DEFAULT_LOG_MAX_TURN_BYTES = 8 * 1024 * 1024;
+
+/** Default global in-flight body byte budget (256 MiB). */
+export const DEFAULT_LOG_IN_FLIGHT_BUDGET_BYTES = 256 * 1024 * 1024;
+
+/** Default index batch-flush delay (ms). */
+export const DEFAULT_LOG_INDEX_FLUSH_MS = 250;
+
+/** Default zstd level for turn bodies (measured sweet spot). */
+export const DEFAULT_LOG_ZSTD_LEVEL = 3;
 
 export interface ChatPageConfig {
   readonly enabled: boolean;
@@ -1086,6 +1136,13 @@ function validateLogging(raw: unknown): LoggingConfig {
       : DEFAULT_LOG_CAPTURE_TIMEOUT_MS;
   const rawCompression = isRecord(rawLogging.compression) ? rawLogging.compression : {};
   const rawMinAge = rawCompression.minAgeMinutes;
+  // Bounded integer option: an absent/invalid value falls back to `dflt`.
+  const intOption = (
+    v: unknown,
+    dflt: number,
+    min: number,
+    max = Number.MAX_SAFE_INTEGER,
+  ): number => (typeof v === "number" && Number.isInteger(v) && v >= min && v <= max ? v : dflt);
   return {
     enabled: rawLogging.enabled === true,
     dir: stringOrDefault(rawLogging.dir, "./logs"),
@@ -1099,6 +1156,16 @@ function validateLogging(raw: unknown): LoggingConfig {
           ? rawMinAge
           : DEFAULT_LOG_COMPRESSION.minAgeMinutes,
     },
+    retentionDays: intOption(rawLogging.retentionDays, DEFAULT_LOG_RETENTION_DAYS, 0),
+    maxTurnBytes: intOption(rawLogging.maxTurnBytes, DEFAULT_LOG_MAX_TURN_BYTES, 1),
+    inFlightBudgetBytes: intOption(
+      rawLogging.inFlightBudgetBytes,
+      DEFAULT_LOG_IN_FLIGHT_BUDGET_BYTES,
+      1,
+    ),
+    indexFlushMs: intOption(rawLogging.indexFlushMs, DEFAULT_LOG_INDEX_FLUSH_MS, 1),
+    // zstd levels are 1..22; anything else would throw at compress time.
+    zstdLevel: intOption(rawLogging.zstdLevel, DEFAULT_LOG_ZSTD_LEVEL, 1, 22),
   };
 }
 
@@ -1601,10 +1668,17 @@ export function serializeConfig(
       systemDir: config.logging.systemDir,
       sessionDir: config.logging.sessionDir,
       captureTimeoutMs: config.logging.captureTimeoutMs,
+      // Accepted-and-ignored: preserved verbatim so a UI save never drops a key
+      // an on-disk config still carries.
       compression: {
         enabled: config.logging.compression.enabled,
         minAgeMinutes: config.logging.compression.minAgeMinutes,
       },
+      retentionDays: config.logging.retentionDays,
+      maxTurnBytes: config.logging.maxTurnBytes,
+      inFlightBudgetBytes: config.logging.inFlightBudgetBytes,
+      indexFlushMs: config.logging.indexFlushMs,
+      zstdLevel: config.logging.zstdLevel,
     },
     chatPage: { enabled: config.chatPage.enabled },
     limits: {

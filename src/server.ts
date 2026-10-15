@@ -51,6 +51,7 @@ import { ZipLimitError, buildZip } from "./http/zip.ts";
 import { type CaptureContext, captureTurn, summarizeTools } from "./logging/capture.ts";
 import { LogStore } from "./logging/log-store.ts";
 import { errorMessage, logger, newRequestId } from "./logging/logger.ts";
+import { computePromptSurface } from "./logging/prompt-surface.ts";
 import {
   type RequestServingInfo,
   currentRequestContext,
@@ -428,6 +429,18 @@ async function dispatchMessages(
   // Best-effort capture (no-op when logging disabled). Never blocks/alters
   // the client response beyond a transparent stream tee. Reuses the parsed body.
   const toolTrace = summarizeTools(parsed.tools);
+  // Fingerprint the FULL instruction surface — the system prompt, the tool
+  // definitions WITH their schemas, and injected instruction envelopes lifted out
+  // of the conversation — so the prompt library distinguishes a tool-schema or
+  // `<system-reminder>` change from a system-prompt one. Computed only while
+  // capture is active (it scans the whole conversation on the request path).
+  const promptSurface = store.isEnabled()
+    ? computePromptSurface({
+        system: parsed.system,
+        tools: parsed.tools,
+        messages: parsed.messages,
+      })
+    : undefined;
   return maybeCaptureTurn(
     store,
     response,
@@ -439,6 +452,7 @@ async function dispatchMessages(
       translationPath: target.translationPath,
       system: parsed.system,
       messages: Array.isArray(parsed.messages) ? parsed.messages : [],
+      ...(promptSurface ? { promptSurface } : {}),
       ...(toolTrace ? { tools: toolTrace } : {}),
       ...(keyLabel ? { servingKeyLabel: keyLabel } : {}),
       requestedAt,
@@ -508,6 +522,17 @@ async function dispatchChat(
       translationPath: target.translationPath,
       system: raw.system ?? "You are a helpful assistant.",
       messages: Array.isArray(raw.messages) ? raw.messages : [],
+      // The chat page offers no tools, so the tool part of the surface is
+      // genuinely empty; injected instruction envelopes are still extracted.
+      ...(store.isEnabled()
+        ? {
+            promptSurface: computePromptSurface({
+              system: body.system,
+              tools: undefined,
+              messages: body.messages,
+            }),
+          }
+        : {}),
       ...(keyLabel ? { servingKeyLabel: keyLabel } : {}),
       requestedAt,
     },
@@ -852,47 +877,132 @@ function handleModelsList({ config, catalogManager }: RouteContext): Response {
   return Response.json({ data });
 }
 
-async function handleLogsSystemList({ logStore }: RouteContext): Promise<Response> {
-  return Response.json({ data: await logStore.listSystemPrompts() });
+/** Parse a route turn segment (a decimal `seq`) or null when not a positive int. */
+function parseTurnSeq(raw: string | undefined): number | null {
+  if (raw === undefined || !/^\d+$/.test(raw)) return null;
+  return Number(raw);
 }
 
-async function handleLogsExportSystem({ logStore }: RouteContext): Promise<Response> {
-  return zipResponse(await logStore.exportSystemPrompts(), "system-prompts");
+/** Cutoff epoch-ms for an export range filter, or null for "all" (never pruned). */
+function exportRangeCutoff(range: "all" | "today" | "1h"): number | null {
+  if (range === "all") return null;
+  if (range === "1h") return Date.now() - 60 * 60 * 1000;
+  // "today": local midnight.
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
 }
 
-async function handleLogsExportSessions({ url, logStore }: RouteContext): Promise<Response> {
-  const rangeParam = url.searchParams.get("range") ?? "all";
-  const range = rangeParam === "today" || rangeParam === "1h" ? rangeParam : "all";
-  return zipResponse(await logStore.exportSessionTurns(range), `sessions-${range}`);
+/**
+ * GET /api/logs/system — the browsable prompt/instruction-version library.
+ *
+ * A version is the FULL instruction surface (system blocks + tool schemas +
+ * injected instruction blocks) folded into one sha256; each is joined here with
+ * its per-version orchestration stats (turns, sessions, served models, token
+ * totals, stop reasons, failure classes, tool-call shape). Served entirely from
+ * the SQLite index — no directory scan. The version CONTENT is omitted from the
+ * listing (served by the detail route) so a many-version list stays small.
+ */
+async function handleLogsPromptsList({ logStore }: RouteContext): Promise<Response> {
+  const versions = await logStore.listPromptVersions();
+  const data = await Promise.all(
+    versions.map(async (v) => ({
+      hash: v.hash,
+      createdAt: v.createdAt,
+      lastSeen: v.lastSeen,
+      seenCount: v.seenCount,
+      systemBytes: v.systemBytes,
+      toolsBytes: v.toolsBytes,
+      stats: await logStore.statsForPromptVersion(v.hash),
+    })),
+  );
+  return Response.json({ data });
 }
 
-async function handleLogsSystemDetail({ params, logStore }: RouteContext): Promise<Response> {
+/** GET /api/logs/system/<hash> — one version's full content + its stats. */
+async function handleLogsPromptDetail({ params, logStore }: RouteContext): Promise<Response> {
   const hash = params[0] ?? "";
-  const rec = await logStore.getSystemPrompt(hash);
-  return rec ? Response.json(rec) : Response.json({ error: "not found" }, { status: 404 });
+  const rec = await logStore.getPromptVersion(hash);
+  if (!rec) return Response.json({ error: "not found" }, { status: 404 });
+  return Response.json({ ...rec, stats: await logStore.statsForPromptVersion(hash) });
 }
 
+/** GET /api/logs/sessions — every session with its token/turn aggregates. */
 async function handleLogsSessionsList({ logStore }: RouteContext): Promise<Response> {
   return Response.json({ data: await logStore.listSessions() });
 }
 
+/**
+ * GET /api/logs/sessions/<id>       — the session's turns (index metadata).
+ * GET /api/logs/sessions/<id>/<seq>  — one turn as `{ meta, body }`.
+ *
+ * The body may be ABSENT (shed under capture pressure, or pruned by retention)
+ * while the metadata row survives — the detail response carries BOTH so a
+ * missing payload is presented as a typed `bodyState`, never as a blank.
+ */
 async function handleLogsSessionDetail({ params, logStore }: RouteContext): Promise<Response> {
   // Route-level allow-list (defense-in-depth before LogStore): the session
-  // segment is strictly [A-Za-z0-9_-] (no dots -> no '..'); the turn segment
-  // allows dots for the timestamped filename but still no slashes.
-  const sessionOk = params[0] !== undefined && /^[a-zA-Z0-9_-]+$/.test(params[0]);
-  const turnOk = params[1] === undefined || /^[a-zA-Z0-9._-]+$/.test(params[1]);
-  if (!sessionOk || !turnOk) {
+  // segment is strictly [A-Za-z0-9_-] (no dots -> no '..'); the turn segment is
+  // the turn's integer `seq`.
+  if (params[0] === undefined || !/^[a-zA-Z0-9_-]+$/.test(params[0])) {
     return Response.json({ error: "not found" }, { status: 404 });
   }
-  if (params.length === 1 && params[0]) {
-    return Response.json({ data: await logStore.listTurns(params[0]) });
+  const sessionId = params[0];
+  if (params.length === 1) {
+    return Response.json({ data: await logStore.listTurns(sessionId) });
   }
-  if (params.length === 2 && params[0] && params[1]) {
-    const turn = await logStore.getTurn(params[0], params[1]);
-    return turn ? Response.json(turn) : Response.json({ error: "not found" }, { status: 404 });
+  if (params.length === 2) {
+    const seq = parseTurnSeq(params[1]);
+    if (seq === null) return Response.json({ error: "not found" }, { status: 404 });
+    const meta = (await logStore.listTurns(sessionId)).find((t) => t.seq === seq) ?? null;
+    const body = await logStore.getTurnBody(sessionId, seq);
+    if (meta === null && body === null) {
+      return Response.json({ error: "not found" }, { status: 404 });
+    }
+    return Response.json({ meta, body });
   }
   return Response.json({ error: "not found" }, { status: 404 });
+}
+
+/**
+ * GET /api/logs/export/system — every prompt version with its full content, one
+ * JSON member per version, composed from the index API (no directory scan).
+ */
+async function handleLogsExportSystem({ logStore }: RouteContext): Promise<Response> {
+  const versions = await logStore.listPromptVersions();
+  const entries = versions.map((v) => ({
+    name: `prompts/${v.hash}.json`,
+    content: JSON.stringify(v, null, 2),
+  }));
+  return zipResponse(entries, "prompt-versions");
+}
+
+/**
+ * GET /api/logs/export/sessions?range=all|today|1h — session turns within the
+ * range, bodies decompressed from the index API. A turn whose body was
+ * shed/pruned is exported as its metadata (marked `bodyUnavailable`) so the
+ * omission is explicit in the archive, never silent.
+ */
+async function handleLogsExportSessions({ url, logStore }: RouteContext): Promise<Response> {
+  const rangeParam = url.searchParams.get("range") ?? "all";
+  const range = rangeParam === "today" || rangeParam === "1h" ? rangeParam : "all";
+  const cutoff = exportRangeCutoff(range);
+  const sessions = await logStore.listSessions();
+  const entries: { name: string; content: string }[] = [];
+  for (const session of sessions) {
+    for (const turn of await logStore.listTurns(session.id)) {
+      if (cutoff !== null && Date.parse(turn.requestedAt) < cutoff) continue;
+      const body = await logStore.getTurnBody(session.id, turn.seq);
+      entries.push({
+        name: `sessions/${session.id}/${String(turn.seq).padStart(5, "0")}.json`,
+        content:
+          body === null
+            ? JSON.stringify({ ...turn, bodyUnavailable: true }, null, 2)
+            : JSON.stringify(body, null, 2),
+      });
+    }
+  }
+  return zipResponse(entries, `sessions-${range}`);
 }
 
 function handleMessages({
@@ -1238,13 +1348,13 @@ const ROUTES: Route[] = [
     handler: ({ config }) =>
       new Response(renderProvidersPageHtml(config.chatPage.enabled), { headers: htmlHeaders }),
   },
-  // Log observability API — gated.
+  // Log observability API — gated. Reads the SQLite turn index (no directory scan).
   {
     method: "GET",
-    name: "logs-system",
+    name: "logs-prompts",
     match: exact("/api/logs/system"),
     requiresAuth: true,
-    handler: handleLogsSystemList,
+    handler: handleLogsPromptsList,
   },
   {
     method: "GET",
@@ -1262,10 +1372,10 @@ const ROUTES: Route[] = [
   },
   {
     method: "GET",
-    name: "logs-system-detail",
+    name: "logs-prompt-detail",
     match: prefix("/api/logs/system/"),
     requiresAuth: true,
-    handler: handleLogsSystemDetail,
+    handler: handleLogsPromptDetail,
   },
   {
     method: "GET",

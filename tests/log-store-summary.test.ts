@@ -1,27 +1,29 @@
 /**
- * LogStore summary-index tests (scalable log listing).
+ * LogStore index-backed listing + export routes.
  *
- * The per-session `_summary.json` index lets listSessions/listTurns serve
- * listing metadata without reading turn-file bodies (which total many GB in a
- * long-lived deployment and previously OOM'd the proxy). These tests exercise
- * the full index lifecycle against the real recordTurn write path: creation,
- * exclusion from listings/exports, legacy backfill, drift self-healing,
- * concurrent appends (no lost entries), and corrupt-file tolerance.
+ * The old per-session `_summary.json` index is gone: listings are served from
+ * the SQLite index (`listSessions` / `listTurns`), and the ZIP-export routes
+ * read each turn body (a zstd file) or prompt version straight out of the store.
+ * These tests cover the lifecycle the viewer depends on:
+ *   - `listSessions` orders by last activity and sums tokens;
+ *   - `exportSessionTurns` names every turn body WITHOUT the `.zst` extension,
+ *     decompresses its content, honors the `all | today | 1h` range filter, and
+ *     skips a shed body (no file on disk);
+ *   - `exportSystemPrompts` emits each prompt version's full instruction surface.
+ *
+ * Hermetic: temp directories only, never the repo `./logs`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import {
-  copyFileSync,
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { LoggingConfig } from "../src/config.ts";
 import { LogStore } from "../src/logging/log-store.ts";
+import type { TurnRecord } from "../src/logging/log-types.ts";
+import { computePromptSurface } from "../src/logging/prompt-surface.ts";
 
 let root: string;
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "ccpp-logstore-summary-"));
 });
@@ -29,22 +31,32 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function store(): LogStore {
-  return new LogStore({
+function logConfig(over: Partial<LoggingConfig> = {}): LoggingConfig {
+  return {
     enabled: true,
     dir: root,
     systemDir: "system",
     sessionDir: "sessions",
-    captureTimeoutMs: 120000,
+    captureTimeoutMs: 120_000,
     compression: { enabled: false, minAgeMinutes: 10 },
-  });
+    retentionDays: 30,
+    maxTurnBytes: 8 * 1024 * 1024,
+    inFlightBudgetBytes: 256 * 1024 * 1024,
+    indexFlushMs: 60_000,
+    zstdLevel: 3,
+    ...over,
+  };
 }
 
-function turn(sessionId: string, at: string, inTok: number, outTok: number) {
+function store(over: Partial<LoggingConfig> = {}): LogStore {
+  return new LogStore(logConfig(over), { writerMode: "inline" });
+}
+
+function turn(sessionId: string, at: string, inTok: number, outTok: number): TurnRecord {
   return {
     sessionId,
-    canonicalModel: "bedrock.converse.global.x",
-    invocationModel: "x",
+    canonicalModel: "bedrock.converse.global.model-x",
+    invocationModel: "model-x",
     backend: "converse",
     translationPath: "converse",
     streamed: false,
@@ -58,43 +70,13 @@ function turn(sessionId: string, at: string, inTok: number, outTok: number) {
   };
 }
 
-function sessionDirOf(sid: string): string {
-  return join(root, "sessions", sid);
-}
-
-describe("summary index creation + exclusion", () => {
-  test("recordTurn writes _summary.json; listings and exports exclude it", async () => {
-    const s = store();
-    await s.recordTurn(turn("sess-a", "2026-09-12T10:00:00.000Z", 10, 5));
-    await s.recordTurn(turn("sess-a", "2026-09-12T10:01:00.000Z", 20, 7));
-
-    const dir = sessionDirOf("sess-a");
-    expect(existsSync(join(dir, "_summary.json"))).toBe(true);
-    const parsed = JSON.parse(readFileSync(join(dir, "_summary.json"), "utf-8"));
-    expect(parsed.fileCount).toBe(2);
-    expect(parsed.turns.map((t: { turn: string }) => t.turn)).toEqual([
-      "00001-2026-09-12T10-00-00-000Z",
-      "00002-2026-09-12T10-01-00-000Z",
-    ]);
-
-    // The index never surfaces as a turn.
-    const turns = await s.listTurns("sess-a");
-    expect(turns.length).toBe(2);
-    expect(turns.some((t) => t.turn === "_summary")).toBe(false);
-    const exportEntries = await s.exportSessionTurns("all");
-    expect(exportEntries.map((e) => e.name).sort()).toEqual([
-      "sessions/sess-a/00001-2026-09-12T10-00-00-000Z.json",
-      "sessions/sess-a/00002-2026-09-12T10-01-00-000Z.json",
-    ]);
-    // getTurn refuses the index basename.
-    expect(await s.getTurn("sess-a", "_summary")).toBeNull();
-  });
-
-  test("listSessions aggregates from the index", async () => {
+describe("index-backed listing", () => {
+  test("listSessions orders by last activity (desc) and aggregates tokens", async () => {
     const s = store();
     await s.recordTurn(turn("sess-a", "2026-09-12T10:00:00.000Z", 10, 5));
     await s.recordTurn(turn("sess-a", "2026-09-12T10:01:00.000Z", 20, 7));
     await s.recordTurn(turn("sess-b", "2026-09-12T11:00:00.000Z", 1, 1));
+    await s.flush();
 
     const sessions = await s.listSessions();
     expect(sessions.map((x) => x.id)).toEqual(["sess-b", "sess-a"]); // lastAt desc
@@ -104,83 +86,105 @@ describe("summary index creation + exclusion", () => {
     expect(a?.outputTokens).toBe(12);
     expect(a?.firstAt).toBe("2026-09-12T10:00:00.000Z");
     expect(a?.lastAt).toBe("2026-09-12T10:01:00.000Z");
+    await s.close();
+  });
+
+  test("listTurns returns metadata in seq order without reading bodies", async () => {
+    const s = store();
+    await s.recordTurn(turn("sess-a", "2026-09-12T10:00:00.000Z", 10, 5));
+    await s.recordTurn(turn("sess-a", "2026-09-12T10:01:00.000Z", 20, 7));
+    await s.flush();
+
+    const turns = await s.listTurns("sess-a");
+    expect(turns.map((t) => t.seq)).toEqual([1, 2]);
+    expect(turns.map((t) => t.inputTokens)).toEqual([10, 20]);
+    await s.close();
   });
 });
 
-describe("legacy backfill (sessions recorded before the index existed)", () => {
-  test("listSessions rebuilds a deleted index from turn files, identically", async () => {
+describe("exportSessionTurns", () => {
+  test("names each body without the .zst extension and decompresses its content", async () => {
     const s = store();
-    for (let i = 0; i < 5; i++) {
-      await s.recordTurn(turn("legacy", `2026-09-12T10:0${i}:00.000Z`, i + 1, i + 2));
-    }
-    const before = await s.listSessions();
+    await s.recordTurn(turn("sess-a", "2026-09-12T10:00:00.000Z", 10, 5));
+    await s.flush();
 
-    // Simulate a pre-index session: drop the index on disk.
-    rmSync(join(sessionDirOf("legacy"), "_summary.json"));
-
-    const after = await s.listSessions();
-    expect(after).toEqual(before);
-    // The rebuilt index is persisted, so the scan never repeats.
-    expect(existsSync(join(sessionDirOf("legacy"), "_summary.json"))).toBe(true);
-    const parsed = JSON.parse(readFileSync(join(sessionDirOf("legacy"), "_summary.json"), "utf-8"));
-    expect(parsed.fileCount).toBe(5);
-    expect(parsed.turns.length).toBe(5);
+    const entries = await s.exportSessionTurns("all");
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.name).toBe("sessions/sess-a/00001-2026-09-12T10-00-00-000Z.json");
+    const rec = JSON.parse(entries[0]?.content ?? "{}") as { sessionId: string };
+    expect(rec.sessionId).toBe("sess-a");
+    await s.close();
   });
 
-  test("a turn recorded by an index-less build is picked up via count drift", async () => {
+  test("range filters by requestedAt: '1h' and 'today' exclude old turns", async () => {
     const s = store();
-    await s.recordTurn(turn("drift", "2026-09-12T10:00:00.000Z", 5, 5));
-    const dir = sessionDirOf("drift");
-    rmSync(join(dir, "_summary.json"));
-    // Simulate the old build writing one more turn file with no index update.
-    copyFileSync(
-      join(dir, "00001-2026-09-12T10-00-00-000Z.json"),
-      join(dir, "00002-2026-09-12T10-05-00-000Z.json"),
-    );
+    const fresh = new Date().toISOString();
+    await s.recordTurn(turn("sess-a", "2020-01-01T00:00:00.000Z", 1, 1)); // old
+    await s.recordTurn(turn("sess-a", fresh, 2, 2)); // fresh
+    await s.flush();
 
-    const sessions = await s.listSessions();
-    const drift = sessions.find((x) => x.id === "drift");
-    expect(drift?.turnCount).toBe(2);
-    const turns = await s.listTurns("drift");
-    expect(turns.length).toBe(2);
+    expect((await s.exportSessionTurns("all")).map((e) => e.name)).toEqual([
+      "sessions/sess-a/00001-2020-01-01T00-00-00-000Z.json",
+      `sessions/sess-a/00002-${fresh.replace(/[:.]/g, "-")}.json`,
+    ]);
+    expect((await s.exportSessionTurns("1h")).map((e) => e.name)).toEqual([
+      `sessions/sess-a/00002-${fresh.replace(/[:.]/g, "-")}.json`,
+    ]);
+    expect((await s.exportSessionTurns("today")).map((e) => e.name)).toEqual([
+      `sessions/sess-a/00002-${fresh.replace(/[:.]/g, "-")}.json`,
+    ]);
+    await s.close();
   });
-});
 
-describe("concurrent turn records (summary mutex)", () => {
-  test("N concurrent recordTurns -> N index entries, no lost appends", async () => {
+  test("skips a shed body (its metadata survives, but there is no file to export)", async () => {
     const s = store();
-    const N = 25;
-    await Promise.all(
-      Array.from({ length: N }, (_, i) =>
-        s.recordTurn(turn("conc", `2026-09-12T10:${String(i).padStart(2, "0")}:00.000Z`, 1, 1)),
-      ),
-    );
-    const turns = await s.listTurns("conc");
-    expect(turns.length).toBe(N);
-    const sessions = await s.listSessions();
-    expect(sessions.find((x) => x.id === "conc")?.turnCount).toBe(N);
+    await s.recordTurn({ ...turn("sess-a", "2026-09-12T10:00:00.000Z", 10, 5), bodyState: "shed" });
+    await s.flush();
+
+    expect((await s.exportSessionTurns("all")).length).toBe(0);
+    // The index row is still there.
+    expect((await s.listTurns("sess-a")).length).toBe(1);
+    expect((await s.listTurns("sess-a"))[0]?.bodyState).toBe("shed");
+    await s.close();
   });
 });
 
-describe("corrupt-file tolerance", () => {
-  test("a corrupt turn file is skipped without crashing or looping", async () => {
+describe("exportSystemPrompts", () => {
+  test("exports each prompt version's full instruction surface, self-describing", async () => {
     const s = store();
-    await s.recordTurn(turn("corrupt", "2026-09-12T10:00:00.000Z", 3, 4));
-    const dir = sessionDirOf("corrupt");
-    rmSync(join(dir, "_summary.json"));
-    // A turn file whose JSON is truncated (e.g. crash on a pre-atomic-write build).
-    writeFileSync(join(dir, "00002-2026-09-12T10-01-00-000Z.json"), '{"sessionId": "cor');
+    const surface = computePromptSurface({
+      system: "You are terse.",
+      tools: [{ name: "Read", input_schema: { type: "object" } }],
+      messages: [],
+    });
+    await s.recordTurn({
+      ...turn("sess-a", "2026-09-12T10:00:00.000Z", 10, 5),
+      promptSurface: surface,
+    });
+    await s.flush();
 
-    const turns = await s.listTurns("corrupt");
-    expect(turns.length).toBe(1);
-    expect(turns[0]?.turn).toBe("00001-2026-09-12T10-00-00-000Z");
-    // Stable across listings: the index records fileCount (2), so the skipped
-    // file does not re-trip the drift check and force a rescan every time.
-    const again = await s.listTurns("corrupt");
-    expect(again).toEqual(turns);
-    // The persisted index reflects both files on disk.
-    const parsed = JSON.parse(readFileSync(join(dir, "_summary.json"), "utf-8"));
-    expect(parsed.fileCount).toBe(2);
-    expect(parsed.turns.length).toBe(1);
+    const entries = await s.exportSystemPrompts();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.name).toBe(`prompt-versions/${surface.hash}.json`);
+    const rec = JSON.parse(entries[0]?.content ?? "{}") as {
+      hash: string;
+      system: unknown;
+      tools: unknown;
+      injected: unknown;
+      stats: { turns: number };
+    };
+    expect(rec.hash).toBe(surface.hash);
+    // The stored content reconstitutes the surface's three parts verbatim.
+    expect(rec.system).toEqual(JSON.parse(surface.systemJson));
+    expect(rec.tools).toEqual(JSON.parse(surface.toolsJson));
+    expect(rec.injected).toEqual(JSON.parse(surface.injectedJson));
+    expect(rec.stats.turns).toBe(1);
+    await s.close();
+  });
+
+  test("a store with no prompt versions exports an empty list", async () => {
+    const s = store();
+    expect(await s.exportSystemPrompts()).toEqual([]);
+    await s.close();
   });
 });

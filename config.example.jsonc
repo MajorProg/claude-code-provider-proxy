@@ -173,11 +173,23 @@
     "dir": "./logs",
     "systemDir": "system",
     "sessionDir": "sessions",
-    // Background gzip compression of turn files (json -> json.gz); readers
-    // (viewer, API, ZIP export) decompress transparently. Existing logs are
-    // compressed by the same bounded sweep. minAgeMinutes avoids churning
-    // files a resumed session may still re-write.
-    "compression": { "enabled": true, "minAgeMinutes": 10 }
+    // DEPRECATED / accepted-and-ignored: turn bodies are now zstd-compressed at
+    // write, so this block no longer drives behavior. It is still accepted (and
+    // preserved on save) so existing configs keep loading.
+    "compression": { "enabled": true, "minAgeMinutes": 10 },
+    // Retention window for turn BODIES, in days (0 = keep forever). Pruned
+    // bodies set body_state="pruned"; index rows and prompt versions are kept.
+    "retentionDays": 30,
+    // Per-turn body byte cap (8 MiB). Larger bodies are written clipped and
+    // marked body_state="truncated".
+    "maxTurnBytes": 8388608,
+    // Global in-flight body byte budget (256 MiB). Under pressure the writer
+    // sheds bodies (body_state="shed") while always recording metadata.
+    "inFlightBudgetBytes": 268435456,
+    // Max delay before a batched index commit is flushed.
+    "indexFlushMs": 250,
+    // zstd level for turn bodies (3 is the measured sweet spot; never 19).
+    "zstdLevel": 3
   },
 
   // Built-in chat test page at /chat (enabled by default for a local pod). The
