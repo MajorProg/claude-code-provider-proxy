@@ -22,6 +22,7 @@
  * It never parses or reorders the stream — it only interleaves ping frames into
  * the idle gaps, which are valid to insert between any two SSE events.
  */
+import { DEFAULT_STREAM_IDLE_MS, readWithIdleTimeout } from "../http/upstream.ts";
 
 /** Default idle gap (ms) before a synthetic ping is injected on Path P. */
 export const DEFAULT_PASSTHROUGH_PING_IDLE_MS = 5_000;
@@ -33,12 +34,15 @@ const PING_FRAME = new TextEncoder().encode('event: ping\ndata: {"type":"ping"}\
  *
  * @param upstream  The upstream response body (verbatim SSE bytes).
  * @param idleMs    Silence (ms) before injecting a ping. Default 5s.
+ * @param streamIdleMs  Max gap (ms) between upstream chunks before the stream is
+ *                      failed (PC1 stall bound). Default {@link DEFAULT_STREAM_IDLE_MS}.
  * @returns A ReadableStream that relays `upstream` byte-for-byte and injects
  *          standard ping frames during idle gaps.
  */
 export function keepAliveTee(
   upstream: ReadableStream<Uint8Array>,
   idleMs: number = DEFAULT_PASSTHROUGH_PING_IDLE_MS,
+  streamIdleMs: number = DEFAULT_STREAM_IDLE_MS,
 ): ReadableStream<Uint8Array> {
   const reader = upstream.getReader();
   let pingTimer: ReturnType<typeof setInterval> | undefined;
@@ -71,7 +75,14 @@ export function keepAliveTee(
       const pump = async (): Promise<void> => {
         try {
           for (;;) {
-            const { done, value } = await reader.read();
+            // PC1 stall bound: bound the gap BETWEEN upstream chunks with the
+            // same readWithIdleTimeout the translated paths (C/M) use. Without
+            // it, a silently stalled upstream hangs Path P forever — and the
+            // tee's own pings keep Claude Code's idle watchdog from firing
+            // either, so nothing would ever break the deadlock. On idle,
+            // readWithIdleTimeout cancels the reader and throws, failing the
+            // client stream cleanly via the catch below.
+            const { done, value } = await readWithIdleTimeout(reader, streamIdleMs);
             if (done) break;
             if (value) enqueue(value); // verbatim passthrough
           }

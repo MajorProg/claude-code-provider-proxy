@@ -15,7 +15,7 @@ import { buildAnthropicHeaders } from "../src/http/upstream.ts";
 import { parseCanonicalId } from "../src/model/canonical-id.ts";
 import { Catalog } from "../src/model/catalog.ts";
 import { route } from "../src/router.ts";
-import { liveEnabled } from "./helpers/live.ts";
+import { providerLiveEnabled } from "./helpers/live.ts";
 
 const CONFIG: ProxyConfig = validateConfig({
   server: { host: "127.0.0.1", port: 8787 },
@@ -73,50 +73,53 @@ describe("Moonshot routing (unit)", () => {
   });
 });
 
-describe.if(liveEnabled() && !!MOONSHOT_KEY)("Moonshot live (api.moonshot.ai/anthropic)", () => {
-  const base = "https://api.moonshot.ai/anthropic";
-  const headers = {
-    "content-type": "application/json",
-    authorization: `Bearer ${MOONSHOT_KEY as string}`,
-    "anthropic-version": "2023-06-01",
-  };
-
-  test("non-streaming /v1/messages returns a well-formed Anthropic message", async () => {
-    const res = await fetch(`${base}/v1/messages`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: LIVE_MODEL,
-        max_tokens: 64,
-        messages: [{ role: "user", content: "Reply with exactly one word: OK" }],
-      }),
-    });
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as {
-      type?: string;
-      content?: { type?: string }[];
-      usage?: { input_tokens?: number };
+describe.if(providerLiveEnabled("MOONSHOT_API_KEY"))(
+  "Moonshot live (api.moonshot.ai/anthropic)",
+  () => {
+    const base = "https://api.moonshot.ai/anthropic";
+    const headers = {
+      "content-type": "application/json",
+      authorization: `Bearer ${MOONSHOT_KEY as string}`,
+      "anthropic-version": "2023-06-01",
     };
-    expect(json.type).toBe("message");
-    expect(Array.isArray(json.content)).toBe(true);
-    expect(typeof json.usage?.input_tokens).toBe("number");
-  }, 30_000);
 
-  test("streaming /v1/messages emits native Anthropic SSE", async () => {
-    const res = await fetch(`${base}/v1/messages`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: LIVE_MODEL,
-        max_tokens: 32,
-        stream: true,
-        messages: [{ role: "user", content: "count 1 2 3" }],
-      }),
-    });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type") ?? "").toContain("event-stream");
-    const text = await res.text();
-    expect(text).toMatch(/event:\s?message_start/);
-    expect(text).toMatch(/event:\s?message_stop/);
-  }, 30_000);
-});
+    test("non-streaming /v1/messages returns a well-formed Anthropic message", async () => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: LIVE_MODEL,
+          max_tokens: 64,
+          messages: [{ role: "user", content: "Reply with exactly one word: OK" }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as {
+        type?: string;
+        content?: { type?: string }[];
+        usage?: { input_tokens?: number };
+      };
+      expect(json.type).toBe("message");
+      expect(Array.isArray(json.content)).toBe(true);
+      expect(typeof json.usage?.input_tokens).toBe("number");
+    }, 30_000);
+
+    test("streaming /v1/messages emits native Anthropic SSE", async () => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: LIVE_MODEL,
+          max_tokens: 32,
+          stream: true,
+          messages: [{ role: "user", content: "count 1 2 3" }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type") ?? "").toContain("event-stream");
+      const text = await res.text();
+      expect(text).toMatch(/event:\s?message_start/);
+      expect(text).toMatch(/event:\s?message_stop/);
+    }, 30_000);
+  },
+);

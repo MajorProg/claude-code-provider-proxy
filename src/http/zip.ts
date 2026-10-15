@@ -62,6 +62,23 @@ export class ZipLimitError extends Error {
   }
 }
 
+/**
+ * Reject an entry name that could escape the extraction directory: an absolute
+ * path (leading `/`) or any `..` path segment. This is DEFENSE IN DEPTH — a
+ * caller must already produce safe names (the log-export route sanitizes the
+ * session segment), but buildZip is the last line before archive bytes reach an
+ * operator's unzip, so it refuses a traversal name outright rather than
+ * emitting an entry that a non-sanitizing unzip would write outside the target.
+ */
+function assertSafeEntryName(name: string): void {
+  if (name.startsWith("/")) {
+    throw new Error(`ZIP entry name "${name}" is an absolute path`);
+  }
+  if (name.split("/").includes("..")) {
+    throw new Error(`ZIP entry name "${name}" contains a '..' path traversal segment`);
+  }
+}
+
 /** Build a ZIP archive (store method) from the given entries. */
 export function buildZip(entries: readonly ZipEntry[], now: Date = new Date()): Uint8Array {
   if (entries.length > ZIP_ENTRY_LIMIT || entries.length > ZIP_MAX_ENTRIES) {
@@ -82,16 +99,21 @@ export function buildZip(entries: readonly ZipEntry[], now: Date = new Date()): 
   let offset = 0;
 
   for (const entry of entries) {
+    assertSafeEntryName(entry.name);
     const nameBytes = encoder.encode(entry.name);
     const data = typeof entry.data === "string" ? encoder.encode(entry.data) : entry.data;
-    // Guard the uint32 header fields: a single file >4GiB, or a local-header
-    // offset past 4GiB, would silently wrap and corrupt the archive.
+    // A single entry larger than 4GiB would overflow the uint32 size fields, so
+    // reject it with a message naming the offending entry (the total-bytes cap
+    // below would also catch it, but this reports WHICH entry is oversized).
     if (data.length > ZIP_MAX_UINT32) {
       throw new ZipLimitError(`ZIP entry "${entry.name}" is too large for a v2.0 ZIP (>4GiB)`);
     }
-    if (offset > ZIP_MAX_UINT32) {
-      throw new ZipLimitError("ZIP archive exceeds the 4GiB offset limit (needs ZIP64)");
-    }
+    // The running total doubles as the local-header-offset guard: every byte
+    // counted into `offset` was already checked against ZIP_TOTAL_BYTES_LIMIT,
+    // so `offset` can never exceed that cap. While the cap (512MiB) stays below
+    // ZIP_MAX_UINT32 (4GiB), the offset therefore cannot approach the uint32
+    // limit and no separate 4GiB offset check is needed. Re-examine this if the
+    // cap is ever raised toward 4GiB or the writer gains ZIP64 support.
     if (offset + data.length > ZIP_TOTAL_BYTES_LIMIT) {
       throw new ZipLimitError(`ZIP archive exceeds the ${ZIP_TOTAL_BYTES_LIMIT} byte cap`);
     }

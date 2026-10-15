@@ -14,7 +14,9 @@
  * (`body_state: "truncated"`) and a process-wide in-flight byte budget shared by
  * every concurrent capture sheds the body of new turns (`body_state: "shed"`)
  * while their metadata is still recorded. Only the tee'd log branch is ever
- * dropped — the client stream is never affected.
+ * dropped — the client stream is never affected. A stream CUT EARLY (client
+ * disconnect, capture timeout) likewise records `body_state: "truncated"`, so a
+ * partial payload is never indistinguishable from a complete one.
  */
 import { DEFAULT_LOG_IN_FLIGHT_BUDGET_BYTES, DEFAULT_LOG_MAX_TURN_BYTES } from "../config.ts";
 import { coerceToolInput, isCustomTool } from "../paths/relay.ts";
@@ -72,6 +74,15 @@ export interface CaptureContext {
   readonly translationPath: string;
   readonly system: unknown;
   readonly messages: unknown;
+  /**
+   * Byte length of the WHOLE inbound request body (as read at the trust
+   * boundary). It is a PROXY for message size: a request with huge tool schemas
+   * and a small conversation trips the same threshold. When present and greater
+   * than the per-turn cap, the stored turn keeps its metadata but stores
+   * `messages: []` plus a `messagesOmitted` marker rather than the full
+   * conversation — a single oversized request must not blow the body budget.
+   */
+  readonly inboundBytes?: number;
   /**
    * The full instruction-surface fingerprint (system + tool schemas + injected
    * instruction envelopes) this request ran under, when the caller computed it.
@@ -322,6 +333,11 @@ class BodyCapture {
     return this.state === "truncated";
   }
 
+  /** True while more bulk content may still be accepted (state is "full"). */
+  get accepting(): boolean {
+    return this.state === "full";
+  }
+
   /** Reserve `bytes` of bulk body content; false once no more may be accepted. */
   accept(bytes: number): boolean {
     if (this.state !== "full") return false;
@@ -373,21 +389,102 @@ function extractToolCallNames(content: readonly unknown[]): string[] {
 }
 
 /**
- * Keep whole content blocks until adding the next would exceed `maxBytes` — a
- * faithful clip of an oversized non-streaming body (blocks are the smallest
- * unit that stays individually JSON-valid; the result is still a valid block
- * array). Returns the (possibly empty) kept blocks.
+ * The `messages` (and optional `messagesOmitted`) fields for a turn record.
+ *
+ * The inbound `messages` array is OMITTED — stored as `[]` with a marker — when
+ * the WHOLE request body exceeded the per-turn cap. `inboundBytes` is the
+ * whole-body size, a proxy for message size: a request with huge tool schemas
+ * and a small conversation trips the same threshold. The rest of the record
+ * (usage, stop reason, tool calls, response content) is unaffected, and
+ * `bodyState` is deliberately untouched — it describes the RESPONSE capture, a
+ * different axis.
  */
-function clipContent(content: readonly unknown[], maxBytes: number): unknown[] {
+function messagesFields(
+  ctx: CaptureContext,
+  limitBytes: number,
+): Pick<TurnRecord, "messages" | "messagesOmitted"> {
+  const inboundBytes = ctx.inboundBytes;
+  if (inboundBytes !== undefined && inboundBytes > limitBytes) {
+    return { messages: [], messagesOmitted: { inboundBytes, limitBytes } };
+  }
+  return { messages: ctx.messages };
+}
+
+/**
+ * Per-content-block JSON byte sizes, computed ONCE. Sizing a non-streaming body
+ * this way lets both the whole-array fit check and the clipped-array size come
+ * from arithmetic — no throwaway `JSON.stringify` of the entire array.
+ */
+function contentBlockSizes(content: readonly unknown[]): number[] {
+  return content.map((block) => utf8Bytes(JSON.stringify(block)));
+}
+
+/** Exact JSON byte length of a block array given its serialized block sizes:
+ *  `[` + blocks joined by `,` + `]` (2 bytes when empty). */
+function arrayBytes(sizes: readonly number[]): number {
+  if (sizes.length === 0) return 2; // "[]"
+  let total = 2 + (sizes.length - 1); // brackets + N-1 separators
+  for (const size of sizes) total += size;
+  return total;
+}
+
+/**
+ * Keep whole content blocks until adding the next would exceed `maxBytes` — a
+ * faithful clip of an oversized non-streaming body (blocks are the smallest unit
+ * that stays individually JSON-valid; the result is still a valid block array).
+ * Reuses the sizes from {@link contentBlockSizes} so a block is serialized once,
+ * never again for the clip. Returns the kept blocks AND their EXACT JSON byte
+ * size (for the budget reservation): the fit check uses the true array size,
+ * while the clip point keeps the prior block-at-a-time rule so the truncation
+ * boundary is byte-for-byte unchanged.
+ */
+function clipBlocks(
+  content: readonly unknown[],
+  sizes: readonly number[],
+  maxBytes: number,
+): { blocks: unknown[]; bytes: number } {
   const out: unknown[] = [];
+  const keptSizes: number[] = [];
   let bytes = 2; // the enclosing "[]"
-  for (const block of content) {
-    const size = utf8Bytes(JSON.stringify(block));
+  for (let i = 0; i < content.length; i++) {
+    const size = sizes[i] ?? 0;
     if (bytes + size + 1 > maxBytes) break;
-    out.push(block);
+    out.push(content[i]);
+    keptSizes.push(size);
     bytes += size + 1; // + separating comma
   }
-  return out;
+  return { blocks: out, bytes: arrayBytes(keptSizes) };
+}
+
+/** The bounded-capture decision for one non-streaming body's content array. */
+export interface ContentCapturePlan {
+  /** EXACT JSON byte size of the blocks to store (for the shared-budget reservation). */
+  readonly bytes: number;
+  /** Blocks to keep — all of them, or a whole-block clip of the front of the array. */
+  readonly stored: unknown[];
+  /** True when the cap forced one or more trailing blocks to be dropped. */
+  readonly truncated: boolean;
+}
+
+/**
+ * Decide how much of a non-streaming response's content array fits the per-turn
+ * cap, sizing the array by summing per-block JSON sizes ONCE (no throwaway
+ * `JSON.stringify` of the whole body). The exact fit boundary is preserved: the
+ * array is kept whole when its true JSON size is within the cap, and clipped
+ * block-by-block only when it is not. Extracted so the byte-exact sizing is
+ * directly testable, independent of the writer's own whole-payload cap.
+ */
+export function planContentCapture(
+  content: readonly unknown[],
+  maxBytes: number,
+): ContentCapturePlan {
+  const sizes = contentBlockSizes(content);
+  const full = arrayBytes(sizes);
+  if (full <= maxBytes) {
+    return { bytes: full, stored: content as unknown[], truncated: false };
+  }
+  const clipped = clipBlocks(content, sizes, maxBytes);
+  return { bytes: clipped.bytes, stored: clipped.blocks, truncated: true };
 }
 
 /* ===================== response capture ===================== */
@@ -408,17 +505,13 @@ async function captureNonStreaming(
   let stored: unknown[] = [];
   try {
     if (!meter.shed) {
-      const full = utf8Bytes(JSON.stringify(content));
-      if (full <= meter.maxTurnBytes) {
-        // Fits the per-turn cap: keep it, unless the global budget is exhausted.
-        if (meter.accept(full)) stored = content;
-      } else {
-        // Over the per-turn cap: clip by whole blocks, then mark truncated.
-        const clipped = clipContent(content, meter.maxTurnBytes);
-        if (meter.accept(utf8Bytes(JSON.stringify(clipped)))) {
-          stored = clipped;
-          meter.truncate();
-        }
+      // Size the content ONCE (per-block JSON sums) and reuse it for the clip —
+      // the whole body is never serialized just to be sized, and the byte
+      // thresholds are unchanged.
+      const plan = planContentCapture(content, meter.maxTurnBytes);
+      if (meter.accept(plan.bytes)) {
+        stored = plan.stored;
+        if (plan.truncated) meter.truncate();
       }
     }
     const respondedAt = new Date().toISOString();
@@ -431,7 +524,7 @@ async function captureNonStreaming(
       translationPath: ctx.translationPath,
       streamed: false,
       systemHash,
-      messages: ctx.messages,
+      ...messagesFields(ctx, meter.maxTurnBytes),
       ...(ctx.promptSurface ? { promptSurface: ctx.promptSurface } : {}),
       ...(ctx.tools ? { tools: ctx.tools } : {}),
       ...(ctx.servingKeyLabel ? { servingKeyLabel: ctx.servingKeyLabel } : {}),
@@ -575,8 +668,12 @@ export class AnthropicStreamAccumulator {
       const index = ev.index as number;
       const delta = ev.delta as { type?: string; text?: string; partial_json?: string } | undefined;
       if (delta?.type === "text_delta" && typeof delta.text === "string") {
-        // Bulk content: only kept while the body meter still accepts bytes.
-        if (this.meter.accept(utf8Bytes(delta.text))) {
+        // Bulk content: only kept while the body meter still accepts bytes. The
+        // `accepting` guard short-circuits the byte measurement itself once the
+        // body is clipped or shed — otherwise `utf8Bytes` would run on every
+        // remaining delta of a long stream (accept would reject them anyway).
+        // Thresholds are unchanged: `accept` already returns false in that state.
+        if (this.meter.accepting && this.meter.accept(utf8Bytes(delta.text))) {
           let parts = this.textByIndex.get(index);
           if (parts === undefined) {
             parts = [];
@@ -586,7 +683,9 @@ export class AnthropicStreamAccumulator {
         }
       } else if (delta?.type === "input_json_delta" && typeof delta.partial_json === "string") {
         const t = this.toolByIndex.get(index);
-        if (t && this.meter.accept(utf8Bytes(delta.partial_json))) t.json.push(delta.partial_json);
+        if (t && this.meter.accepting && this.meter.accept(utf8Bytes(delta.partial_json))) {
+          t.json.push(delta.partial_json);
+        }
       }
     } else if (type === "message_delta") {
       const delta = ev.delta as { stop_reason?: string | null } | undefined;
@@ -711,6 +810,12 @@ function captureStreaming(
   // stream the user actually consumes ends or is cancelled), promptly cancel the
   // log-branch read so the tee doesn't keep the upstream socket alive for the
   // slower/idle branch. `clientDone` fires on client-branch close OR cancel.
+  //
+  // `clientCancelled` distinguishes the two: it is set ONLY when the consumer
+  // DISCONNECTS mid-stream (the monitored branch's `cancel` callback), never on a
+  // normal end-of-stream close — so the capture can tell a partial body from a
+  // complete one.
+  let clientCancelled = false;
   const clientDone = new AbortController();
   const clientReader = clientBranch.getReader();
   const monitoredClientBranch = new ReadableStream<Uint8Array>({
@@ -729,8 +834,9 @@ function captureStreaming(
       }
     },
     cancel(reason) {
+      clientCancelled = true; // client disconnected mid-stream
       void clientReader.cancel(reason).catch(() => {});
-      clientDone.abort(); // client disconnected mid-stream
+      clientDone.abort();
     },
   });
 
@@ -739,12 +845,20 @@ function captureStreaming(
     // Admit this capture against the shared budget at stream start (before any
     // await) so a burst of concurrent large streams sheds promptly.
     const acc = new AnthropicStreamAccumulator(budget);
+    // `earlyTerminated` marks a GENUINE cut: the capture timeout (hung upstream)
+    // or the request-signal abort (client disconnect). It is NOT set by
+    // `onClientDone`, which also fires on a normal end-of-stream. A turn cut this
+    // way is recorded `body_state: "truncated"` so its (incomplete) payload is
+    // not indistinguishable from a complete one.
+    let earlyTerminated = false;
     // Cancel the log-branch read on client disconnect or after a wall-clock cap
     // so a slow/hung upstream can't pin the branch (and its socket) open.
     const timeout = setTimeout(() => {
+      earlyTerminated = true;
       void reader.cancel(new Error("log capture timed out")).catch(() => {});
     }, store.captureTimeoutMs);
     const onAbort = () => {
+      earlyTerminated = true;
       void reader.cancel(new Error("client disconnected")).catch(() => {});
     };
     // PC8: follow the client branch — when it ends, stop pumping the log branch.
@@ -767,6 +881,14 @@ function captureStreaming(
       }
       const respondedAt = new Date().toISOString();
       const latencyMs = latencyBetween(ctx.requestedAt, respondedAt);
+      // A genuine early cut (timeout / client disconnect) downgrades a body that
+      // the meter still called "full" to "truncated": the accumulation stopped
+      // mid-stream, so the payload is partial. A body the meter already shed or
+      // clipped keeps that more specific state.
+      const bodyState =
+        acc.bodyState === "full" && (earlyTerminated || clientCancelled)
+          ? "truncated"
+          : acc.bodyState;
       const turn: TurnRecord = {
         sessionId: ctx.sessionId,
         canonicalModel: ctx.canonicalModel,
@@ -775,7 +897,7 @@ function captureStreaming(
         translationPath: ctx.translationPath,
         streamed: true,
         systemHash,
-        messages: ctx.messages,
+        ...messagesFields(ctx, budget.maxTurnBytes),
         ...(ctx.promptSurface ? { promptSurface: ctx.promptSurface } : {}),
         ...(ctx.tools ? { tools: ctx.tools } : {}),
         ...(ctx.servingKeyLabel ? { servingKeyLabel: ctx.servingKeyLabel } : {}),
@@ -784,7 +906,7 @@ function captureStreaming(
         usage: { inputTokens: acc.inputTokens, outputTokens: acc.outputTokens },
         ...(acc.cacheReadTokens !== null ? { cacheReadTokens: acc.cacheReadTokens } : {}),
         toolCalls: acc.toolCalls,
-        bodyState: acc.bodyState,
+        bodyState,
         requestedAt: ctx.requestedAt,
         respondedAt,
         ...(latencyMs !== undefined ? { latencyMs } : {}),

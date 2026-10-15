@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import { BadRequestError, PayloadTooLargeError, UpstreamError } from "../src/errors.ts";
 import type { IRResponse } from "../src/ir/types.ts";
 import {
+  MAX_JSON_DEPTH,
   MAX_TOOL_RESULT_CHARS,
   PASSTHROUGH_RELAY_HEADERS,
   assertInboundLimits,
@@ -442,10 +443,72 @@ describe("parseJsonObject prototype-pollution guard (SEC-2)", () => {
   });
 });
 
+describe("parseJsonObject single-traversal strip (E2)", () => {
+  // The pollution strip and the depth cap now share ONE walk (a plain JSON.parse
+  // + this traversal) instead of a parse reviver followed by a second pass. The
+  // SEC-2 guarantee is unchanged and must hold at EVERY depth, arrays included.
+  test("strips pollution keys nested inside objects AND arrays at every depth", () => {
+    const raw =
+      '{"messages":[{"role":"user","content":[{"type":"text",' +
+      '"constructor":"x","prototype":"y","text":"hi"}]}],' +
+      '"outer":{"inner":{"__proto__":{"polluted":true},"ok":1}}}';
+    const obj = parseJsonObject(raw) as {
+      messages: Array<{ content: Array<Record<string, unknown>> }>;
+      outer: { inner: Record<string, unknown> };
+    };
+    const block = obj.messages[0]?.content[0] as Record<string, unknown>;
+    expect(Object.hasOwn(block, "constructor")).toBe(false);
+    expect(Object.hasOwn(block, "prototype")).toBe(false);
+    expect(block.text).toBe("hi"); // neighbours survive
+
+    const inner = obj.outer.inner;
+    expect(Object.hasOwn(inner, "__proto__")).toBe(false);
+    expect(inner.ok).toBe(1); // sibling of a stripped deep key survives
+    // Nothing leaked onto the global prototype.
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  test("throws at exactly MAX_JSON_DEPTH+1, accepts exactly MAX_JSON_DEPTH", () => {
+    const wrap = (n: number): string => {
+      let s = "true";
+      for (let i = 0; i < n; i++) s = `{"a":${s}}`;
+      return s;
+    };
+    expect(() => parseJsonObject(wrap(MAX_JSON_DEPTH))).not.toThrow();
+    expect(() => parseJsonObject(wrap(MAX_JSON_DEPTH + 1))).toThrow(BadRequestError);
+    expect(() => parseJsonObject(wrap(MAX_JSON_DEPTH + 1))).toThrow(/nests deeper than/);
+  });
+
+  test("still parses a valid deep-but-legal payload with its values intact", () => {
+    let inner: Record<string, unknown> = { leaf: 42 };
+    for (let i = 0; i < 20; i++) inner = { nested: inner };
+    const parsed = parseJsonObject(JSON.stringify(inner)) as Record<string, unknown>;
+    let node: unknown = parsed;
+    for (let i = 0; i < 20; i++) node = (node as Record<string, unknown>).nested;
+    expect((node as Record<string, unknown>).leaf).toBe(42);
+  });
+});
+
 describe("readBodyWithLimit (SEC-1)", () => {
-  test("returns the body when under the limit", async () => {
+  test("returns the body AND its raw byte length when under the limit", async () => {
     const req = new Request("http://x/", { method: "POST", body: '{"a":1}' });
-    expect(await readBodyWithLimit(req, 1024)).toBe('{"a":1}');
+    expect(await readBodyWithLimit(req, 1024)).toEqual({ text: '{"a":1}', bytes: 7 });
+  });
+
+  test("the byte length counts UTF-8 bytes, not code units", async () => {
+    // "é" is 2 UTF-8 bytes; the body's raw size must be reported as such.
+    const body = '{"a":"é"}';
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(body));
+        c.close();
+      },
+    });
+    const req = { headers: { get: () => null }, body: stream, text: async () => "unused" };
+    const { text, bytes } = await readBodyWithLimit(req, 1024);
+    expect(text).toBe(body);
+    expect(bytes).toBe(Buffer.byteLength(body, "utf8"));
+    expect(bytes).toBe(body.length + 1); // one extra byte for é
   });
 
   test("fast-rejects via Content-Length before reading (413)", async () => {

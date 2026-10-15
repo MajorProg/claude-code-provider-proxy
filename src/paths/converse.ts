@@ -420,16 +420,18 @@ export async function handleConverseMessages(
   const converseBody = anthropicToConverseRequest(parsed);
   const headers = buildConverseHeaders(bearer);
   const streaming = parsed.stream === true;
-  const opts = signal ? { signal } : {};
+  // PC2: a message body is NEVER replayed on a status code (streaming or not) —
+  // a 5xx after the model generated would be a second billed generation. 429s
+  // are owned by the failover engine (see passthrough.ts). Connection-level
+  // retries (a throw before any response) are unaffected.
+  const opts = {
+    ...(signal ? { signal } : {}),
+    retryTransientStatus: false,
+    retryRateLimit: false,
+  };
 
   if (streaming) {
-    const streamOpts = { ...opts, retryTransientStatus: false };
-    const upstream = await postJson(
-      route.streamPath,
-      headers,
-      JSON.stringify(converseBody),
-      streamOpts,
-    );
+    const upstream = await postJson(route.streamPath, headers, JSON.stringify(converseBody), opts);
     await assertUpstreamOk(upstream, route, { requireBody: true });
     const body = upstream.body as ReadableStream<Uint8Array>;
     const sse = converseStreamToAnthropicSse(
@@ -443,11 +445,7 @@ export async function handleConverseMessages(
     });
   }
 
-  // 429s are owned by the failover engine (see passthrough.ts) — 5xx retries stay.
-  const upstream = await postJson(route.path, headers, JSON.stringify(converseBody), {
-    ...opts,
-    retryRateLimit: false,
-  });
+  const upstream = await postJson(route.path, headers, JSON.stringify(converseBody), opts);
   await assertUpstreamOk(upstream, route);
 
   const converseJson = await parseUpstreamJson<ConverseResponse>(upstream, route);

@@ -86,11 +86,16 @@ export const DEFAULT_MAX_BODY_BYTES = 25 * 1024 * 1024; // 25 MiB
  *
  * Falls back to `req.text()` when the body is not a readable stream (e.g. a
  * synthetic Request in tests), still honoring the Content-Length fast path.
+ *
+ * Returns the decoded text AND the raw byte length of the body. The byte count
+ * is computed here anyway (it is what the cap is enforced against), so surfacing
+ * it saves a caller a second `byteLength` pass over the same body — the capture
+ * layer uses it to skip storing a `messages` payload for an oversized request.
  */
 export async function readBodyWithLimit(
   req: { headers: { get(name: string): string | null }; body?: unknown; text(): Promise<string> },
   maxBytes: number = DEFAULT_MAX_BODY_BYTES,
-): Promise<string> {
+): Promise<{ text: string; bytes: number }> {
   const declared = req.headers.get("content-length");
   if (declared !== null) {
     const n = Number(declared);
@@ -105,10 +110,11 @@ export async function readBodyWithLimit(
   if (!body || typeof (body as ReadableStream).getReader !== "function") {
     // No stream available (test Request / already-buffered): read then check.
     const text = await req.text();
-    if (byteLength(text) > maxBytes) {
+    const bytes = byteLength(text);
+    if (bytes > maxBytes) {
       throw new PayloadTooLargeError(`Request body exceeds the ${maxBytes}-byte limit`);
     }
-    return text;
+    return { text, bytes };
   }
 
   const reader = (body as ReadableStream<Uint8Array>).getReader();
@@ -139,7 +145,7 @@ export async function readBodyWithLimit(
     buf.set(c, off);
     off += c.byteLength;
   }
-  return new TextDecoder().decode(buf);
+  return { text: new TextDecoder().decode(buf), bytes: total };
 }
 
 /** UTF-8 byte length of a string without allocating a Buffer copy per call. */
@@ -222,7 +228,25 @@ export function toolResultContentToString(content: unknown): string {
  */
 export const MAX_JSON_DEPTH = 64;
 
-/** Throw `BadRequestError` if a parsed value nests deeper than `MAX_JSON_DEPTH`. */
+/**
+ * Keys that, if present as own properties on a parsed object, enable
+ * prototype-pollution attacks (`__proto__`) or let crafted input reach the
+ * prototype chain via later property access (`constructor`, `prototype`).
+ */
+const POLLUTION_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * Walk a parsed value ONCE, enforcing the depth cap (SEC-3) and stripping
+ * prototype-pollution keys (SEC-2) in the SAME traversal. Iterating `Object.keys`
+ * (rather than `Object.values`) lets us `delete` a dangerous key as we reach it
+ * without disturbing the iteration — `Object.keys` returns a snapshot array, and
+ * the value under a stripped key is dropped whole so it never needs descending.
+ *
+ * Folding the two passes together is the point: the inbound body used to be
+ * traversed TWICE (a `JSON.parse` reviver over every node, then this depth walk),
+ * which measured 2.5–2.8× a plain parse on every request, and the request body
+ * is re-sent in full on every turn.
+ */
 function assertJsonDepth(value: unknown, label: string, depth = 0): void {
   if (depth > MAX_JSON_DEPTH) {
     throw new BadRequestError(`${label} nests deeper than the ${MAX_JSON_DEPTH}-level limit`);
@@ -230,14 +254,23 @@ function assertJsonDepth(value: unknown, label: string, depth = 0): void {
   if (Array.isArray(value)) {
     for (const item of value) assertJsonDepth(item, label, depth + 1);
   } else if (value !== null && typeof value === "object") {
-    for (const v of Object.values(value)) assertJsonDepth(v, label, depth + 1);
+    const obj = value as Record<string, unknown>;
+    for (const key of Object.keys(obj)) {
+      if (POLLUTION_KEYS.has(key)) {
+        delete obj[key];
+        continue;
+      }
+      assertJsonDepth(obj[key], label, depth + 1);
+    }
   }
 }
 
 export function parseJsonObject(raw: string, label = "Request body"): JsonObject {
   let parsed: unknown;
   try {
-    parsed = parseJsonSafe(raw);
+    // A PLAIN parse — no reviver. The prototype-pollution strip happens inside
+    // the depth walk below, so the body is traversed once, not twice.
+    parsed = JSON.parse(raw);
   } catch {
     throw new BadRequestError(`${label} is not valid JSON`);
   }
@@ -249,19 +282,16 @@ export function parseJsonObject(raw: string, label = "Request body"): JsonObject
 }
 
 /**
- * Keys that, if present as own properties on a parsed object, enable
- * prototype-pollution attacks (`__proto__`) or let crafted input reach the
- * prototype chain via later property access (`constructor`, `prototype`).
- */
-const POLLUTION_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-
-/**
  * `JSON.parse` with a reviver that strips prototype-pollution keys anywhere in
  * the tree (SEC-2). `JSON.parse('{"__proto__":{...}}')` creates an *own*
  * property literally named `__proto__` (not a prototype mutation), but code that
  * later spreads/copies or does `obj[k] = ...` can promote it into a real
  * pollution vector — so we drop these keys at the boundary. The reviver returns
  * `undefined` for a dangerous key, which removes it from the result.
+ *
+ * Used for upstream RESPONSE bodies, whose root need not be an object and is
+ * validated separately. The inbound request path uses {@link parseJsonObject},
+ * which folds the strip into its depth walk so the tree is visited once.
  */
 export function parseJsonSafe(raw: string): unknown {
   return JSON.parse(raw, (key, value) => (POLLUTION_KEYS.has(key) ? undefined : value));

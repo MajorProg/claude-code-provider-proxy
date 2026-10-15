@@ -9,7 +9,7 @@
  * Covered here:
  *   - a turn becomes a zstd body file plus an index row; flush drains;
  *   - the shed policy marks a body `shed` while metadata survives;
- *   - the per-turn cap writes the body clipped, marked `truncated`;
+ *   - the per-turn cap drops the body WHOLE (marked `shed`), never corrupt JSON;
  *   - a body WRITE failure still records the row (metadata is never lost);
  *   - retention deletes old bodies and marks them `pruned`;
  *   - a prompt version is stored once and linked by every turn that ran it;
@@ -23,7 +23,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { IndexDb } from "../src/logging/index-db.ts";
-import type { TurnRecord, WriterConfig, WriterJob } from "../src/logging/log-types.ts";
+import type {
+  PromptSurface,
+  TurnRecord,
+  WriterConfig,
+  WriterJob,
+} from "../src/logging/log-types.ts";
 import { computePromptSurface } from "../src/logging/prompt-surface.ts";
 import { InlineWriter, WorkerWriter, createWriter } from "../src/logging/writer.ts";
 
@@ -152,19 +157,38 @@ describe("InlineWriter: bounded capture on the write side", () => {
     await w.close();
   });
 
-  test("a body over maxTurnBytes is written clipped and marked truncated", async () => {
+  test("a body over maxTurnBytes is dropped whole (marked shed), never stored corrupt", async () => {
     const w = new InlineWriter(config({ maxTurnBytes: 40 }));
     w.write(job("s1", 1));
     await w.flush();
 
     const db = reader();
     const t = db.listTurns("s1")[0];
-    expect(t?.bodyState).toBe("truncated");
-    expect(t?.bodyFile).not.toBeNull();
+    // A byte-clip of a JSON blob is not valid JSON, so the body is dropped
+    // honestly: metadata survives, the payload is ABSENT, never unparseable.
+    expect(t?.bodyState).toBe("shed");
+    expect(t?.bodyFile).toBeNull();
+    expect(t?.bodyBytes).toBeNull();
+    // Metadata is still recorded.
+    expect(t?.stopReason).toBe("end_turn");
+
+    db.close();
+    await w.close();
+  });
+
+  test("every stored body file is valid JSON (a record under the cap round-trips)", async () => {
+    const w = new InlineWriter(config({ maxTurnBytes: 8 * 1024 * 1024 }));
+    w.write(job("s1", 1));
+    await w.flush();
+
+    const db = reader();
+    const t = db.listTurns("s1")[0];
+    expect(t?.bodyState).toBe("full");
     const raw = zstd.zstdDecompressSync(
       new Uint8Array(readFileSync(join(root, t?.bodyFile ?? ""))),
     );
-    expect(raw.byteLength).toBeLessThanOrEqual(40);
+    // Parseable JSON, never a clipped prefix.
+    expect(() => JSON.parse(new TextDecoder().decode(raw))).not.toThrow();
 
     db.close();
     await w.close();
@@ -210,7 +234,45 @@ describe("InlineWriter: retention", () => {
   });
 });
 
+/** A minimal synthetic prompt surface (the writer only stores the parts). */
+function surface(tag: string): PromptSurface {
+  return {
+    hash: `hash-${tag}`,
+    systemJson: `"s-${tag}"`,
+    toolsJson: "[]",
+    injectedJson: "[]",
+    systemBytes: 3,
+    toolsBytes: 2,
+  };
+}
+
 describe("InlineWriter: prompt versions", () => {
+  test("the seen-count map is bounded: an evicted hash re-reads its count from the DB", async () => {
+    const w = new InlineWriter(config());
+    // More distinct surfaces than the bound (512): each is seen exactly once, so
+    // the oldest are evicted from the in-memory map. bodyState "shed" avoids a
+    // body file per turn — only the index rows and prompt versions matter here.
+    const N = 600;
+    for (let i = 0; i < N; i++) {
+      w.write(job("s1", i + 1, { promptSurface: surface(String(i)), bodyState: "shed" }));
+    }
+    await w.flush();
+
+    // surface "0" is the first inserted, so it was evicted. Re-seeing it must
+    // continue from the stored count (1) — NOT restart at 1 — proving the bound
+    // costs a re-read, never correctness.
+    w.write(job("s1", N + 1, { promptSurface: surface("0"), bodyState: "shed" }));
+    await w.flush();
+
+    const db = reader();
+    expect(db.getPromptVersionMeta("hash-0")?.seenCount).toBe(2);
+    // A hash still resident in the map also kept counting.
+    expect(db.getPromptVersionMeta("hash-599")?.seenCount).toBe(1);
+
+    db.close();
+    await w.close();
+  });
+
   test("records a prompt version once and links every turn that ran it", async () => {
     const surface = computePromptSurface({
       system: "sys",
@@ -227,7 +289,8 @@ describe("InlineWriter: prompt versions", () => {
     expect(versions).toHaveLength(1);
     expect(versions[0]?.hash).toBe(surface.hash);
     expect(versions[0]?.seenCount).toBe(2);
-    expect(versions[0]?.toolsJson).toBe(surface.toolsJson);
+    // The content is served by the detail read (the list is metadata-only).
+    expect(db.getPromptVersion(surface.hash)?.toolsJson).toBe(surface.toolsJson);
     expect(db.listTurns("s1").map((t) => t.promptVersion)).toEqual([surface.hash, surface.hash]);
 
     db.close();

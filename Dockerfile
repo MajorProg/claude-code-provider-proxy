@@ -3,8 +3,8 @@
 # Bun runtime image for the claude-code-provider-proxy.
 # Pinned to an explicit version (not :latest) for reproducible builds. For a
 # fully immutable base, additionally pin the digest, e.g.
-#   FROM oven/bun:1.3.13-alpine@sha256:<digest> AS base
-# (resolve the current digest with: docker buildx imagetools inspect oven/bun:1.3.13-alpine)
+#   FROM oven/bun:1.4.3-alpine@sha256:<digest> AS base
+# (resolve the current digest with: docker buildx imagetools inspect oven/bun:1.4.3-alpine)
 FROM oven/bun:1.4.3-alpine AS base
 WORKDIR /app
 

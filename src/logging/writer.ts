@@ -16,13 +16,13 @@
  * transferable ArrayBuffer (moved, not structured-clone copied) and the worker
  * opens the database itself, so no sqlite call ever happens on the main thread.
  *
- * Metadata is never lost. A BODY may be shed (queue-budget pressure, a worker
- * crash that took the transferred buffer with it, or the per-turn cap) and the
- * row is marked `shed`/`truncated`, but the index row is always staged, and
- * `IndexDb` spools a failed commit for replay on the next open.
+ * Metadata is never lost. A BODY may be dropped (queue-budget pressure, a worker
+ * crash that took the transferred buffer with it, or a record larger than the
+ * per-turn cap) and the row is marked `shed`, but the index row is always
+ * staged, and `IndexDb` spools a failed commit for replay on the next open.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { IndexDb, type TurnRow } from "./index-db.ts";
@@ -30,8 +30,9 @@ import type {
   BodyState,
   ErrorClass,
   FailoverEvent,
+  PromptPartRef,
   PromptSurface,
-  PromptVersionRecord,
+  PromptVersionWrite,
   TurnRecord,
   WriterConfig,
   WriterJob,
@@ -51,6 +52,13 @@ const DEFAULT_MAX_BATCH_TURNS = 256;
 
 /** Jobs in flight to the worker before posting pauses (flow control). */
 const DEFAULT_MAX_OUTSTANDING = 16;
+
+/**
+ * Bound on the in-memory per-hash seen-count map (LRU by recency). A long-lived
+ * worker accumulating distinct prompt surfaces must not grow it without bound;
+ * an evicted hash simply re-reads its absolute seen count on the next sighting.
+ */
+const MAX_SEEN_SURFACES = 512;
 
 /** Retention sweep cadence (ms); unref'd, so it never holds the process open. */
 const PRUNE_TICK_MS = 6 * 60 * 60 * 1000;
@@ -153,7 +161,7 @@ export interface WriterStats {
   readonly shedCount: number;
   /** Index batches committed by the core. */
   readonly flushCount: number;
-  /** Index rows committed (body written, shed, or truncated). */
+  /** Index rows committed (body written, or shed when over the per-turn cap). */
   readonly writtenCount: number;
   /** Body bytes currently in flight (queued, not yet processed). */
   readonly inFlightBytes: number;
@@ -216,6 +224,23 @@ function writeFileAtomic(file: string, data: Uint8Array): void {
 /** Serialize a turn record to the UTF-8 bytes that become its body file. */
 function encodeTurn(turn: TurnRecord): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(turn));
+}
+
+/**
+ * Content-address ONE canonical prompt part: its sha256, the string itself and
+ * its UTF-8 size. Computed here (on the writer thread, off the request path)
+ * from the already-materialized canonical strings. Deliberately NOT memoized by
+ * the combined version hash: two versions with the same combined hash must still
+ * reflect their own content (the index test that upserts one hash with different
+ * content relies on last-write-wins). Three sha256's of a few hundred KB are
+ * sub-millisecond, and a flush touches only 1-3 versions.
+ */
+function partRef(content: string): PromptPartRef {
+  return {
+    hash: createHash("sha256").update(content).digest("hex"),
+    content,
+    bytes: Buffer.byteLength(content, "utf8"),
+  };
 }
 
 /** Project a turn into the small, clone-safe index metadata. */
@@ -286,8 +311,7 @@ export class WriterCore {
   readonly #onCommit: WriterCoreOptions["onCommit"];
   #turns: TurnRow[] = [];
   #batchIds: number[] = [];
-  #prompts = new Map<string, PromptVersionRecord>();
-  #sessions = new Set<string>();
+  #prompts = new Map<string, PromptVersionWrite>();
   #seen = new Map<string, { createdAt: string; seenCount: number }>();
   #flushCount = 0;
   #closed = false;
@@ -322,18 +346,22 @@ export class WriterCore {
     let bodyState: BodyState = "shed";
 
     if (job.body !== null && meta.bodyState !== "shed") {
-      bodyState = meta.bodyState;
-      let stored = job.body;
+      const stored = job.body;
       if (stored.byteLength > this.#config.maxTurnBytes) {
-        stored = stored.subarray(0, this.#config.maxTurnBytes);
-        bodyState = "truncated";
-      }
-      const written = this.#writeBody(meta, stored);
-      if (written) {
-        bodyFile = written.file;
-        bodyBytes = written.bytes;
-      } else {
+        // A byte-clip of a UTF-8 JSON blob is NOT valid JSON: the stored file
+        // would fail to parse and read back as an empty body. Instead of storing
+        // a corrupt payload, drop the body honestly — the metadata row survives
+        // and the body is ABSENT (marked `shed`), never corrupt.
         bodyState = "shed";
+      } else {
+        bodyState = meta.bodyState;
+        const written = this.#writeBody(meta, stored);
+        if (written) {
+          bodyFile = written.file;
+          bodyBytes = written.bytes;
+        } else {
+          bodyState = "shed";
+        }
       }
     }
 
@@ -362,7 +390,6 @@ export class WriterCore {
       failoverEvents: meta.failoverEvents,
     });
     this.#batchIds.push(job.id);
-    this.#sessions.add(meta.sessionId);
     if (meta.promptSurface) this.#recordPrompt(meta.promptSurface, now);
 
     if (this.#turns.length >= DEFAULT_MAX_BATCH_TURNS) {
@@ -373,26 +400,22 @@ export class WriterCore {
   }
 
   /**
-   * Commit the staged rows. `insertTurnRows` runs first because the `sessions`
-   * rollup is DERIVED from the `turns` rows; prompt versions are independent.
-   * Each `IndexDb` call is internally atomic and spools on failure, so one flush
-   * is a handful of commits covering the whole batch instead of one commit per
-   * turn.
+   * Commit the staged rows as ONE transaction: the turn rows, their incremental
+   * `sessions` rollup (which now travels with the inserts) and the prompt
+   * versions. `IndexDb.commitFlush` owns the transaction and spools the batch on
+   * failure, so a flush is a single commit covering the whole batch rather than
+   * one commit per kind.
    */
   flushBatch(): void {
-    if (this.#turns.length === 0 && this.#prompts.size === 0 && this.#sessions.size === 0) return;
+    if (this.#turns.length === 0 && this.#prompts.size === 0) return;
     const turns = this.#turns;
     const ids = this.#batchIds;
     const prompts = [...this.#prompts.values()];
-    const sessions = [...this.#sessions];
     this.#turns = [];
     this.#batchIds = [];
     this.#prompts = new Map();
-    this.#sessions = new Set();
     try {
-      this.#db.insertTurnRows(turns);
-      this.#db.upsertSessions(sessions);
-      this.#db.upsertPromptVersions(prompts);
+      this.#db.commitFlush(turns, prompts);
       this.#flushCount += 1;
       // The ids are reported only after the rows are durable (inserted, or
       // spooled for replay by IndexDb), so a caller may safely retire them.
@@ -467,16 +490,28 @@ export class WriterCore {
     }
   }
 
-  /** Stage a prompt version, tracking its absolute seen count across the run. */
+  /**
+   * Stage a prompt version, tracking its absolute seen count across the run.
+   * The `#seen` map is bounded (LRU): on eviction the next sighting re-reads
+   * `createdAt` / `seenCount` from the DB via the METADATA-ONLY accessor, so an
+   * eviction costs a read, never correctness — and never materializes the
+   * version's ~244 KB of tool schemas.
+   */
   #recordPrompt(surface: PromptSurface, now: string): void {
     let seen = this.#seen.get(surface.hash);
     if (!seen) {
-      const existing = this.#db.getPromptVersion(surface.hash);
+      const existing = this.#db.getPromptVersionMeta(surface.hash);
       const createdAt = existing && existing.createdAt.length > 0 ? existing.createdAt : now;
       seen = { createdAt, seenCount: existing?.seenCount ?? 0 };
-      this.#seen.set(surface.hash, seen);
     }
     seen.seenCount += 1;
+    // Re-insert as most-recent, then evict the oldest past the cap.
+    this.#seen.delete(surface.hash);
+    this.#seen.set(surface.hash, seen);
+    if (this.#seen.size > MAX_SEEN_SURFACES) {
+      const oldest = this.#seen.keys().next().value;
+      if (oldest !== undefined) this.#seen.delete(oldest);
+    }
     this.#batchPrompt(surface, now, seen.createdAt, seen.seenCount);
   }
 
@@ -492,11 +527,11 @@ export class WriterCore {
       createdAt,
       lastSeen,
       seenCount,
-      systemJson: surface.systemJson,
-      toolsJson: surface.toolsJson,
-      injectedJson: surface.injectedJson,
       systemBytes: surface.systemBytes,
       toolsBytes: surface.toolsBytes,
+      system: partRef(surface.systemJson),
+      tools: partRef(surface.toolsJson),
+      injected: partRef(surface.injectedJson),
     });
   }
 

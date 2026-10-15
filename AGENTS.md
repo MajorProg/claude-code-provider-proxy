@@ -282,8 +282,12 @@ when wiring or debugging a provider.
   jitter so a benched herd reinstates staggered, not as a synchronized burst;
   survives hot-reloads). Message-path 429s are owned by the engine, not
   `postJson`: a rate limit is the upstream's decision about the
-  credential/account, so the body is never re-sent on the same key (5xx keeps
-  in-place retries). A provider whose pool keys all belong to one account may
+  credential/account, so the body is never re-sent on the same key; the message
+  path disables in-place 5xx retries too (a 5xx after the model generated would
+  be a second billed generation), so a message body is never replayed on ANY
+  status — only pre-response connection errors retry (count_tokens, which does
+  not generate, still retries 5xx). A provider whose pool keys all belong to one
+  account may
   set `accountScoped: true` — then a 429 proving an ACCOUNT-level block (a
   parsed reset stamp or the Fair-Usage 1313 signature) benches the whole pool
   at once instead of cascading one 429 per key. When EVERY usable key of every

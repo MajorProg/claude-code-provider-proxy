@@ -16,7 +16,7 @@ import { parseCanonicalId } from "../src/model/canonical-id.ts";
 import { Catalog } from "../src/model/catalog.ts";
 import { handleMantleMessages } from "../src/paths/mantle.ts";
 import { route } from "../src/router.ts";
-import { liveEnabled } from "./helpers/live.ts";
+import { providerLiveEnabled } from "./helpers/live.ts";
 
 const CONFIG: ProxyConfig = validateConfig({
   server: { host: "127.0.0.1", port: 8787 },
@@ -69,7 +69,7 @@ describe("Mistral routing (unit)", () => {
   });
 });
 
-describe.if(liveEnabled() && !!MISTRAL_KEY)("Mistral live via mantle translation", () => {
+describe.if(providerLiveEnabled("MISTRAL_API_KEY"))("Mistral live via mantle translation", () => {
   const target = route(
     CONFIG,
     new Catalog([]),

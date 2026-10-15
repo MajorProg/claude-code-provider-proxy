@@ -166,7 +166,14 @@ export function renderLogViewerHtml(chatEnabled: boolean): string {
       if(m.bodyState==='truncated')h+='<div class="mb-2 rounded-md bg-orange-50 dark:bg-orange-900/30 text-orange-800 dark:text-orange-200 px-3 py-2 text-sm">Body truncated at the configured maxTurnBytes cap; the payload below is clipped.</div>';
       const msgs=body.messages||[];
       h+='<div class="font-semibold mt-2">Request</div>';
-      if(Array.isArray(msgs))for(const msg of msgs){h+='<div class="font-medium capitalize mt-2 text-slate-500">'+window.esc(msg.role||'')+'</div>'+this.renderBlocks(msg.content);}
+      if(body.messagesOmitted){
+        // The inbound conversation exceeded the capture body budget, so it was
+        // omitted whole rather than stored (metadata survives). Surface that
+        // explicitly — an empty message list would read as "no messages sent".
+        const o=body.messagesOmitted;
+        h+='<div class="mb-2 rounded-md bg-amber-50 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 px-3 py-2 text-sm">Request messages omitted: inbound body '+window.esc(o.inboundBytes)+' bytes exceeded the '+window.esc(o.limitBytes)+'-byte capture bound.</div>';
+      }
+      else if(Array.isArray(msgs))for(const msg of msgs){h+='<div class="font-medium capitalize mt-2 text-slate-500">'+window.esc(msg.role||'')+'</div>'+this.renderBlocks(msg.content);}
       else h+='<pre><code>'+window.esc(JSON.stringify(msgs,null,2))+'</code></pre>';
       h+='<div class="font-semibold mt-4">Assistant output</div>'+this.renderBlocks(body.responseContent);
       return h;

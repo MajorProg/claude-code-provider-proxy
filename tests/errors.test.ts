@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import {
   BadRequestError,
   ConfigError,
+  PayloadTooLargeError,
   ProxyError,
   UpstreamError,
   assertNever,
@@ -56,6 +57,23 @@ describe("UpstreamError", () => {
     const err = new UpstreamError(503, "Upstream 503");
     expect(err.upstreamBody).toBeUndefined();
     expect(err.context).toBeUndefined();
+  });
+});
+
+describe("PayloadTooLargeError", () => {
+  test("renders 413 with type 'request_too_large' (Anthropic's own 413 type)", () => {
+    const err = new PayloadTooLargeError("request body exceeds the configured limit");
+    expect(err.status).toBe(413);
+    expect(err.type).toBe("request_too_large");
+    expect(err instanceof ProxyError).toBe(true);
+    // Well-formed Anthropic error body — same shape every ProxyError renders.
+    expect(err.toAnthropicBody()).toEqual({
+      type: "error",
+      error: {
+        type: "request_too_large",
+        message: "request body exceeds the configured limit",
+      },
+    });
   });
 });
 

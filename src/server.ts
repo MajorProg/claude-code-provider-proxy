@@ -35,6 +35,7 @@ import {
 } from "./config.ts";
 import {
   BadRequestError,
+  PayloadTooLargeError,
   ProviderDisabledError,
   ProxyError,
   UnauthorizedError,
@@ -212,12 +213,22 @@ function authenticateManagement(req: Request, config: ProxyConfig): void {
 }
 
 /**
- * Content-Security-Policy for the served HTML pages. The pages load Alpine +
- * a markdown renderer from a CDN and use inline <script>/<style> (Alpine
- * x-data attributes and the inlined page scripts), so 'unsafe-inline' is
- * required for script/style; everything else is locked down. connect-src is
- * 'self' (all API calls are same-origin). This hardens the credential-reveal
- * DOM surface addressed by the XSS-escaping work.
+ * Content-Security-Policy for the served HTML pages. Every other directive is
+ * locked down: object-src/base-uri/frame-ancestors 'none', connect-src 'self'
+ * (all API calls are same-origin), and form-action 'self' (no exfiltration via
+ * a crafted <form action>). This hardens the credential-reveal DOM surface
+ * addressed by the XSS-escaping work.
+ *
+ * 'unsafe-inline' + 'unsafe-eval' REMAIN for script-src DELIBERATELY — removing
+ * them would be a full UI rewrite (explicitly declined). The reasons:
+ *   - the Tailwind Play CDN compiles utility classes with eval at runtime;
+ *   - every page ships its Alpine component as an inline <script>;
+ *   - Alpine itself evaluates x-data / x-if attribute expressions.
+ * The compensating control is that every innerHTML / x-html sink was AUDITED:
+ * untrusted values pass through window.esc (escapeHtml), mdRender escapes text
+ * before emitting HTML, and dynamic text uses x-text (text binding, never
+ * HTML). So the eval/inline surface is a reviewed, bounded risk rather than an
+ * open injection path.
  */
 const CSP_HEADER =
   "default-src 'self'; " +
@@ -231,6 +242,8 @@ const CSP_HEADER =
   "font-src 'self' data:; " +
   "object-src 'none'; " +
   "base-uri 'none'; " +
+  // A submitted <form> may only post back to this origin — never an attacker's.
+  "form-action 'self'; " +
   "frame-ancestors 'none'";
 
 /**
@@ -279,6 +292,25 @@ function modelFromBody(parsed: JsonObject): string {
     throw new BadRequestError("Request is missing a string `model` field");
   }
   return parsed.model;
+}
+
+/**
+ * Anthropic's Messages API REQUIRES `max_tokens`. Each outbound backend reacts
+ * differently to its absence — Converse silently omits the field (the upstream
+ * applies its own default), Mantle/OpenAI omits it, and only z.ai's wire
+ * (mantle.ts) currently rejects it — so the SAME invalid request behaves
+ * differently per path. Enforce the requirement ONCE here, on the /v1/messages
+ * path only: `count_tokens` has no such requirement (its request carries no
+ * generation), so this must NOT live in the shared `assertInboundLimits`
+ * (relay.ts), which dispatchCountTokens also calls.
+ */
+function assertMaxTokens(parsed: JsonObject): void {
+  const maxTokens = parsed.max_tokens;
+  if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || maxTokens <= 0) {
+    throw new BadRequestError(
+      "Request is missing a valid `max_tokens` field (a positive integer is required)",
+    );
+  }
 }
 
 /**
@@ -414,8 +446,12 @@ async function dispatchMessages(
   const requestedAt = new Date().toISOString();
   // Parse the inbound body ONCE here; thread the parsed object through
   // inference and capture (no re-parse in extractModel/safeParse/the handler).
-  const parsed = parseJsonObject(await readBodyWithLimit(req));
+  // `bytes` is the whole-body size the capture layer uses to decide whether the
+  // conversation fits the per-turn body budget (oversized -> `messagesOmitted`).
+  const { text, bytes } = await readBodyWithLimit(req);
+  const parsed = parseJsonObject(text);
   assertInboundLimits(parsed, config.limits);
+  assertMaxTokens(parsed);
   const { response, canonicalId, target, keyLabel } = await runInference(
     config,
     catalog,
@@ -452,6 +488,10 @@ async function dispatchMessages(
       translationPath: target.translationPath,
       system: parsed.system,
       messages: Array.isArray(parsed.messages) ? parsed.messages : [],
+      // Whole inbound body size: the capture layer omits an oversized
+      // conversation (storing `messagesOmitted`) rather than blowing the body
+      // budget on one giant request.
+      inboundBytes: bytes,
       ...(promptSurface ? { promptSurface } : {}),
       ...(toolTrace ? { tools: toolTrace } : {}),
       ...(keyLabel ? { servingKeyLabel: keyLabel } : {}),
@@ -484,7 +524,7 @@ async function dispatchChat(
   const requestedAt = new Date().toISOString();
   // Parse at the trust boundary (uniform with dispatchMessages/CountTokens):
   // rejects non-object bodies with a clean 400 rather than a downstream cast.
-  const raw = parseJsonObject(await readBodyWithLimit(req), "Chat body") as {
+  const raw = parseJsonObject((await readBodyWithLimit(req)).text, "Chat body") as {
     model?: string;
     system?: unknown;
     messages?: unknown;
@@ -549,13 +589,11 @@ function zipResponse(entries: { name: string; content: string }[], baseName: str
     zip = buildZip(entries.map((e) => ({ name: e.name, data: e.content })));
   } catch (err) {
     if (err instanceof ZipLimitError) {
-      // Too large / too many entries for a v2.0 ZIP — 413 instead of a silently
-      // corrupt archive. The operator can narrow the export range and retry.
+      // Too large / too many entries for a v2.0 ZIP. Throwing the typed 413
+      // (rather than a hand-rolled body) routes through the ONE error renderer,
+      // so a 413 has a single shape everywhere.
       logger.warn("zip export exceeded limits", { message: err.message });
-      return Response.json(
-        { type: "error", error: { type: "request_too_large", message: err.message } },
-        { status: 413 },
-      );
+      throw new PayloadTooLargeError(err.message);
     }
     throw err;
   }
@@ -661,7 +699,7 @@ async function dispatchCountTokens(
   cooldownStore?: CredentialCooldownStore,
 ): Promise<Response> {
   authenticateInbound(req.headers, config.inboundAuth.keys);
-  const parsed = parseJsonObject(await readBodyWithLimit(req));
+  const parsed = parseJsonObject((await readBodyWithLimit(req)).text);
   assertInboundLimits(parsed, config.limits);
   const canonicalId = parseCanonicalId(modelFromBody(parsed));
   // Record what the client ASKED for (may be a virtual tier id); the engine
@@ -812,15 +850,29 @@ function exact(...paths: string[]): (pathname: string) => string[] | null {
 /**
  * Prefix matcher that captures the remaining path as `/`-split, non-empty,
  * decodeURIComponent'd segments. Used for the log system-hash / session routes.
+ *
+ * A malformed percent-escape (`%`, `%zz`) makes decodeURIComponent throw
+ * URIError. Matching runs BEFORE the auth gate, so letting that throw would
+ * surface as a pre-auth 500 (plus a console.error + an error-level log line)
+ * on every request — unauthenticated noise amplification. Treat an undecodable
+ * segment as "no match" (-> the caller's 404) instead.
  */
 function prefix(base: string): (pathname: string) => string[] | null {
   return (pathname) => {
     if (!pathname.startsWith(base)) return null;
-    return pathname
+    const segments = pathname
       .slice(base.length)
       .split("/")
-      .filter((p) => p.length > 0)
-      .map(decodeURIComponent);
+      .filter((p) => p.length > 0);
+    const decoded: string[] = [];
+    for (const segment of segments) {
+      try {
+        decoded.push(decodeURIComponent(segment));
+      } catch {
+        return null;
+      }
+    }
+    return decoded;
   };
 }
 
@@ -894,6 +946,35 @@ function exportRangeCutoff(range: "all" | "today" | "1h"): number | null {
 }
 
 /**
+ * How many export entries to buffer before yielding to the event loop. The
+ * session export does synchronous SQLite reads, zstd decompression and
+ * JSON.stringify per entry and then a synchronous crc32 + buffer copy in
+ * buildZip; without a periodic yield a large export would freeze every
+ * concurrent inference stream for hundreds of ms to ~1s.
+ */
+export const EXPORT_YIELD_INTERVAL = 50;
+
+/** Yield to the MACROTASK queue (not just microtasks) so timers and I/O run. */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * Sanitize a session id for use as a ZIP entry-name path segment. The id comes
+ * from the raw `x-claude-code-session-id` request header (and the index stores
+ * it verbatim), so it must never inject a path separator or a `..` traversal
+ * segment into an archive an operator will extract. Mirrors the writer's
+ * on-disk `safeSessionId` allow-list: keep `[A-Za-z0-9._-]`, collapse the rest
+ * to `_`, and reject the degenerate `.`/`..`/empty results (buildZip ALSO
+ * refuses any residual traversal name as defence in depth).
+ */
+function safeExportSessionSegment(id: string): string {
+  const cleaned = id.replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (cleaned.length === 0 || cleaned === "." || cleaned === "..") return "unknown-session";
+  return cleaned.slice(0, 128);
+}
+
+/**
  * GET /api/logs/system — the browsable prompt/instruction-version library.
  *
  * A version is the FULL instruction surface (system blocks + tool schemas +
@@ -954,7 +1035,9 @@ async function handleLogsSessionDetail({ params, logStore }: RouteContext): Prom
   if (params.length === 2) {
     const seq = parseTurnSeq(params[1]);
     if (seq === null) return Response.json({ error: "not found" }, { status: 404 });
-    const meta = (await logStore.listTurns(sessionId)).find((t) => t.seq === seq) ?? null;
+    // Single-row reads: getTurn/getTurnBody both hit the index by
+    // (sessionId, seq) — no full-session listing scan for one turn.
+    const meta = await logStore.getTurn(sessionId, seq);
     const body = await logStore.getTurnBody(sessionId, seq);
     if (meta === null && body === null) {
       return Response.json({ error: "not found" }, { status: 404 });
@@ -967,13 +1050,21 @@ async function handleLogsSessionDetail({ params, logStore }: RouteContext): Prom
 /**
  * GET /api/logs/export/system — every prompt version with its full content, one
  * JSON member per version, composed from the index API (no directory scan).
+ *
+ * `listPromptVersions` returns METADATA ONLY, so the content for each version is
+ * fetched explicitly via `getPromptVersion` (the download is the whole point of
+ * this route — a metadata-only archive would silently drop system/tools/injected).
  */
 async function handleLogsExportSystem({ logStore }: RouteContext): Promise<Response> {
   const versions = await logStore.listPromptVersions();
-  const entries = versions.map((v) => ({
-    name: `prompts/${v.hash}.json`,
-    content: JSON.stringify(v, null, 2),
-  }));
+  const entries: { name: string; content: string }[] = [];
+  for (const meta of versions) {
+    const rec = await logStore.getPromptVersion(meta.hash);
+    entries.push({
+      name: `prompts/${meta.hash}.json`,
+      content: JSON.stringify(rec ?? meta, null, 2),
+    });
+  }
   return zipResponse(entries, "prompt-versions");
 }
 
@@ -990,16 +1081,23 @@ async function handleLogsExportSessions({ url, logStore }: RouteContext): Promis
   const sessions = await logStore.listSessions();
   const entries: { name: string; content: string }[] = [];
   for (const session of sessions) {
+    // Sanitize the session id BEFORE it enters an archive path: it is a raw
+    // client-supplied header value, and an unsanitized `../` in the entry name
+    // would let a non-sanitizing unzip write outside the extraction directory.
+    const segment = safeExportSessionSegment(session.id);
     for (const turn of await logStore.listTurns(session.id)) {
       if (cutoff !== null && Date.parse(turn.requestedAt) < cutoff) continue;
       const body = await logStore.getTurnBody(session.id, turn.seq);
       entries.push({
-        name: `sessions/${session.id}/${String(turn.seq).padStart(5, "0")}.json`,
+        name: `sessions/${segment}/${String(turn.seq).padStart(5, "0")}.json`,
         content:
           body === null
             ? JSON.stringify({ ...turn, bodyUnavailable: true }, null, 2)
             : JSON.stringify(body, null, 2),
       });
+      // Periodically yield to the macrotask queue so a large export never
+      // starves concurrent inference streams (see EXPORT_YIELD_INTERVAL).
+      if (entries.length % EXPORT_YIELD_INTERVAL === 0) await yieldToEventLoop();
     }
   }
   return zipResponse(entries, `sessions-${range}`);

@@ -12,6 +12,7 @@
 export type ProxyErrorType =
   | "authentication_error"
   | "invalid_request_error"
+  | "request_too_large"
   | "rate_limit_error"
   | "not_found_error"
   | "api_error"
@@ -74,7 +75,9 @@ export class BadRequestError extends ProxyError {
 /** 413 — inbound request body exceeds the configured size limit (SEC-1). */
 export class PayloadTooLargeError extends ProxyError {
   constructor(message: string) {
-    super(413, "invalid_request_error", message);
+    // Anthropic's own 413 type is "request_too_large" — matching it keeps the
+    // client's error taxonomy consistent with the endpoint it proxies.
+    super(413, "request_too_large", message);
   }
 }
 

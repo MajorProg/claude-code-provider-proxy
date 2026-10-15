@@ -47,4 +47,26 @@ describe("buildZip", () => {
     }));
     expect(() => buildZip(tooMany)).toThrow(ZipLimitError);
   });
+
+  test("refuses an entry name with a '..' path traversal segment (defence in depth)", () => {
+    expect(() => buildZip([{ name: "sessions/../../etc/passwd.json", data: "x" }])).toThrow(
+      /path traversal segment/,
+    );
+    expect(() => buildZip([{ name: "../escape.json", data: "x" }])).toThrow(
+      /path traversal segment/,
+    );
+  });
+
+  test("refuses an absolute entry name (leading /) (defence in depth)", () => {
+    expect(() => buildZip([{ name: "/etc/passwd.json", data: "x" }])).toThrow(/absolute path/);
+  });
+
+  test("a legitimate dotted/slashed name is still accepted ('..' only as a full segment)", () => {
+    const zip = buildZip([
+      { name: "sessions/.._.._evil/00001.json", data: "x" },
+      { name: "prompts/ab.cd.ef.json", data: "y" },
+    ]);
+    expect(zip[0]).toBe(0x50); // 'P'
+    expect(zip[1]).toBe(0x4b); // 'K'
+  });
 });

@@ -20,7 +20,13 @@
   // Catalog refresh cadence (DESIGN §7.4)
   "refreshIntervalMinutes": 60,
 
-  // Optional: retry Claude on Mantle if runtime rejects (DESIGN §5.4). Default off.
+  // Optional (default off): a ROUTE-TIME fallback for Claude models that cannot
+  // be resolved on the Converse backend at all — absent from the converse
+  // catalog, or with neither an inference profile nor on-demand support. When
+  // on, such a Claude model is routed over Mantle's native Anthropic
+  // passthrough (Path P) instead of returning 404. This is NOT a retry after a
+  // runtime rejection (DESIGN §5.4); it fires only when the forward Converse
+  // route cannot be resolved before the request is sent.
   "claudeFallbackToMantle": false,
 
   // Region families -> concrete AWS regions (DESIGN §5.2, §10)
@@ -150,7 +156,7 @@
       "credential": "${MISTRAL_API_KEY:-}",
       "auth": "bearer",
       "baseUrl": "https://api.mistral.ai/v1",
-      "countTokens": true,
+      "countTokens": false,
       "modelsUrl": "https://api.mistral.ai/v1/models"
     }
     //

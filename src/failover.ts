@@ -631,8 +631,16 @@ export async function executeWithFailover(opts: {
   }
 
   let lastError: unknown;
+  // An account-scoped 429 benches every key of its provider at once (see the
+  // catch below). Remaining planned attempts against that SAME provider are
+  // known-futile: each would burn a live upstream request only to re-learn the
+  // account-level block. Record the benched provider so those attempts are
+  // skipped, advancing straight to the next provider's attempt (or, when none
+  // remain, rethrowing the 429).
+  let skipProvider: string | undefined;
   for (let i = 0; i < attempts.length; i++) {
     const { target, entry, sourceId } = attempts[i] as Attempt;
+    if (skipProvider !== undefined && target.provider === skipProvider) continue;
     // Correlate engine lines with the inbound request (absent in unit tests).
     const reqId = currentRequestContext()?.requestId;
     try {
@@ -694,6 +702,9 @@ export async function executeWithFailover(opts: {
               cooldownStore.mark(target.provider, poolEntry.label, resetAtMs);
             }
           }
+          // Every key of this provider's account is now benched: skip its
+          // remaining planned attempts this request (no cascade of 429s).
+          skipProvider = target.provider;
         } else if (entry?.label !== undefined) {
           cooldownStore.mark(target.provider, entry.label, resetAtMs);
         }

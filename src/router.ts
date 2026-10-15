@@ -61,13 +61,18 @@ export interface RouteTarget {
   readonly credentials?: readonly CredentialPoolEntry[];
 }
 
-/** Map a region-family profilePrefix to a catalog RegionKey. */
+/**
+ * Map a region-family profilePrefix to a catalog RegionKey.
+ *
+ * The sole caller (routeConverse) resolves the AWS region with
+ * `awsRegionForPrefix` FIRST, whose accepted set is exactly {global, us, eu}
+ * and which throws for anything else. So by the time this runs the prefix is
+ * already known-good and the non-"global" case is always "us"/"eu" — the former
+ * unknown-prefix `throw new ModelNotFoundError(...)` here was unreachable dead
+ * code (no input could reach it) and has been removed.
+ */
 function regionKeyForPrefix(config: ProxyConfig, profilePrefix: string): RegionKey {
-  if (profilePrefix === "us" || profilePrefix === "eu") return profilePrefix;
-  if (profilePrefix === "global") return config.primaryRegion;
-  throw new ModelNotFoundError(
-    `Unknown profilePrefix "${profilePrefix}" (expected global | us | eu)`,
-  );
+  return profilePrefix === "global" ? config.primaryRegion : (profilePrefix as RegionKey);
 }
 
 /**
@@ -200,17 +205,42 @@ function routeConverse(config: ProxyConfig, catalog: Catalog, id: CanonicalId): 
   const regionKey = regionKeyForPrefix(config, id.profilePrefix);
   const origin = `https://${hostForRegion(bedrock.hosts.converse, awsRegion)}`;
 
-  // The converse backend ALWAYS uses the Converse API (Path C), for Claude and
-  // non-Claude alike. Converse serves the full Claude catalog, and the backend
-  // is chosen explicitly by the canonical id — no cross-backend fallback
-  // (DESIGN §5.3, §5.4). Native Anthropic passthrough is reserved for mantle.
+  // The converse backend normally ALWAYS uses the Converse API (Path C), for
+  // Claude and non-Claude alike: Converse serves the full Claude catalog and the
+  // backend is chosen explicitly by the canonical id. The single exception is
+  // `claudeFallbackToMantle` (below): a ROUTE-TIME fallback, NOT a retry after a
+  // runtime rejection — it fires only when the forward Converse route cannot be
+  // resolved at all (the model is absent from the converse catalog, or has
+  // neither an inference profile nor on-demand support). It is GATED on
+  // isAnthropic: the field is Claude-specific, and Mantle serves a Claude native
+  // id over its native Anthropic passthrough route (Path P), so only a Claude id
+  // has a same-model destination to fall back to. Falling a non-Claude model
+  // onto Path M would be a different translation, not a fallback.
   const model = catalog.get(regionKey, "converse", id.nativeModelId);
   if (!model) {
+    if (config.claudeFallbackToMantle && isAnthropic(id.nativeModelId)) {
+      return routeMantle(config, id);
+    }
     throw new ModelNotFoundError(
       `Model "${id.nativeModelId}" not found for converse in region "${awsRegion}"`,
     );
   }
-  const invocationId = resolveInvocationId(model, config.profilePreference);
+  let invocationId: string;
+  try {
+    invocationId = resolveInvocationId(model, config.profilePreference);
+  } catch (err) {
+    // No inference profile and no on-demand support: the model exists on
+    // Converse but cannot be invoked there. For a Claude id with the fallback
+    // enabled, Mantle's passthrough route serves the same model.
+    if (
+      config.claudeFallbackToMantle &&
+      isAnthropic(id.nativeModelId) &&
+      err instanceof ModelNotFoundError
+    ) {
+      return routeMantle(config, id);
+    }
+    throw err;
+  }
   const encoded = encodeURIComponent(invocationId);
   return makeRoute({
     provider: "bedrock",

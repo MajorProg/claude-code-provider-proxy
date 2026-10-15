@@ -13,6 +13,15 @@
  */
 import { networkInterfaces } from "node:os";
 
+/**
+ * The shape os.networkInterfaces() returns: a name -> address-list map. Callers
+ * that derive or verify a BIND_IP accept a {@link NetworkInterfaceSource}, so the
+ * OS lookup is an ordinary injectable parameter (defaulting to the real OS) and
+ * the "no private LAN interface" path is reachable in a hermetic test.
+ */
+export type NetworkInterfaceMap = ReturnType<typeof networkInterfaces>;
+export type NetworkInterfaceSource = () => NetworkInterfaceMap;
+
 /** Interface-name fragments that indicate VPN / virtual / container NICs. */
 const VIRTUAL_NAME_PATTERNS = [
   "utun", // macOS VPN tunnels
@@ -59,9 +68,11 @@ export interface BindCandidate {
  * Enumerate all candidate LAN IPv4 addresses: non-internal, private-range,
  * on a non-virtual/non-VPN interface. Returned in interface-enumeration order.
  */
-export function listBindCandidates(): BindCandidate[] {
+export function listBindCandidates(
+  net: NetworkInterfaceSource = networkInterfaces,
+): BindCandidate[] {
   const out: BindCandidate[] = [];
-  const ifaces = networkInterfaces();
+  const ifaces = net();
   for (const [name, addrs] of Object.entries(ifaces)) {
     if (!addrs || isVirtualName(name)) continue;
     for (const a of addrs) {
@@ -79,8 +90,8 @@ export function listBindCandidates(): BindCandidate[] {
  * null when none can be found (e.g. VPN-only host) — callers must then fail
  * loudly and ask the user to set BIND_IP explicitly, rather than guessing.
  */
-export function deriveBindIp(): string | null {
-  const candidates = listBindCandidates();
+export function deriveBindIp(net: NetworkInterfaceSource = networkInterfaces): string | null {
+  const candidates = listBindCandidates(net);
   return candidates[0]?.ip ?? null;
 }
 
@@ -93,9 +104,12 @@ export type VerifyResult =
  * physical interface. Used to catch stale/wrong values before Docker fails at
  * bind time.
  */
-export function verifyBindIp(ip: string): VerifyResult {
+export function verifyBindIp(
+  ip: string,
+  net: NetworkInterfaceSource = networkInterfaces,
+): VerifyResult {
   if (!isPrivateIPv4(ip)) return { ok: false, reason: "not-private" };
-  const ifaces = networkInterfaces();
+  const ifaces = net();
   for (const [name, addrs] of Object.entries(ifaces)) {
     if (!addrs) continue;
     for (const a of addrs) {

@@ -402,14 +402,12 @@ function isBlockedHost(host: string): boolean {
   if (h === "::1") return true;
   if (h.startsWith("fe80:") || h.startsWith("fe80::")) return true; // link-local
   if (/^f[cd][0-9a-f]{2}:/.test(h)) return true; // fc00::/7 unique-local
-  // IPv4-mapped IPv6. The URL parser normalizes ::ffff:169.254.169.254 to the
-  // hex form ::ffff:a9fe:a9fe, so handle BOTH the dotted and hex tails.
-  const mappedDotted = h.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  // IPv4-mapped IPv6. This function's only caller passes `new URL(origin).hostname`,
+  // and the WHATWG URL parser NORMALIZES the dotted form ::ffff:169.254.169.254 to
+  // the hex form ::ffff:a9fe:a9fe — so only the hex tail can ever arrive here.
   const mappedHex = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
   let v4 = h;
-  if (mappedDotted) {
-    v4 = mappedDotted[1] as string;
-  } else if (mappedHex) {
+  if (mappedHex) {
     const hi = Number.parseInt(mappedHex[1] as string, 16);
     const lo = Number.parseInt(mappedHex[2] as string, 16);
     v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
@@ -562,10 +560,11 @@ export interface ProxyConfig {
   readonly server: { readonly host: string; readonly port: number };
   readonly inboundAuth: InboundAuthConfig;
   /**
-   * Set (only) by {@link loadConfig} when env interpolation resolved bare
-   * `${VAR}` refs to empty (vars unset/empty). Surfaced by /status.json,
-   * /api/config/status, and doctor; never set by validateConfig (a UI save has
-   * no load-time warnings) and never serialized.
+   * Set (only) by {@link loadConfig} — never by validateConfig (a UI save has
+   * no load-time warnings) and never serialized. Entries are either an env var
+   * NAME whose bare `${VAR}` reference resolved empty, or a self-describing
+   * message for a per-type provider field set on a provider that does not read
+   * it. Surfaced by /status.json, /api/config/status, and doctor.
    */
   readonly loadWarnings?: readonly string[];
   readonly primaryRegion: RegionKey;
@@ -1092,6 +1091,18 @@ function validateExternalProvider(key: string, raw: unknown): ExternalProviderCo
     raw.accountScoped === undefined || typeof raw.accountScoped === "boolean",
     `${where}.accountScoped must be a boolean`,
   );
+  // countTokens / strictTools are per-type switches, read only on one translation
+  // path (router.ts: countTokens for type "anthropic", strictTools for type
+  // "openai"). Assert their TYPE the same way accountScoped is, so a quoted
+  // "true" fails fast instead of validating and silently disabling the feature.
+  assert(
+    raw.countTokens === undefined || typeof raw.countTokens === "boolean",
+    `${where}.countTokens must be a boolean`,
+  );
+  assert(
+    raw.strictTools === undefined || typeof raw.strictTools === "boolean",
+    `${where}.strictTools must be a boolean`,
+  );
 
   const zaiWire =
     raw.zaiWire === undefined ? undefined : validateZaiWire(raw.zaiWire, `${where}.zaiWire`);
@@ -1350,12 +1361,52 @@ async function configFromText(
   }
   const validated = validateConfig(parsed);
   warnDroppedVirtualEntries(parsed, validated);
+  // A per-type provider field set on the wrong `type` validates but is NEVER
+  // read (router.ts wires each field per-type) — report each so an operator
+  // does not believe a feature is on when it never runs. Non-fatal: the repo
+  // degrades rather than fails on misplaced info.
+  const misplaced = misplacedProviderFieldWarnings(validated);
+  for (const w of misplaced) console.warn(`config: ${w}`);
+  const warnings = [...(missing.size > 0 ? [...missing].sort() : []), ...misplaced];
   if (missing.size > 0) {
     const names = [...missing].sort().join(", ");
     console.warn(`config: unset env var(s) resolved empty: ${names}`);
-    return Object.freeze({ ...validated, loadWarnings: [...missing].sort() });
+  }
+  if (warnings.length > 0) {
+    return Object.freeze({ ...validated, loadWarnings: warnings });
   }
   return validated;
+}
+
+/**
+ * Report provider fields that are read by exactly one provider `type` and were
+ * set on a provider of a different type — they validate but are silently
+ * ignored (see `router.ts`: `countTokens` is wired only for type "anthropic";
+ * `strictTools` and `zaiWire` only for type "openai"). Returns one message per
+ * misplaced field naming the field, the provider, and the reason. Emitted as
+ * load warnings (non-fatal) by {@link configFromText}, so they surface in
+ * /status.json, /api/config/status, and doctor.
+ */
+function misplacedProviderFieldWarnings(config: ProxyConfig): string[] {
+  const warnings: string[] = [];
+  for (const [key, p] of Object.entries(config.providers.external)) {
+    if (p.type !== "openai" && p.zaiWire !== undefined) {
+      warnings.push(
+        `providers.${key}.zaiWire is set but ignored on a type "${p.type}" provider (zaiWire is only read for type "openai")`,
+      );
+    }
+    if (p.type !== "openai" && p.strictTools === true) {
+      warnings.push(
+        `providers.${key}.strictTools is set but ignored on a type "${p.type}" provider (strictTools is only read for type "openai")`,
+      );
+    }
+    if (p.type !== "anthropic" && p.countTokens === true) {
+      warnings.push(
+        `providers.${key}.countTokens is set but ignored on a type "${p.type}" provider (countTokens is only read for type "anthropic")`,
+      );
+    }
+  }
+  return warnings;
 }
 
 /**

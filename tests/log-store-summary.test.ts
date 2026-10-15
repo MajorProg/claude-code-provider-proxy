@@ -9,7 +9,8 @@
  *   - `exportSessionTurns` names every turn body WITHOUT the `.zst` extension,
  *     decompresses its content, honors the `all | today | 1h` range filter, and
  *     skips a shed body (no file on disk);
- *   - `exportSystemPrompts` emits each prompt version's full instruction surface.
+ *   - the prompt-version listing is metadata-only while the detail read serves
+ *     the full instruction surface.
  *
  * Hermetic: temp directories only, never the repo `./logs`.
  */
@@ -149,8 +150,8 @@ describe("exportSessionTurns", () => {
   });
 });
 
-describe("exportSystemPrompts", () => {
-  test("exports each prompt version's full instruction surface, self-describing", async () => {
+describe("prompt-version content: metadata listing + full detail", () => {
+  test("listPromptVersions is metadata-only; getPromptVersion serves the full surface", async () => {
     const s = store();
     const surface = computePromptSurface({
       system: "You are terse.",
@@ -163,28 +164,30 @@ describe("exportSystemPrompts", () => {
     });
     await s.flush();
 
-    const entries = await s.exportSystemPrompts();
-    expect(entries).toHaveLength(1);
-    expect(entries[0]?.name).toBe(`prompt-versions/${surface.hash}.json`);
-    const rec = JSON.parse(entries[0]?.content ?? "{}") as {
-      hash: string;
-      system: unknown;
-      tools: unknown;
-      injected: unknown;
-      stats: { turns: number };
-    };
-    expect(rec.hash).toBe(surface.hash);
-    // The stored content reconstitutes the surface's three parts verbatim.
-    expect(rec.system).toEqual(JSON.parse(surface.systemJson));
-    expect(rec.tools).toEqual(JSON.parse(surface.toolsJson));
-    expect(rec.injected).toEqual(JSON.parse(surface.injectedJson));
-    expect(rec.stats.turns).toBe(1);
+    const versions = await s.listPromptVersions();
+    expect(versions).toHaveLength(1);
+    const meta = versions[0];
+    expect(meta?.hash).toBe(surface.hash);
+    expect(meta?.seenCount).toBe(1);
+    // The listing carries NO content fields (no ~244 KB tools_json deserialized).
+    expect(Object.keys(meta ?? {})).not.toContain("toolsJson");
+    expect(Object.keys(meta ?? {})).not.toContain("systemJson");
+
+    // The detail read reconstitutes the surface's three parts verbatim.
+    const rec = await s.getPromptVersion(surface.hash);
+    expect(rec?.systemJson).toEqual(surface.systemJson);
+    expect(rec?.toolsJson).toEqual(surface.toolsJson);
+    expect(rec?.injectedJson).toEqual(surface.injectedJson);
+    // The metadata accessor agrees with the listing.
+    expect((await s.getPromptVersionMeta(surface.hash))?.hash).toBe(surface.hash);
     await s.close();
   });
 
-  test("a store with no prompt versions exports an empty list", async () => {
+  test("a store with no prompt versions lists nothing", async () => {
     const s = store();
-    expect(await s.exportSystemPrompts()).toEqual([]);
+    expect(await s.listPromptVersions()).toEqual([]);
+    expect(await s.getPromptVersion("missing")).toBeNull();
+    expect(await s.getPromptVersionMeta("missing")).toBeNull();
     await s.close();
   });
 });

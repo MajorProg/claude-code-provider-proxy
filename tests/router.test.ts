@@ -5,11 +5,17 @@
  *
  * Required env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, (AWS_SESSION_TOKEN).
  */
-import { beforeAll, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import { generateShortLivedBedrockToken } from "../src/auth/bedrock-token.ts";
 import { type ProxyConfig, validateConfig } from "../src/config.ts";
+import { ModelNotFoundError } from "../src/errors.ts";
 import { parseCanonicalId } from "../src/model/canonical-id.ts";
-import { type Catalog, CatalogManager, createHttpDiscoveryClient } from "../src/model/catalog.ts";
+import {
+  Catalog,
+  CatalogManager,
+  type DiscoveredModel,
+  createHttpDiscoveryClient,
+} from "../src/model/catalog.ts";
 import { route } from "../src/router.ts";
 import { awsCreds, describeLive } from "./helpers/live.ts";
 
@@ -118,5 +124,104 @@ describeLive("route (against live catalog)", () => {
   test("unknown model throws ModelNotFoundError", () => {
     const id = parseCanonicalId("bedrock.converse.us.nonexistent.model-v99:0");
     expect(() => route(CONFIG, catalog, id)).toThrow();
+  });
+});
+
+// ── claudeFallbackToMantle (route-time fallback) ─────────────────────────────
+// Hermetic: a fixed Catalog + validateConfig, no live discovery.
+
+const CLAUDE_MODEL = "claude-3-5-sonnet-20241022";
+const NONCLAUDE_MODEL = "amazon.nova-lite-v1:0";
+
+/** A converse Claude entry that CANNOT be invoked on Converse. */
+const converseClaudeNoProfile: DiscoveredModel = {
+  provider: "bedrock",
+  awsRegion: "us-east-1",
+  regionKey: "us",
+  backend: "converse",
+  nativeModelId: CLAUDE_MODEL,
+  isAnthropic: true,
+  supportsOnDemand: false,
+  profiles: [],
+  streaming: true,
+};
+
+const converseNonClaudeNoProfile: DiscoveredModel = {
+  provider: "bedrock",
+  awsRegion: "us-east-1",
+  regionKey: "us",
+  backend: "converse",
+  nativeModelId: NONCLAUDE_MODEL,
+  isAnthropic: false,
+  supportsOnDemand: false,
+  profiles: [],
+  streaming: true,
+};
+
+function fbConfig(claudeFallbackToMantle: boolean): ProxyConfig {
+  return validateConfig({
+    server: { host: "127.0.0.1", port: 8787 },
+    inboundAuth: { keys: ["test"] },
+    primaryRegion: "us",
+    profilePreference: "global",
+    refreshIntervalMinutes: 60,
+    claudeFallbackToMantle,
+    regions: [{ key: "us", awsRegion: "us-east-1" }],
+    providers: {
+      bedrock: {
+        credential: "bedrock-api-key-test",
+        hosts: {
+          converse: "bedrock-runtime.{region}.amazonaws.com",
+          mantle: "bedrock-mantle.{region}.api.aws",
+          control: "bedrock.{region}.amazonaws.com",
+        },
+      },
+    },
+    logging: { enabled: false },
+    chatPage: { enabled: false },
+  });
+}
+
+describe("route() claudeFallbackToMantle", () => {
+  test("flag on + a Claude converse id with no resolvable profile -> mantle passthrough", () => {
+    const id = parseCanonicalId(`bedrock.converse.us.${CLAUDE_MODEL}`);
+    const t = route(fbConfig(true), new Catalog([converseClaudeNoProfile]), id);
+    expect(t.provider).toBe("bedrock");
+    expect(t.backend).toBe("mantle");
+    expect(t.translationPath).toBe("passthrough");
+    expect(t.isAnthropic).toBe(true);
+    expect(t.path).toBe("https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages");
+    expect(t.countTokensPath).toBe(
+      "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages/count_tokens",
+    );
+    // The native id is passed through unchanged (Mantle's route takes bare ids).
+    expect(t.invocationId).toBe(CLAUDE_MODEL);
+  });
+
+  test("flag on + a Claude converse id absent from the catalog -> mantle passthrough", () => {
+    const id = parseCanonicalId(`bedrock.converse.us.${CLAUDE_MODEL}`);
+    const t = route(fbConfig(true), new Catalog([]), id);
+    expect(t.translationPath).toBe("passthrough");
+    expect(t.isAnthropic).toBe(true);
+    expect(t.path).toContain("/anthropic/v1/messages");
+    expect(t.countTokensPath).toContain("/anthropic/v1/messages/count_tokens");
+  });
+
+  test("flag off -> a Claude converse id with no resolvable profile still throws", () => {
+    const id = parseCanonicalId(`bedrock.converse.us.${CLAUDE_MODEL}`);
+    expect(() => route(fbConfig(false), new Catalog([converseClaudeNoProfile]), id)).toThrow(
+      ModelNotFoundError,
+    );
+    expect(() => route(fbConfig(false), new Catalog([]), id)).toThrow(ModelNotFoundError);
+  });
+
+  test("flag on + a NON-Claude model with no profile still throws (isAnthropic gate)", () => {
+    const id = parseCanonicalId(`bedrock.converse.us.${NONCLAUDE_MODEL}`);
+    // Falling a non-Claude id onto Path M would be a different translation, not
+    // a fallback — the gate must keep the ModelNotFoundError.
+    expect(() => route(fbConfig(true), new Catalog([converseNonClaudeNoProfile]), id)).toThrow(
+      ModelNotFoundError,
+    );
+    expect(() => route(fbConfig(true), new Catalog([]), id)).toThrow(ModelNotFoundError);
   });
 });

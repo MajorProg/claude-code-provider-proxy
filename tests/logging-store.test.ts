@@ -6,7 +6,8 @@
  * side is served from the SQLite index, with each body decompressed on demand.
  * These tests drive the real store over throwaway temp directories:
  *   - recordTurn returns without committing anything (the row appears on flush);
- *   - listTurns / getTurnBody round-trip a turn through zstd unchanged;
+ *   - listTurns / getTurn / getTurnBody round-trip a turn through zstd unchanged;
+ *   - an over-cap body is ABSENT (never corrupt), its metadata intact;
  *   - a pruned (or missing) body reads back as absent, never throwing;
  *   - sessions aggregate; a prompt surface is stored once and linked;
  *   - a disabled store — and an unwritable dir — are safe no-ops.
@@ -177,6 +178,44 @@ describe("LogStore: read path", () => {
     await s.close();
   });
 
+  test("getTurn returns one turn's metadata by (sessionId, seq)", async () => {
+    const s = store();
+    await s.recordTurn(turn("s1"));
+    await s.flush();
+    const meta = await s.getTurn("s1", 1);
+    expect(meta?.seq).toBe(1);
+    expect(meta?.bodyState).toBe("full");
+    expect(await s.getTurn("s1", 999)).toBeNull();
+    await s.close();
+  });
+
+  test("messagesOmitted rides inside the body blob and round-trips", async () => {
+    const s = store();
+    const recorded = turn("s1", {
+      messagesOmitted: { inboundBytes: 12_345, limitBytes: 8_192 },
+    });
+    await s.recordTurn(recorded);
+    await s.flush();
+    expect(await s.getTurnBody("s1", 1)).toEqual(recorded);
+    await s.close();
+  });
+
+  test("an over-cap body is ABSENT (never corrupt) while its metadata survives", async () => {
+    const s = store({ maxTurnBytes: 200 });
+    await s.recordTurn(turn("s1", { messages: [{ role: "user", content: "x".repeat(2_000) }] }));
+    await s.flush();
+
+    const metas = await s.listTurns("s1");
+    expect(metas).toHaveLength(1);
+    // The body was over the cap, so it is dropped whole — marked shed, no file.
+    expect(metas[0]?.bodyState).toBe("shed");
+    expect(metas[0]?.bodyFile).toBeNull();
+    // The payload is absent, never an unparseable (corrupt) body.
+    expect(await s.getTurnBody("s1", 1)).toBeNull();
+    expect(metas[0]?.stopReason).toBe("end_turn");
+    await s.close();
+  });
+
   test("a prompt surface is stored once, linked, and queryable with stats", async () => {
     const s = store();
     const surface = computePromptSurface({
@@ -232,9 +271,11 @@ describe("LogStore: disabled / unwritable", () => {
     await s.flush();
     expect(await s.listSessions()).toEqual([]);
     expect(await s.listTurns("s1")).toEqual([]);
+    expect(await s.getTurn("s1", 1)).toBeNull();
     expect(await s.getTurnBody("s1", 1)).toBeNull();
     expect(await s.listPromptVersions()).toEqual([]);
     expect(await s.getPromptVersion("x")).toBeNull();
+    expect(await s.getPromptVersionMeta("x")).toBeNull();
     expect((await s.statsForPromptVersion("x")).turns).toBe(0);
     expect(await s.recordSystemPrompt("sys")).toBeNull();
     await s.close();

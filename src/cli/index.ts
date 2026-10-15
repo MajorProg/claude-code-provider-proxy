@@ -32,14 +32,15 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { networkInterfaces as osNetworkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { credentialState, resolveBedrockMode } from "../auth/bedrock-mode.ts";
 import { type ProxyConfig, loadConfig } from "../config.ts";
-import { deriveBindIp, verifyBindIp } from "./bind-ip.ts";
+import { type NetworkInterfaceMap, deriveBindIp, verifyBindIp } from "./bind-ip.ts";
 import { bootstrapPaths, ensureAuthToken, ensureConfigFiles } from "./bootstrap.ts";
 import { writeClaudeSettings } from "./claude.ts";
-import { checkBun, checkDocker, ensureClaudeCode } from "./deps.ts";
+import { type DepsHost, checkBun, checkDocker, ensureClaudeCode } from "./deps.ts";
 import { getEnvValue, readEnvFile, setEnvValue } from "./env.ts";
 import {
   bold,
@@ -72,6 +73,103 @@ interface Args {
   arg: string | undefined;
 }
 
+/**
+ * The process/OS boundary every command touches (existence probe, capture/inherit
+ * runners, detached spawn, process signal) plus the Claude settings-file override,
+ * collected into one injectable object. Command bodies take an optional `io`
+ * defaulting to {@link realCliEnv}; tests pass a stub so the REAL command logic
+ * runs in-process against a temp root with no real process spawned and no file
+ * written outside it. The default preserves today's behaviour exactly.
+ */
+export interface CliEnv extends DepsHost {
+  spawnDetached(
+    cmd: string,
+    args: string[],
+    opts: { cwd: string; logFd: number; env: Record<string, string> },
+  ): number | undefined;
+  kill(pid: number): void;
+  /** Override for ~/.claude/settings.json (tests point this at a temp dir). */
+  claudeSettingsFile?: string;
+  /**
+   * The OS network-interface map (os.networkInterfaces()). A seam so BIND_IP
+   * derivation/verification can be driven against a synthetic host — e.g. a
+   * VPN-only machine with no private LAN address — instead of the real NICs.
+   */
+  networkInterfaces(): NetworkInterfaceMap;
+  /**
+   * Ping watcher's poll of the proxy's public /status.json: the parsed body, or
+   * `undefined` on a non-2xx response. The real default GETs `url` with a 4s
+   * timeout COMBINED with `signal`, so cancelling the watcher cancels the
+   * in-flight request instead of leaving it to run out its own timeout; a test
+   * injects a canned sequence.
+   */
+  pollStatus(
+    url: string,
+    signal?: AbortSignal,
+  ): Promise<{ servingAccount?: string | null } | undefined>;
+  /**
+   * Ping watcher's inter-poll delay. The real default waits `ms` (clearing the
+   * timer promptly when `signal` aborts); a test stub resolves immediately.
+   */
+  sleep(ms: number, signal?: AbortSignal): Promise<void>;
+}
+
+/** The real boundary: every method shells out / signals the real OS. */
+export const realCliEnv: CliEnv = {
+  commandExists,
+  runCapture,
+  runInherit,
+  currentPlatform,
+  spawnDetached,
+  kill: (pid): void => {
+    process.kill(pid);
+  },
+  networkInterfaces: () => osNetworkInterfaces(),
+  pollStatus: async (url, signal) => {
+    // Bound each poll with a 4s timeout so a hung request cannot wedge the
+    // watcher, AND cancel it the instant the watcher signal aborts so Ctrl-C
+    // tears down an in-flight fetch immediately — not merely the await around
+    // it (leaving the request to hold the event loop until the timeout fires is
+    // the bug this wires in). The two signals are merged through a controller
+    // rather than AbortSignal.any(), which this project's TS lib does not declare.
+    const timeout = AbortSignal.timeout(4000);
+    const merged = new AbortController();
+    const onAbort = (): void => merged.abort();
+    timeout.addEventListener("abort", onAbort, { once: true });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const res = await fetch(url, { signal: merged.signal });
+      if (!res.ok) return undefined;
+      return (await res.json()) as { servingAccount?: string | null };
+    } finally {
+      // Detach both: the watcher signal is long-lived, so an undispatched
+      // listener would accumulate one per poll over a long watch.
+      timeout.removeEventListener("abort", onAbort);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  },
+  sleep: (ms, signal) =>
+    new Promise<void>((resolve) => {
+      if (signal === undefined) {
+        setTimeout(resolve, ms);
+        return;
+      }
+      // Abort-aware: an abort settles the wait at once (no full-interval stall),
+      // otherwise the timer does. Whichever fires detaches the other, and the
+      // abort listener is removed on normal completion too — so the long-lived
+      // watcher signal never accumulates listeners.
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal.addEventListener("abort", onAbort, { once: true });
+    }),
+};
+
 /** Project root = two levels up from src/cli/index.ts. */
 function projectRoot(): string {
   return dirname(dirname(dirname(fileURLToPath(import.meta.url))));
@@ -93,19 +191,17 @@ export function parseArgs(argv: string[]): Args {
 }
 
 /** Resolve the run mode: explicit flag wins, else Docker if available. */
-function resolveMode(explicit: Mode | undefined): Mode {
+export function resolveMode(explicit: Mode | undefined, io: CliEnv = realCliEnv): Mode {
   if (explicit) return explicit;
-  return commandExists("docker") ? "docker" : "local";
+  return io.commandExists("docker") ? "docker" : "local";
 }
 
-function compose(root: string, args: string[]): number {
+function compose(root: string, args: string[], io: CliEnv = realCliEnv): number {
   // Prefer the `docker compose` plugin; fall back to legacy `docker-compose`.
-  if (runCapture("docker", ["compose", "version"]) !== null) {
-    return runInherit("docker", ["compose", ...args], root);
-  }
-  if (commandExists("docker-compose")) {
-    return runInherit("docker-compose", args, root);
-  }
+  const hasPlugin = io.runCapture("docker", ["compose", "version"]) !== null;
+  if (hasPlugin) return io.runInherit("docker", ["compose", ...args], root);
+  const hasLegacy = io.commandExists("docker-compose");
+  if (hasLegacy) return io.runInherit("docker-compose", args, root);
   die("neither 'docker compose' nor 'docker-compose' is available.");
 }
 
@@ -182,11 +278,11 @@ export function claudeModels(envPath: string): {
  * verify it and warn (don't block) on a stale/virtual/absent value. Returns the
  * effective BIND_IP, or null if none could be established.
  */
-export function resolveBindIp(envPath: string): string | null {
+export function resolveBindIp(envPath: string, io: CliEnv = realCliEnv): string | null {
   const current = getEnvValue(envPath, "BIND_IP");
   if (current && current.trim() !== "") {
     const value = current.trim();
-    const v = verifyBindIp(value);
+    const v = verifyBindIp(value, io.networkInterfaces);
     if (!v.ok) {
       warn(`BIND_IP=${current} looks unsafe (${v.reason}); keeping it but verify your network.`);
     }
@@ -195,7 +291,7 @@ export function resolveBindIp(envPath: string): string | null {
     process.env.BIND_IP = value;
     return value;
   }
-  const derived = deriveBindIp();
+  const derived = deriveBindIp(io.networkInterfaces);
   if (!derived) {
     warn("Could not auto-derive a LAN IP (VPN-only or no private interface?).");
     return null;
@@ -239,7 +335,7 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
-function localUp(root: string, envPath: string): void {
+function localUp(root: string, envPath: string, io: CliEnv = realCliEnv): void {
   const { pid: pidFile, log, logDir } = localPaths(root);
   const existing = readPid(pidFile);
   if (existing && pidAlive(existing)) {
@@ -249,28 +345,28 @@ function localUp(root: string, envPath: string): void {
   mkdirSync(logDir, { recursive: true });
 
   const port = portValue(envPath);
-  const bind = resolveBindIp(envPath);
+  const bind = resolveBindIp(envPath, io);
   // Local mode binds the server directly to the LAN IP (or 127.0.0.1 fallback).
   const host = bind ?? "127.0.0.1";
 
   // Load .env values into the child environment (interpolated by config load).
-  const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+  const childEnv: Record<string, string> = { ...(process.env as Record<string, string>) };
   for (const line of existsSync(envPath) ? readFileSync(envPath, "utf8").split(/\r?\n/) : []) {
     const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-    if (m?.[1] && m[2] !== undefined) env[m[1]] = m[2];
+    if (m?.[1] && m[2] !== undefined) childEnv[m[1]] = m[2];
   }
-  env.HOST = host;
-  env.PORT = port;
-  env.CONFIG_PATH = join(root, "config.local.jsonc");
+  childEnv.HOST = host;
+  childEnv.PORT = port;
+  childEnv.CONFIG_PATH = join(root, "config.local.jsonc");
 
   // Open the log fd and guarantee it's closed even if the spawn throws.
   const logFd = openSync(log, "a");
   let pid: number | undefined;
   try {
-    pid = spawnDetached("bun", ["run", join(root, "src", "server.ts")], {
+    pid = io.spawnDetached("bun", ["run", join(root, "src", "server.ts")], {
       cwd: root,
       logFd,
-      env,
+      env: childEnv,
     });
   } finally {
     closeSync(logFd);
@@ -284,7 +380,7 @@ function localUp(root: string, envPath: string): void {
   info(`  Logs:             ${log}`);
 }
 
-function localDown(root: string): void {
+function localDown(root: string, io: CliEnv = realCliEnv): void {
   const { pid: pidFile } = localPaths(root);
   const pid = readPid(pidFile);
   if (!pid) {
@@ -293,7 +389,7 @@ function localDown(root: string): void {
   }
   if (pidAlive(pid)) {
     try {
-      process.kill(pid);
+      io.kill(pid);
       ok(`Stopped local proxy (pid ${pid}).`);
       rmSync(pidFile, { force: true });
     } catch (e) {
@@ -321,48 +417,51 @@ function localStatus(root: string, envPath: string): void {
 }
 
 // --- Commands -------------------------------------------------------------
-function cmdSetup(root: string, mode: Mode, rotate: boolean): void {
+export function cmdSetup(root: string, mode: Mode, rotate: boolean, io: CliEnv = realCliEnv): void {
   info(`${bold("[1/4]")} Checking dependencies…`);
-  checkBun();
-  if (mode === "docker") checkDocker(true);
+  checkBun(io);
+  if (mode === "docker") checkDocker(true, io);
 
   info(`${bold("[2/4]")} Bootstrapping config…`);
   const paths = bootstrapPaths(root);
   const { createdEnv } = ensureConfigFiles(paths);
   const token = ensureAuthToken(paths, rotate);
-  resolveBindIp(paths.env);
+  resolveBindIp(paths.env, io);
 
   info(`${bold("[3/4]")} Installing + configuring Claude Code…`);
-  ensureClaudeCode();
+  ensureClaudeCode(io);
   const port = portValue(paths.env);
   const models = claudeModels(paths.env);
-  writeClaudeSettings({
-    baseUrl: `http://127.0.0.1:${port}`,
-    authToken: token,
-    mainModel: models.mainModel,
-    fastModel: models.fastModel,
-    sonnetModel: models.sonnetModel,
-    haikuModel: models.haikuModel,
-    opusModel: models.opusModel,
-    defaultModel: models.defaultModel,
-    subagentModel: models.subagentModel,
-    legacySmallFast: models.legacySmallFast,
-    ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
-    ...(models.customModelOption ? { customModelOption: models.customModelOption } : {}),
-    ...(models.customModelOptionName
-      ? { customModelOptionName: models.customModelOptionName }
-      : {}),
-    ...(models.customModelOptionDescription
-      ? { customModelOptionDescription: models.customModelOptionDescription }
-      : {}),
-  });
+  writeClaudeSettings(
+    {
+      baseUrl: `http://127.0.0.1:${port}`,
+      authToken: token,
+      mainModel: models.mainModel,
+      fastModel: models.fastModel,
+      sonnetModel: models.sonnetModel,
+      haikuModel: models.haikuModel,
+      opusModel: models.opusModel,
+      defaultModel: models.defaultModel,
+      subagentModel: models.subagentModel,
+      legacySmallFast: models.legacySmallFast,
+      ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
+      ...(models.customModelOption ? { customModelOption: models.customModelOption } : {}),
+      ...(models.customModelOptionName
+        ? { customModelOptionName: models.customModelOptionName }
+        : {}),
+      ...(models.customModelOptionDescription
+        ? { customModelOptionDescription: models.customModelOptionDescription }
+        : {}),
+    },
+    io.claudeSettingsFile,
+  );
 
   if (mode === "docker") {
     info(`${bold("[4/4]")} Building Docker image…`);
-    compose(root, ["build"]);
+    compose(root, ["build"], io);
   } else {
     info(`${bold("[4/4]")} Local mode — no image build needed.`);
-    if (commandExists("bun")) runInherit("bun", ["install"], root);
+    if (io.commandExists("bun")) io.runInherit("bun", ["install"], root);
   }
 
   ok("Setup complete.");
@@ -379,55 +478,55 @@ function cmdSetup(root: string, mode: Mode, rotate: boolean): void {
   info(`Next: ${bold(`bun run cli up --${mode}`)}`);
 }
 
-function cmdUp(root: string, mode: Mode): void {
+export function cmdUp(root: string, mode: Mode, io: CliEnv = realCliEnv): void {
   const paths = bootstrapPaths(root);
   ensureConfigFiles(paths);
   if (mode === "local") {
-    localUp(root, paths.env);
+    localUp(root, paths.env, io);
     return;
   }
-  checkDocker(true);
-  const bind = resolveBindIp(paths.env);
+  checkDocker(true, io);
+  const bind = resolveBindIp(paths.env, io);
   if (!bind) die("BIND_IP is required for Docker mode. Set it in .env (LAN IPv4).");
   const port = portValue(paths.env);
-  compose(root, ["up", "-d", "--build"]);
+  compose(root, ["up", "-d", "--build"], io);
   ok(`Running in Docker (bound to ${bind} + 127.0.0.1 only — not 0.0.0.0).`);
   info(`  Registry (LAN):   http://${bind}:${port}/`);
   info(`  Registry (local): http://127.0.0.1:${port}/`);
   info(`  Configure Claude: ${bold("bun run cli config-claude")}`);
 }
 
-function cmdDown(root: string, mode: Mode): void {
+export function cmdDown(root: string, mode: Mode, io: CliEnv = realCliEnv): void {
   if (mode === "local") {
-    localDown(root);
+    localDown(root, io);
     return;
   }
-  checkDocker(true);
-  compose(root, ["down", "--remove-orphans"]);
+  checkDocker(true, io);
+  compose(root, ["down", "--remove-orphans"], io);
   ok("Stopped.");
 }
 
-function cmdStatus(root: string, mode: Mode): void {
+export function cmdStatus(root: string, mode: Mode, io: CliEnv = realCliEnv): void {
   const envPath = join(root, ".env");
   if (mode === "local") {
     localStatus(root, envPath);
     return;
   }
-  checkDocker(true);
-  compose(root, ["ps"]);
+  checkDocker(true, io);
+  compose(root, ["ps"], io);
   const port = portValue(envPath);
   const bind = getEnvValue(envPath, "BIND_IP");
   info(`Registry: http://${bind || "127.0.0.1"}:${port}/  (local: http://127.0.0.1:${port}/)`);
 }
 
-function cmdLogs(root: string, mode: Mode): void {
+export function cmdLogs(root: string, mode: Mode, io: CliEnv = realCliEnv): void {
   if (mode === "local") {
     const { log } = localPaths(root);
     if (!existsSync(log)) {
       warn("No local log file yet.");
       return;
     }
-    runInherit(
+    io.runInherit(
       process.platform === "win32" ? "powershell" : "tail",
       process.platform === "win32"
         ? ["-Command", `Get-Content -Wait -Tail 50 "${log}"`]
@@ -435,40 +534,43 @@ function cmdLogs(root: string, mode: Mode): void {
     );
     return;
   }
-  checkDocker(true);
-  compose(root, ["logs", "-f", "proxy"]);
+  checkDocker(true, io);
+  compose(root, ["logs", "-f", "proxy"], io);
 }
 
-function cmdConfigClaude(root: string): void {
+export function cmdConfigClaude(root: string, io: CliEnv = realCliEnv): void {
   const paths = bootstrapPaths(root);
   ensureConfigFiles(paths);
   const token = getEnvValue(paths.env, "PROXY_INBOUND_KEY");
   if (!token || token.trim() === "") {
     die("PROXY_INBOUND_KEY not set in .env. Run setup first (it generates one).");
   }
-  ensureClaudeCode();
+  ensureClaudeCode(io);
   const port = portValue(paths.env);
   const models = claudeModels(paths.env);
-  writeClaudeSettings({
-    baseUrl: `http://127.0.0.1:${port}`,
-    authToken: token,
-    mainModel: models.mainModel,
-    fastModel: models.fastModel,
-    sonnetModel: models.sonnetModel,
-    haikuModel: models.haikuModel,
-    opusModel: models.opusModel,
-    defaultModel: models.defaultModel,
-    subagentModel: models.subagentModel,
-    legacySmallFast: models.legacySmallFast,
-    ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
-    ...(models.customModelOption ? { customModelOption: models.customModelOption } : {}),
-    ...(models.customModelOptionName
-      ? { customModelOptionName: models.customModelOptionName }
-      : {}),
-    ...(models.customModelOptionDescription
-      ? { customModelOptionDescription: models.customModelOptionDescription }
-      : {}),
-  });
+  writeClaudeSettings(
+    {
+      baseUrl: `http://127.0.0.1:${port}`,
+      authToken: token,
+      mainModel: models.mainModel,
+      fastModel: models.fastModel,
+      sonnetModel: models.sonnetModel,
+      haikuModel: models.haikuModel,
+      opusModel: models.opusModel,
+      defaultModel: models.defaultModel,
+      subagentModel: models.subagentModel,
+      legacySmallFast: models.legacySmallFast,
+      ...(models.maxContextTokens ? { maxContextTokens: models.maxContextTokens } : {}),
+      ...(models.customModelOption ? { customModelOption: models.customModelOption } : {}),
+      ...(models.customModelOptionName
+        ? { customModelOptionName: models.customModelOptionName }
+        : {}),
+      ...(models.customModelOptionDescription
+        ? { customModelOptionDescription: models.customModelOptionDescription }
+        : {}),
+    },
+    io.claudeSettingsFile,
+  );
 }
 
 /**
@@ -493,52 +595,166 @@ export function resolveSoundPlayer(
   return null;
 }
 
+/** Poll cadence while the proxy is healthy (2s). */
+const PING_INTERVAL_MS = 2000;
+/** Cap for the exponential backoff applied while the proxy is unreachable (30s). */
+const PING_BACKOFF_MAX_MS = 30000;
+
+/**
+ * Run a promise-producing step but resolve to `null` the instant `signal`
+ * aborts — so a poll that is in flight (or a long wait) can never block
+ * shutdown. A step rejection propagates unchanged. The `start` callback is
+ * handed the same `signal` so a cancellable step (the real pollStatus passes it
+ * to fetch) tears its own work down rather than being merely abandoned.
+ */
+function raceAbort<T>(
+  start: (signal: AbortSignal) => Promise<T>,
+  signal: AbortSignal,
+): Promise<T | null> {
+  if (signal.aborted) return Promise.resolve(null);
+  return new Promise<T | null>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(null);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    start(signal).then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * Host-side serving-account change watcher: polls the proxy's public
- * /status.json (`servingAccount` — labels only) every 2s and plays a sound on
- * the default audio device whenever it changes (failover to another key,
- * cooldown expiry, provider shift). Runs on the HOST (the container cannot
- * reach the speakers) — works for both --local and --docker since it targets
- * the published port. Ctrl-C to stop.
+ * /status.json (`servingAccount` — labels only) and plays a sound on the
+ * default audio device whenever it changes (failover to another key, cooldown
+ * expiry, provider shift). Runs on the HOST (the container cannot reach the
+ * speakers) — works for both --local and --docker since it targets the
+ * published port. Returns an exit code (0 for a clean shutdown) when `signal`
+ * aborts; it never resolves otherwise.
+ *
+ * Three behaviours the earlier fire-and-forget loop got wrong:
+ *  - an unreachable proxy is announced ONCE per transition (including when it
+ *    was never reachable — the opening state), and again "reachable again" on
+ *    recovery, so a stopped proxy is never silently ignored;
+ *  - a failed poll no longer discards the last KNOWN account, so an account
+ *    change that happened DURING an outage is still surfaced after recovery;
+ *  - the poll interval backs off (2s → 4s → 8s → … capped at 30s) while the
+ *    proxy is down, and resets to 2s on the first success, so a dead proxy is
+ *    not hammered forever.
  */
-async function cmdPing(soundPath: string | undefined): Promise<void> {
-  const root = projectRoot();
+async function cmdPing(
+  soundPath: string | undefined,
+  signal: AbortSignal,
+  io: CliEnv = realCliEnv,
+  root: string = projectRoot(),
+): Promise<number> {
   const base = `http://127.0.0.1:${portValue(join(root, ".env"))}`;
-  const player = resolveSoundPlayer(currentPlatform());
+  const player = resolveSoundPlayer(io.currentPlatform());
   const sound = soundPath ?? "/System/Library/Sounds/Glass.aiff";
+  // Probe the sound file ONCE at startup rather than on every play.
+  let audio = false;
   if (player === null) {
     warn("No sound player on this platform (macOS: afplay). Watching without sound.");
   } else if (!existsSync(sound)) {
     warn(`Sound file not found: ${sound} — watching without sound.`);
+  } else {
+    audio = true;
   }
+  let playWarned = false;
+  const play = (): void => {
+    if (player === null || !audio) return;
+    let failure: string | null = null;
+    try {
+      if (io.runCapture(player.cmd, [...player.baseArgs, sound]) === null) {
+        failure = `${player.cmd} exited non-zero`;
+      }
+    } catch (e) {
+      failure = e instanceof Error ? e.message : String(e);
+    }
+    if (failure !== null && !playWarned) {
+      playWarned = true;
+      warn(`Could not play the sound (${failure}); continuing without audio.`);
+    }
+  };
+
   info(`Watching ${base}/status.json for serving-account changes (Ctrl-C to stop)…`);
-  let last: string | null | undefined;
+  const ts = (): string => new Date().toLocaleTimeString();
+  let last: string | null | undefined; // last KNOWN account — survives an outage
+  let reachable: boolean | undefined; // undefined until the first observation
+  let outage = false; // a failed poll since the last successful one
+  let backoff = PING_INTERVAL_MS;
+
   for (;;) {
     try {
-      const res = await fetch(`${base}/status.json`, { signal: AbortSignal.timeout(4000) });
-      if (res.ok) {
-        const j = (await res.json()) as { servingAccount?: string | null };
-        const cur = j.servingAccount ?? null;
+      // The watcher signal is threaded into the poll, so an abort cancels the
+      // in-flight fetch (not just this await) and the process can exit at once.
+      const status = await raceAbort((s) => io.pollStatus(`${base}/status.json`, s), signal);
+      if (status === null) break; // aborted mid-poll
+      // Any HTTP answer (even a non-2xx) means the proxy is reachable.
+      if (reachable === false) info(`${ts()} proxy reachable again`);
+      reachable = true;
+      if (status !== undefined) {
+        const cur = status.servingAccount ?? null;
         if (last !== undefined && cur !== last) {
-          info(
-            `${new Date().toLocaleTimeString()} serving account changed: ${last ?? "(none)"} -> ${
-              cur ?? "(none)"
-            }`,
-          );
-          if (player !== null && existsSync(sound)) {
-            runCapture(player.cmd, [...player.baseArgs, sound]);
-          }
+          const when = outage ? " during an outage" : "";
+          info(`${ts()} serving account changed${when}: ${last ?? "(none)"} -> ${cur ?? "(none)"}`);
+          play();
         }
         last = cur;
       }
+      outage = false;
+      backoff = PING_INTERVAL_MS;
     } catch {
-      // Proxy down or restarting — keep watching; surface once per state change.
-      if (last !== undefined) {
-        info(`${new Date().toLocaleTimeString()} proxy unreachable, waiting…`);
-        last = undefined;
-      }
+      // Proxy down or restarting — announce each transition once, then keep watching.
+      if (reachable !== false) info(`${ts()} proxy unreachable at ${base}, waiting…`);
+      reachable = false;
+      outage = true;
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    if (signal.aborted) break;
+    const wait = reachable === false ? backoff : PING_INTERVAL_MS;
+    if (reachable === false) backoff = Math.min(backoff * 2, PING_BACKOFF_MAX_MS);
+    await io.sleep(wait, signal);
+    if (signal.aborted) break;
+  }
+  return 0;
+}
+
+/**
+ * Wire the ping watcher's lifecycle: one AbortController driven by Ctrl-C
+ * (SIGINT/SIGTERM), plus an optional external signal for tests. Awaits the
+ * watcher, prints a single clean "stopped" line, and returns its exit code.
+ * The handlers are removed on the way out so nothing leaks.
+ */
+async function runPingWatcher(
+  soundPath: string | undefined,
+  io: CliEnv,
+  root: string,
+  signal: AbortSignal | undefined,
+): Promise<number> {
+  const controller = new AbortController();
+  const stop = (): void => controller.abort();
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  if (signal !== undefined) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", stop, { once: true });
+  }
+  try {
+    const code = await cmdPing(soundPath, controller.signal, io, root);
+    info("Ping watcher stopped.");
+    return code;
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    if (signal !== undefined) signal.removeEventListener("abort", stop);
   }
 }
 
@@ -607,10 +823,10 @@ export function configDiagnostics(config: ProxyConfig): {
   return out;
 }
 
-async function cmdDoctor(root: string, mode: Mode): Promise<void> {
+export async function cmdDoctor(root: string, mode: Mode, io: CliEnv = realCliEnv): Promise<void> {
   info(bold("Environment check:"));
-  checkBun();
-  checkDocker(false);
+  checkBun(io);
+  checkDocker(false, io);
   const paths = bootstrapPaths(root);
   info(existsSync(paths.env) ? "  .env present." : "  .env missing (run setup).");
   info(
@@ -623,7 +839,7 @@ async function cmdDoctor(root: string, mode: Mode): Promise<void> {
     const v = verifyBindIp(bind.trim());
     info(v.ok ? `  BIND_IP=${bind} OK.` : `  BIND_IP=${bind} PROBLEM: ${v.reason}.`);
   } else {
-    const derived = deriveBindIp();
+    const derived = deriveBindIp(io.networkInterfaces);
     info(
       derived
         ? `  BIND_IP unset — would derive ${derived}.`
@@ -661,7 +877,7 @@ async function cmdDoctor(root: string, mode: Mode): Promise<void> {
   }
 }
 
-function usage(): void {
+export function usage(): void {
   info(
     [
       "claude-code-provider-proxy CLI",
@@ -687,57 +903,83 @@ function usage(): void {
   );
 }
 
-async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
-  const root = projectRoot();
+/**
+ * The CLI entry point. Returns the process exit code: 0 for a normal run, or
+ * the value a long-running command (the ping watcher) settles on when aborted,
+ * so the boot guard can exit deterministically instead of the process being
+ * kept alive by a watch loop. An optional external `signal` cancels the watch
+ * (used by tests; production wires SIGINT/SIGTERM inside the ping command).
+ */
+export async function main(
+  argv: string[] = process.argv.slice(2),
+  io: CliEnv = realCliEnv,
+  root: string = projectRoot(),
+  signal?: AbortSignal,
+): Promise<number> {
+  const args = parseArgs(argv);
   if (args.command === "help" || args.command === "-h" || args.command === "--help") {
     usage();
-    return;
+    return 0;
   }
-  const mode = resolveMode(args.mode);
+  const mode = resolveMode(args.mode, io);
   switch (args.command) {
     case "setup":
-      cmdSetup(root, mode, args.rotate);
+      cmdSetup(root, mode, args.rotate, io);
       break;
     case "up":
     case "start":
-      cmdUp(root, mode);
+      cmdUp(root, mode, io);
       break;
     case "down":
     case "stop":
-      cmdDown(root, mode);
+      cmdDown(root, mode, io);
       break;
     case "restart":
-      cmdDown(root, mode);
-      cmdUp(root, mode);
+      cmdDown(root, mode, io);
+      cmdUp(root, mode, io);
       break;
     case "status":
-      cmdStatus(root, mode);
+      cmdStatus(root, mode, io);
       break;
     case "logs":
-      cmdLogs(root, mode);
+      cmdLogs(root, mode, io);
       break;
     case "config-claude":
-      cmdConfigClaude(root);
+      cmdConfigClaude(root, io);
       break;
     case "doctor":
-      await cmdDoctor(root, mode);
+      await cmdDoctor(root, mode, io);
       break;
     case "ping":
-      await cmdPing(args.arg);
-      break;
+      return runPingWatcher(args.arg, io, root, signal);
     default:
       warn(`Unknown command: ${args.command}`);
       usage();
       process.exit(1);
   }
+  return 0;
+}
+
+/**
+ * Fatal-exit handler for the boot guard: report the error and exit non-zero.
+ * Extracted (and exported) so its body is exercised directly instead of hiding
+ * inside a never-run `import.meta.main` arrow.
+ */
+export function cliErrorExit(err: unknown): void {
+  console.error(err);
+  process.exit(1);
+}
+
+/** Adopt main()'s resolved code as the process exit status (exported for tests). */
+export function setExitCode(code: number): void {
+  process.exitCode = code;
 }
 
 // Only run the CLI when executed directly (`bun run src/cli/index.ts ...`),
 // not when imported (e.g. by the module smoke test), mirroring server.ts.
+// The resolved code becomes the process exit status (a clean ping shutdown is
+// 0), so a non-zero return is not silently discarded; a rejection still forces
+// a non-zero exit through cliErrorExit.
 if (import.meta.main) {
-  main().catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+  main().then(setExitCode).catch(cliErrorExit);
 }

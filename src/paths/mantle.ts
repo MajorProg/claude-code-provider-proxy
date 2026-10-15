@@ -730,7 +730,15 @@ export async function handleMantleMessages(
     );
   }
   const headers = buildOpenAIHeaders(bearer);
-  const opts = signal ? { signal } : {};
+  // PC2: a message body is NEVER replayed on a status code (streaming or not) —
+  // a 5xx after the model generated would be a second billed generation. 429s
+  // are owned by the failover engine (see passthrough.ts). Connection-level
+  // retries (a throw before any response) are unaffected.
+  const opts = {
+    ...(signal ? { signal } : {}),
+    retryTransientStatus: false,
+    retryRateLimit: false,
+  };
   // The upstream correlation id (set on zai-wire lanes) rides the request
   // body AND the response headers — logged here so a z.ai-side lookup
   // correlates with our request id end-to-end.
@@ -752,13 +760,7 @@ export async function handleMantleMessages(
       stream: true,
       stream_options: { include_usage: true },
     };
-    const streamOpts = { ...opts, retryTransientStatus: false };
-    const upstream = await postJson(
-      route.streamPath,
-      headers,
-      JSON.stringify(streamBody),
-      streamOpts,
-    );
+    const upstream = await postJson(route.streamPath, headers, JSON.stringify(streamBody), opts);
     await assertUpstreamOk(upstream, route, { requireBody: true });
     const body = upstream.body as ReadableStream<Uint8Array>;
     // zai-wire lanes surface abnormal in-stream termination as finish_reason
@@ -778,11 +780,9 @@ export async function handleMantleMessages(
     });
   }
 
-  // 429s are owned by the failover engine (see passthrough.ts) — 5xx retries stay.
-  const upstream = await postJson(route.path, headers, JSON.stringify(openaiBody), {
-    ...opts,
-    retryRateLimit: false,
-  });
+  // 429s are owned by the failover engine (see passthrough.ts) — a message body
+  // is never replayed on a status code (PC2), connection retries unaffected.
+  const upstream = await postJson(route.path, headers, JSON.stringify(openaiBody), opts);
   await assertUpstreamOk(upstream, route);
 
   const openaiJson = await parseUpstreamJson<OpenAIResponse>(upstream, route);

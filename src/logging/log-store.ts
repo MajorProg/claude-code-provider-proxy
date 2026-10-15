@@ -13,8 +13,9 @@
  * a dedicated thread (bun:sqlite is synchronous and would otherwise stall the
  * event loop); an InlineWriter runs it on the calling thread (tests / fallback).
  *
- * Read path (listSessions / listTurns / listPromptVersions / getPromptVersion /
- * statsForPromptVersion): served from the index via this store's OWN read
+ * Read path (listSessions / listTurns / getTurn / listPromptVersions /
+ * getPromptVersion / getPromptVersionMeta / statsForPromptVersion): served from
+ * the index via this store's OWN read
  * connection, so reads never depend on, or block, the writer's thread. A turn's
  * body is a single zstd file, decompressed on read ({@link getTurnBody}).
  *
@@ -35,6 +36,7 @@ import type { LoggingConfig } from "../config.ts";
 import { IndexDb, type ListTurnsOptions } from "./index-db.ts";
 import type {
   PromptSurface,
+  PromptVersionMeta,
   PromptVersionRecord,
   PromptVersionStats,
   SessionSummary,
@@ -371,8 +373,31 @@ export class LogStore {
     }
   }
 
-  /** List stored prompt versions (full content), most recently seen first. */
-  async listPromptVersions(): Promise<PromptVersionRecord[]> {
+  /**
+   * Read one turn's index metadata by `(sessionId, seq)`, or null when absent.
+   * Cheaper than {@link getTurnBody} when only the metadata row is needed.
+   */
+  async getTurn(sessionId: string, seq: number): Promise<TurnMeta | null> {
+    const reader = this.reader;
+    if (!reader || !this.enabled) return null;
+    try {
+      return reader.getTurn(sessionId, seq);
+    } catch (err) {
+      logger.warn("log-store failed to read turn", {
+        session: sessionId,
+        seq,
+        message: errorMessage(err),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * List stored prompt versions (METADATA ONLY), most recently seen first. The
+   * content of each version is served by {@link getPromptVersion}, so listing N
+   * versions does not deserialize N × ~244 KB of tool schemas.
+   */
+  async listPromptVersions(): Promise<PromptVersionMeta[]> {
     const reader = this.reader;
     if (!reader || !this.enabled) return [];
     try {
@@ -380,6 +405,21 @@ export class LogStore {
     } catch (err) {
       logger.warn("log-store failed to list prompt versions", { message: errorMessage(err) });
       return [];
+    }
+  }
+
+  /** Read one prompt version's metadata (no content) by hash. */
+  async getPromptVersionMeta(hash: string): Promise<PromptVersionMeta | null> {
+    const reader = this.reader;
+    if (!reader || !this.enabled) return null;
+    try {
+      return reader.getPromptVersionMeta(hash);
+    } catch (err) {
+      logger.warn("log-store failed to read prompt version metadata", {
+        hash,
+        message: errorMessage(err),
+      });
+      return null;
     }
   }
 
@@ -418,50 +458,6 @@ export class LogStore {
   }
 
   /* ---------------- export (for the ZIP download routes) ---------------- */
-
-  /**
-   * Export every stored prompt version as {name, content} for the ZIP download
-   * route. Each entry is the FULL instruction surface (system text + tool
-   * definitions + injected instruction blocks) in readable JSON, carrying the
-   * version hash and its aggregates so an exported archive is self-describing.
-   * Read from the `prompt_versions` table — never a `logs/system/` dir scan,
-   * which the new design no longer populates.
-   */
-  async exportSystemPrompts(): Promise<{ name: string; content: string }[]> {
-    const reader = this.reader;
-    if (!reader || !this.enabled) return [];
-    const out: { name: string; content: string }[] = [];
-    try {
-      for (const v of reader.listPromptVersions()) {
-        let stats: PromptVersionStats;
-        try {
-          stats = reader.statsForPromptVersion(v.hash);
-        } catch {
-          stats = emptyStats(v.hash);
-        }
-        const content = JSON.stringify(
-          {
-            hash: v.hash,
-            createdAt: v.createdAt,
-            lastSeen: v.lastSeen,
-            seenCount: v.seenCount,
-            systemBytes: v.systemBytes,
-            toolsBytes: v.toolsBytes,
-            system: parseCanonical(v.systemJson),
-            tools: parseCanonical(v.toolsJson),
-            injected: parseCanonical(v.injectedJson),
-            stats,
-          },
-          null,
-          2,
-        );
-        out.push({ name: `prompt-versions/${v.hash}.json`, content });
-      }
-    } catch (err) {
-      logger.warn("log-store failed to export prompt versions", { message: errorMessage(err) });
-    }
-    return out;
-  }
 
   /**
    * Export session turn bodies as {name, content} for the ZIP download route,
@@ -564,16 +560,6 @@ export class LogStore {
     const abs = resolve(base, rel);
     if (abs !== base && !abs.startsWith(base + sep)) return null;
     return abs;
-  }
-}
-
-/** Parse a canonical JSON string back to a value; return it raw when it does
- *  not parse (so an export is never blanked by one malformed record). */
-function parseCanonical(json: string): unknown {
-  try {
-    return JSON.parse(json) as unknown;
-  } catch {
-    return json;
   }
 }
 

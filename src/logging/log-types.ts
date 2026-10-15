@@ -27,8 +27,14 @@ export interface TurnUsage {
  * is best-effort and may be shed under memory pressure or dropped by retention
  * (the index row survives either way — the client response is never affected).
  *   - `full`      — body written verbatim (within the per-turn byte cap).
- *   - `truncated` — body written but clipped to `maxTurnBytes`.
- *   - `shed`      — body capture dropped under in-flight budget pressure.
+ *   - `truncated` — the CAPTURE layer clipped the payload to the per-turn cap by
+ *                   whole content blocks (a still-valid, parseable record). Set
+ *                   by capture, never by the writer.
+ *   - `shed`      — body dropped: in-flight budget pressure, or a record larger
+ *                   than `maxTurnBytes` when it reaches the writer (a byte-clip
+ *                   of a UTF-8 JSON blob is not valid JSON, so the payload is
+ *                   dropped whole rather than stored corrupt). The metadata row
+ *                   survives either way.
  *   - `pruned`    — body deleted by retention; the index row survives.
  */
 export type BodyState = "full" | "truncated" | "shed" | "pruned";
@@ -80,8 +86,14 @@ export interface FailoverEvent {
  *       `<system-reminder>` envelope or project-rule content), which are
  *       otherwise indistinguishable from ordinary user turns.
  * A change in ANY of the three yields a new `hash`. `hash` is sha256 over a
- * canonical, key-sorted JSON serialization of the three parts; the full content
- * is kept FOREVER in `prompt_versions`.
+ * canonical, key-sorted JSON serialization of the three parts.
+ *
+ * STORAGE: each part is ALSO content-addressed on its own (sha256 of the part's
+ * canonical string) so two versions that share a byte-identical part — most
+ * importantly the ~244 KB tool schema, which changes far less often than the
+ * system prompt — store that part ONCE. The version metadata lives in
+ * `prompt_versions`, the part strings in `prompt_parts`, and the version ->
+ * three-parts mapping in `prompt_version_content`.
  */
 export interface PromptSurface {
   readonly hash: string;
@@ -96,13 +108,59 @@ export interface PromptSurface {
 }
 
 /**
- * One stored prompt version (`prompt_versions` row). The content is kept
- * forever (never pruned); every turn links back via `turns.prompt_version`.
+ * One content-addressed piece of a prompt surface (a `prompt_parts` row): the
+ * sha256 of the canonical part string, the string itself, and its UTF-8 size.
+ * Two versions whose system/tools/injected parts are byte-identical share ONE
+ * row. Content addressing is EXACT-MATCH — a tool set differing by a single
+ * schema field is a different part — so the win is one copy per genuinely
+ * distinct part, not a perfect collapse.
  */
-export interface PromptVersionRecord extends PromptSurface {
+export interface PromptPartRef {
+  readonly hash: string;
+  readonly content: string;
+  readonly bytes: number;
+}
+
+/**
+ * Metadata for one stored prompt version (a `prompt_versions` row) WITHOUT its
+ * content — the shape a listing needs, so listing N versions does not
+ * deserialize N × ~244 KB of tool schemas. Content is reconstituted on demand
+ * into {@link PromptVersionRecord}.
+ */
+export interface PromptVersionMeta {
+  readonly hash: string;
   readonly createdAt: string;
   readonly lastSeen: string;
   readonly seenCount: number;
+  readonly systemBytes: number;
+  readonly toolsBytes: number;
+}
+
+/**
+ * One stored prompt version WITH its full content. The content is kept forever
+ * (never pruned); every turn links back via `turns.prompt_version`. The parts
+ * are read from `prompt_parts` first, falling back to the legacy inline
+ * `prompt_versions` JSON columns for rows written before content addressing.
+ */
+export interface PromptVersionRecord extends PromptVersionMeta {
+  /** Canonical JSON of the system prompt blocks. */
+  readonly systemJson: string;
+  /** Canonical JSON of the tool definitions (names + full schemas). */
+  readonly toolsJson: string;
+  /** Canonical JSON of injected instruction blocks extracted from the convo. */
+  readonly injectedJson: string;
+}
+
+/**
+ * What the writer hands the index for one prompt version: the metadata row plus
+ * its three parts as content-addressed {@link PromptPartRef}s. The index writes
+ * the parts, the version -> parts mapping and the metadata row in ONE
+ * transaction.
+ */
+export interface PromptVersionWrite extends PromptVersionMeta {
+  readonly system: PromptPartRef;
+  readonly tools: PromptPartRef;
+  readonly injected: PromptPartRef;
 }
 
 /**
@@ -165,6 +223,16 @@ export interface TurnRecord {
   readonly bodyState?: BodyState;
   /** `turn_id` of the parent turn, when this turn belongs to a subagent. */
   readonly subagentOf?: number;
+  /**
+   * Set when the inbound `messages` array was OMITTED from this stored body
+   * because it exceeded the capture budget: `inboundBytes` is the size seen and
+   * `limitBytes` the cap that tripped. Like the rest of this record it lives
+   * INSIDE the zstd body blob, so it is schema-free — no SQL column.
+   */
+  readonly messagesOmitted?: {
+    readonly inboundBytes: number;
+    readonly limitBytes: number;
+  };
 }
 
 /**

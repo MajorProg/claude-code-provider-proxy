@@ -153,8 +153,11 @@ describe("production dispatch fingerprints the FULL instruction surface", () => 
 
       const versions = await store.listPromptVersions();
       expect(versions).toHaveLength(1);
-      const v = versions[0];
-      expect(v).toBeDefined();
+      const meta = versions[0];
+      expect(meta).toBeDefined();
+      // The list is metadata-only; the content comes from the detail read.
+      const v = await store.getPromptVersion(meta?.hash ?? "");
+      expect(v).not.toBeNull();
       // The gap: tools_json was ALWAYS "[]" because no caller passed tools through.
       expect(v?.toolsJson).not.toBe("[]");
       expect(v?.toolsJson).toContain("read_file");
@@ -165,7 +168,7 @@ describe("production dispatch fingerprints the FULL instruction surface", () => 
 
       // The turn links to the full-surface version.
       const turns = await store.listTurns(SESSION);
-      expect(turns[0]?.promptVersion).toBe(v?.hash ?? null);
+      expect(turns[0]?.promptVersion).toBe(meta?.hash ?? null);
       await store.close();
     } finally {
       mock.restore();
@@ -215,7 +218,11 @@ describe("production dispatch fingerprints the FULL instruction surface", () => 
 
       const versions = await store.listPromptVersions();
       expect(versions).toHaveLength(2);
-      const injected = versions.map((v) => v.injectedJson).sort();
+      const injected = (
+        await Promise.all(
+          versions.map(async (v) => (await store.getPromptVersion(v.hash))?.injectedJson ?? ""),
+        )
+      ).sort();
       expect(injected[0]).toContain("Rule A.");
       expect(injected[1]).toContain("Rule B.");
       await store.close();

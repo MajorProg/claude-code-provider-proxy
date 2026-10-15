@@ -1205,10 +1205,11 @@ describe("account-scoped 429 cooldown (provider accountScoped)", () => {
   test("a stamped quota 429 benches the WHOLE pool, not just the failing key", async () => {
     const store = new CredentialCooldownStore();
     const handle = scopedHandler(store, true);
-    // Request 1: primary 429s with a stamped body -> every zai key is marked
-    // at once. The plan was built upfront, so the secondary attempt still runs
-    // (and 429s again — same account); the alibaba candidate serves.
-    let mock = installFetchMock([ZAI_1310, ZAI_1310, { status: 200, json: ANTHROPIC_OK }]);
+    // Request 1: primary 429s with a stamped body -> every zai key is benched at
+    // once AND the remaining planned zai attempts are short-circuited (no cascade
+    // of one 429 per key): one zai request, then straight to the alibaba
+    // candidate, which serves.
+    let mock = installFetchMock([ZAI_1310, { status: 200, json: ANTHROPIC_OK }]);
     try {
       const res = await handle(
         postMessages({
@@ -1219,7 +1220,9 @@ describe("account-scoped 429 cooldown (provider accountScoped)", () => {
         }),
       );
       expect(res.status).toBe(200);
-      expect(mock.requests).toHaveLength(3);
+      expect(mock.requests).toHaveLength(2);
+      expect(mock.requests[0]?.url).toBe("https://api.z.ai/api/anthropic/v1/messages");
+      expect(mock.requests[1]?.headers["x-api-key"]).toBe("alibaba-key");
     } finally {
       mock.restore();
     }
@@ -1249,7 +1252,9 @@ describe("account-scoped 429 cooldown (provider accountScoped)", () => {
   test("Fair-Usage 1313 (no reset stamp) also benches the whole pool", async () => {
     const store = new CredentialCooldownStore();
     const handle = scopedHandler(store, true);
-    const mock = installFetchMock([ZAI_1313, ZAI_1313, { status: 200, json: ANTHROPIC_OK }]);
+    // One account-scoped 429 benches the pool and short-circuits the plan: a
+    // single zai request, then the alibaba candidate serves.
+    const mock = installFetchMock([ZAI_1313, { status: 200, json: ANTHROPIC_OK }]);
     try {
       const res = await handle(
         postMessages({
@@ -1260,6 +1265,7 @@ describe("account-scoped 429 cooldown (provider accountScoped)", () => {
         }),
       );
       expect(res.status).toBe(200);
+      expect(mock.requests).toHaveLength(2);
     } finally {
       mock.restore();
     }

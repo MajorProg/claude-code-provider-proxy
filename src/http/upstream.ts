@@ -4,6 +4,7 @@
  * Centralizes calling upstream providers: injects the outbound Bedrock bearer
  * credential and forwards the Anthropic protocol headers the upstream needs.
  */
+import { UpstreamError } from "../errors.ts";
 import { errorMessage, logger } from "../logging/logger.ts";
 
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
@@ -158,7 +159,8 @@ export interface PostJsonOptions {
  * Retries a small number of times on transient network errors and transient
  * upstream statuses (429/5xx) with jittered linear backoff. Non-transient
  * responses (including 4xx other than 429) are returned immediately for the
- * caller to handle and relay unmodified.
+ * caller to handle and relay unmodified. A 3xx redirect is REFUSED (see
+ * {@link UpstreamRedirectError}) rather than followed.
  */
 export async function postJson(
   url: string,
@@ -194,10 +196,21 @@ export async function postJson(
         headers,
         body,
         signal: controller.signal,
+        // A3: never follow a provider-issued redirect. assertSafeExternalOrigin
+        // validates only the CONFIGURED origin — never a response header — so a
+        // 3xx Location is attacker-chosen and could aim the proxy at a
+        // link-local/RFC-1918/cloud-metadata host, whose body would then be
+        // relayed to the client as a normal 200 (blind SSRF). "manual" surfaces
+        // the 3xx to us; we refuse it below instead of fetching it.
+        redirect: "manual",
       });
       // Headers arrived — stop the time-to-headers timer immediately so it can
       // never fire against the streaming body that follows.
       clearTimeout(timer);
+      // A3: refuse a redirect rather than following it (see `redirect: "manual"`).
+      if (res.status >= 300 && res.status < 400) {
+        throw new UpstreamRedirectError(url, res.status, res.headers.get("location") ?? undefined);
+      }
       const rateLimited = res.status === 429 && !retryRateLimit;
       if (
         isTransientStatus(res.status) &&
@@ -227,6 +240,10 @@ export async function postJson(
       }
       return res;
     } catch (err) {
+      // A3: a redirect is a terminal security rejection — never retried. Any
+      // retry would just re-hit the same redirecting endpoint (and a redirect
+      // is not a transport hiccup). Rethrow before the retry bookkeeping.
+      if (err instanceof UpstreamRedirectError) throw err;
       lastError = err;
       // A client-driven abort is terminal — don't retry it.
       if (options.signal?.aborted) throw err;
@@ -265,6 +282,45 @@ export class UpstreamRequestError extends Error {
     this.name = "UpstreamRequestError";
     this.url = url;
     this.attempts = attempts;
+  }
+}
+
+/**
+ * A 3xx redirect received from an upstream endpoint (A3).
+ *
+ * Every outbound fetch sets `redirect: "manual"`, so the proxy never follows a
+ * Location it did not choose. `assertSafeExternalOrigin` validates only the
+ * CONFIGURED origin — never a response header — so without this a provider (or
+ * a compromised/misconfigured endpoint) answering 302 could point the proxy at
+ * a link-local/RFC-1918/cloud-metadata host (e.g. `http://169.254.169.254/…`)
+ * and have that internal body relayed to the client as an ordinary 200: a blind
+ * SSRF. The redirect is surfaced as an explicit error instead.
+ *
+ * Extends {@link UpstreamError} (status 502) so the route/model context rides
+ * the standard error log line and the client gets a clean Anthropic
+ * `api_error`. It is NOT failover-eligible: 502 is outside the failover status
+ * set, and a redirecting endpoint is a config/provider fault, not an
+ * auth/quota/transport blip — retrying the tier would just re-hit it.
+ */
+export class UpstreamRedirectError extends UpstreamError {
+  /** The Location header the upstream tried to send us to (when present). */
+  readonly location: string | undefined;
+
+  constructor(url: string, status: number, location: string | undefined) {
+    super(
+      502,
+      `Refusing upstream ${status} redirect from ${url}${
+        location !== undefined ? ` to ${location}` : ""
+      } — redirects are not followed (the target is outside the configured origin)`,
+      {
+        context: {
+          url,
+          redirectStatus: status,
+          ...(location !== undefined ? { redirectLocation: location } : {}),
+        },
+      },
+    );
+    this.location = location;
   }
 }
 
@@ -363,8 +419,14 @@ export async function readWithIdleTimeout<T>(
   const idle = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       const err = new Error(`Upstream stream idle for more than ${idleMs}ms`);
-      void reader.cancel(err).catch(() => {});
+      // Reject BEFORE cancelling. A real ReadableStreamDefaultReader settles a
+      // pending read() with { done: true } the moment cancel() is called, so
+      // cancelling first would let that clean-completion win the Promise.race —
+      // a stalled upstream would be reported as a normal end-of-stream instead
+      // of the error the caller's catch path needs. Settling `idle` first makes
+      // the timeout the winner, then cancel releases the upstream.
       reject(err);
+      void reader.cancel(err).catch(() => {});
     }, idleMs);
   });
   try {

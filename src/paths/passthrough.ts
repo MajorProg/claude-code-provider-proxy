@@ -150,13 +150,21 @@ export async function handlePassthroughMessages(
   const headers = buildAnthropicHeaders(inbound, bearer, authStyle);
   const url = streaming ? route.streamPath : route.path;
 
-  // PC2: never replay a streaming request body on a transient status (the
-  // upstream may already be generating). Non-streaming keeps 5xx retries but
-  // hands 429s to the failover engine (a rate limit is a decision about the
-  // credential/account, not a transport blip — retrying in place hammers it).
+  // PC2: a message body is NEVER replayed on a status code — streaming OR
+  // non-streaming. A 5xx/429 the upstream returns AFTER it has begun (or
+  // finished) processing the request (e.g. a 502/504 emitted once the model
+  // generated) would be replayed as a second, double-billed generation, so
+  // `retryTransientStatus` is off on both faces. Pre-response CONNECTION errors
+  // (thrown before any response) are still retried regardless — they are
+  // independent of this flag.
+  //
+  // `retryRateLimit: false`: 429s are the failover engine's business — a rate
+  // limit is a decision about the credential/account, not a transport blip, so
+  // re-sending the same body on the same throttled key just hammers the limiter.
   const opts = {
     ...(signal ? { signal } : {}),
-    ...(streaming ? { retryTransientStatus: false } : { retryRateLimit: false }),
+    retryTransientStatus: false,
+    retryRateLimit: false,
   };
   const upstream = await postJson(url, headers, outboundBody, opts);
 

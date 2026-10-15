@@ -15,7 +15,7 @@ import { buildAnthropicHeaders } from "../src/http/upstream.ts";
 import { parseCanonicalId } from "../src/model/canonical-id.ts";
 import { Catalog } from "../src/model/catalog.ts";
 import { route } from "../src/router.ts";
-import { liveEnabled } from "./helpers/live.ts";
+import { providerLiveEnabled } from "./helpers/live.ts";
 
 const CONFIG: ProxyConfig = validateConfig({
   server: { host: "127.0.0.1", port: 8787 },
@@ -71,7 +71,7 @@ describe("z.ai routing (unit)", () => {
   });
 });
 
-describe.if(liveEnabled() && !!ZAI_KEY)("z.ai live (api.z.ai)", () => {
+describe.if(providerLiveEnabled("ZAI_API_KEY"))("z.ai live (api.z.ai)", () => {
   const base = "https://api.z.ai/api/anthropic";
   const headers = {
     "content-type": "application/json",

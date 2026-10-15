@@ -28,6 +28,7 @@ import {
   captureCounters,
   captureTurn,
   configureCaptureBudget,
+  planContentCapture,
   resetCaptureBudget,
 } from "../src/logging/capture.ts";
 import { LogStore } from "../src/logging/log-store.ts";
@@ -78,6 +79,43 @@ function response(): Response {
   return new Response(streamOf(UPSTREAM, 4), {
     headers: { "content-type": "text/event-stream" },
   });
+}
+
+/**
+ * A streaming response that emits a few SSE frames and then HANGS (the source
+ * never closes and never enqueues again) — a stand-in for a stalled upstream, so
+ * the log branch can only end via a cancel (timeout or client disconnect).
+ */
+function hangingResponse(frames = 3): Response {
+  const enc = new TextEncoder();
+  let emitted = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (emitted < frames) {
+        const frame = sse("content_block_delta", {
+          index: 0,
+          delta: { type: "text_delta", text: `chunk${emitted}` },
+        });
+        controller.enqueue(enc.encode(frame));
+        emitted++;
+        return;
+      }
+      return new Promise<void>(() => {}); // hang: no more pulls, never close
+    },
+  });
+  return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+}
+
+/** A non-streaming Anthropic JSON response carrying the given content blocks. */
+function jsonResponse(content: unknown[]): Response {
+  return new Response(
+    JSON.stringify({
+      content,
+      stop_reason: "end_turn",
+      usage: { input_tokens: 3, output_tokens: 2 },
+    }),
+    { headers: { "content-type": "application/json" } },
+  );
 }
 
 function context(sessionId: string): CaptureContext {
@@ -165,7 +203,11 @@ describe("client stream is never affected by capture bounds", () => {
     await s.close();
   });
 
-  test("a tiny per-turn cap TRUNCATES the body; the client still sees every byte", async () => {
+  test("a tiny per-turn cap drops the body whole; the client still sees every byte", async () => {
+    // 64 bytes is smaller than the whole ENCODED turn record, so the writer
+    // cannot store a valid-JSON body and drops it honestly (bodyState "shed",
+    // never a corrupt byte-clip). Only the log body is affected — the client
+    // stream is untouched.
     const s = store({ maxTurnBytes: 64 });
     const out = captureTurn(s, context("trunc"), response(), undefined);
 
@@ -174,7 +216,8 @@ describe("client stream is never affected by capture bounds", () => {
 
     const metas = await waitForTurns(s, "trunc");
     expect(metas.length).toBeGreaterThan(0);
-    expect(metas[0]?.bodyState).toBe("truncated");
+    expect(metas[0]?.bodyState).toBe("shed");
+    expect(metas[0]?.bodyFile).toBeNull();
     await s.close();
   });
 
@@ -187,6 +230,49 @@ describe("client stream is never affected by capture bounds", () => {
     const metas = await waitForTurns(s, "full");
     expect(metas[0]?.bodyState).toBe("full");
     expect(metas[0]?.bodyFile).not.toBeNull();
+    await s.close();
+  });
+});
+
+describe("an early-terminated stream is recorded bodyState truncated (E1)", () => {
+  // The bug: a cancel (client disconnect, capture timeout) makes the log branch's
+  // read loop exit `done === true`, so the turn was recorded with whatever the
+  // accumulator saw AND bodyState "full" — a silently incomplete payload that
+  // looked complete in the viewer and in exports.
+
+  test("a client that cancels mid-stream records truncated, not full", async () => {
+    const s = store();
+    const out = captureTurn(s, context("cancel"), hangingResponse(), undefined);
+    const reader = out.body?.getReader();
+    if (reader === undefined) throw new Error("expected a streamed body");
+    await reader.read();
+    await reader.read();
+    await reader.cancel(); // client disconnects mid-stream
+
+    const metas = await waitForTurns(s, "cancel");
+    expect(metas[0]?.bodyState).toBe("truncated");
+    await s.close();
+  });
+
+  test("the capture timeout records truncated (a hung upstream is incomplete)", async () => {
+    const s = store({ captureTimeoutMs: 20 });
+    // The source hangs, so the log branch is only ended by the wall-clock timeout.
+    captureTurn(s, context("timeout"), hangingResponse(), undefined);
+
+    const metas = await waitForTurns(s, "timeout");
+    expect(metas[0]?.bodyState).toBe("truncated");
+    await s.close();
+  });
+
+  test("a fully-consumed stream still records full (regression guard)", async () => {
+    const s = store();
+    // Normal end-of-stream: the client reads the whole body. This MUST stay
+    // "full" — the early-cut flag must not fire on a normal close.
+    const out = captureTurn(s, context("complete"), response(), undefined);
+    await collect(out);
+
+    const metas = await waitForTurns(s, "complete");
+    expect(metas[0]?.bodyState).toBe("full");
     await s.close();
   });
 });
@@ -320,5 +406,96 @@ describe("CaptureBudget accounting", () => {
     resetCaptureBudget();
     expect(captureCounters().turnsShed).toBe(0);
     expect(captureCounters().bytesInFlight).toBe(0);
+  });
+});
+
+describe("body sizing stays byte-exact after the metering change (E3)", () => {
+  test("at exactly the cap every block is kept; one byte over clips (byte-exact)", () => {
+    const blocks = [
+      { type: "text", text: "hello world" },
+      { type: "text", text: "second block here" },
+    ];
+    // Exact JSON array size: "[" + blocks joined by "," + "]".
+    const exact =
+      2 +
+      blocks.reduce((n, b) => n + Buffer.byteLength(JSON.stringify(b), "utf8"), 0) +
+      (blocks.length - 1);
+
+    // At exactly the array size the true-size fit check keeps everything.
+    const fit = planContentCapture(blocks, exact);
+    expect(fit.truncated).toBe(false);
+    expect(fit.stored).toEqual(blocks);
+    expect(fit.bytes).toBe(exact);
+
+    // One byte under: the exact fit fails and the trailing block is dropped.
+    const over = planContentCapture(blocks, exact - 1);
+    expect(over.truncated).toBe(true);
+    expect(over.stored).toEqual([blocks[0]]);
+    // The reported size is the EXACT size of the kept blocks, not a round number.
+    expect(over.bytes).toBe(2 + Buffer.byteLength(JSON.stringify(blocks[0]), "utf8"));
+  });
+
+  test("the in-flight budget sheds the streaming body at the same delta", () => {
+    // A 20-byte budget holds exactly two 10-byte deltas; the third sheds.
+    const acc = new AnthropicStreamAccumulator(new CaptureBudget(DEFAULT_CAP, 20));
+    acc.push(sse("content_block_start", { index: 0, content_block: { type: "text" } }));
+    for (let i = 0; i < 2; i++) {
+      acc.push(
+        sse("content_block_delta", {
+          index: 0,
+          delta: { type: "text_delta", text: "x".repeat(10) },
+        }),
+      );
+    }
+    expect(acc.bodyState).toBe("full");
+    acc.push(
+      sse("content_block_delta", { index: 0, delta: { type: "text_delta", text: "x".repeat(10) } }),
+    );
+    expect(acc.bodyState).toBe("shed");
+    // Further deltas are skipped by the accept guard without changing state.
+    acc.push(
+      sse("content_block_delta", { index: 0, delta: { type: "text_delta", text: "x".repeat(10) } }),
+    );
+    expect(acc.bodyState).toBe("shed");
+    expect(acc.content()).toEqual([]);
+    acc.dispose();
+  });
+});
+
+describe("an oversized inbound request omits messages (E4)", () => {
+  test("over-threshold stores messages: [] plus a messagesOmitted marker", async () => {
+    const s = store();
+    const ctx: CaptureContext = { ...context("omit"), inboundBytes: DEFAULT_CAP + 1 };
+    captureTurn(s, ctx, jsonResponse([{ type: "text", text: "hi" }]), undefined);
+
+    await waitForTurns(s, "omit");
+    const body = (await s.getTurnBody("omit", 1)) as {
+      messages: unknown;
+      messagesOmitted: unknown;
+      bodyState: string;
+    };
+    expect(body.messages).toEqual([]);
+    expect(body.messagesOmitted).toEqual({
+      inboundBytes: DEFAULT_CAP + 1,
+      limitBytes: DEFAULT_CAP,
+    });
+    // bodyState describes the RESPONSE capture — untouched by message omission.
+    expect(body.bodyState).toBe("full");
+    await s.close();
+  });
+
+  test("just-under-threshold preserves messages with no marker", async () => {
+    const s = store();
+    const ctx: CaptureContext = { ...context("keep"), inboundBytes: DEFAULT_CAP };
+    captureTurn(s, ctx, jsonResponse([{ type: "text", text: "hi" }]), undefined);
+
+    await waitForTurns(s, "keep");
+    const body = (await s.getTurnBody("keep", 1)) as {
+      messages: unknown;
+      messagesOmitted?: unknown;
+    };
+    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+    expect(body.messagesOmitted).toBeUndefined();
+    await s.close();
   });
 });

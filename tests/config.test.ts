@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   assertSafeExternalOrigin,
   awsRegionForPrefix,
@@ -763,5 +766,159 @@ describe("validateConfig — zaiWire", () => {
       raw.providers as unknown as { zai: { zaiWire: { reasoningEffortModels: number } } }
     ).zai.zaiWire.reasoningEffortModels = 7;
     expect(() => validateConfig(raw)).toThrow(ConfigError);
+  });
+});
+
+// Per-type provider switches (countTokens / strictTools): asserted as booleans
+// the same way accountScoped is, so a quoted "true" fails fast instead of
+// validating and silently disabling the feature.
+describe("validateConfig — boolean provider flags fail fast on a non-boolean type", () => {
+  function providerRaw(extra: Record<string, unknown>) {
+    const raw = structuredClone(VALID_RAW) as typeof VALID_RAW & {
+      providers: Record<string, unknown>;
+    };
+    raw.providers.zai = {
+      type: "anthropic",
+      credential: "k",
+      auth: "bearer",
+      baseUrl: "https://api.z.ai/api/anthropic",
+      modelsUrl: "https://api.z.ai/api/paas/v4/models",
+      ...extra,
+    };
+    return raw;
+  }
+
+  test('a quoted countTokens ("true") is a structural error, not a silent disable', () => {
+    expect(() => validateConfig(providerRaw({ countTokens: "true" }))).toThrow(
+      /countTokens must be a boolean/,
+    );
+  });
+
+  test('a quoted strictTools ("true") is a structural error', () => {
+    expect(() => validateConfig(providerRaw({ strictTools: "true" }))).toThrow(
+      /strictTools must be a boolean/,
+    );
+  });
+
+  test("absent and real booleans still validate (strictTools omitted when falsy)", () => {
+    const absent = validateConfig(providerRaw({}));
+    expect(absent.providers.external.zai?.countTokens).toBe(false);
+    expect(absent.providers.external.zai?.strictTools).toBeUndefined();
+
+    const real = validateConfig(providerRaw({ countTokens: true, strictTools: true }));
+    expect(real.providers.external.zai?.countTokens).toBe(true);
+    expect(real.providers.external.zai?.strictTools).toBe(true);
+
+    // A false strictTools validates but is OMITTED from the result (optional
+    // field, omit-if-absent shape preserved).
+    const falsy = validateConfig(providerRaw({ countTokens: false, strictTools: false }));
+    expect(falsy.providers.external.zai?.strictTools).toBeUndefined();
+  });
+});
+
+// A field read by only one provider `type` (router.ts wires each per-type)
+// validates on the wrong type but is NEVER read. loadConfig reports it as a
+// non-fatal load warning (surfaced in /status.json, /api/config/status, doctor)
+// so an operator does not believe a feature is on when it never runs.
+describe("loadConfig — misplaced per-type provider fields warn (non-fatal)", () => {
+  let dir: string;
+  let path: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "ccpp-misplaced-"));
+    path = join(dir, "config.local.jsonc");
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function writeProviders(providersJson: string): void {
+    writeFileSync(
+      path,
+      `{
+        "server": { "host": "127.0.0.1", "port": 8787 },
+        "inboundAuth": { "keys": ["k"] },
+        "primaryRegion": "us",
+        "profilePreference": "global",
+        "refreshIntervalMinutes": 60,
+        "claudeFallbackToMantle": false,
+        "regions": [{ "key": "us", "awsRegion": "us-east-1" }],
+        "providers": { ${providersJson} }
+      }`,
+    );
+  }
+
+  test('zaiWire on a type "anthropic" provider warns (names field + provider)', async () => {
+    writeProviders(`"anthropicp": {
+      "type": "anthropic",
+      "credential": "k",
+      "auth": "bearer",
+      "baseUrl": "https://api.example.com/anthropic",
+      "countTokens": true,
+      "modelsUrl": "https://api.example.com/v1/models",
+      "zaiWire": { "forcedThinkingModels": ["^glm-5"], "reasoningEffortModels": ["^glm-5"] }
+    }`);
+    const cfg = await loadConfig(path, {});
+    const warnings = cfg.loadWarnings ?? [];
+    const zaiWireWarning = warnings.find((w) => w.includes("providers.anthropicp.zaiWire"));
+    expect(zaiWireWarning).toBeDefined();
+    expect(zaiWireWarning).toContain('type "anthropic"');
+    expect(zaiWireWarning).toContain('only read for type "openai"');
+  });
+
+  test('zaiWire on a type "openai" provider does NOT warn', async () => {
+    writeProviders(`"zai": {
+      "type": "openai",
+      "credential": "k",
+      "auth": "bearer",
+      "baseUrl": "https://api.z.ai/api/paas/v4",
+      "countTokens": false,
+      "modelsUrl": "https://api.z.ai/api/paas/v4/models",
+      "zaiWire": { "forcedThinkingModels": ["^glm-5"], "reasoningEffortModels": ["^glm-5"] }
+    }`);
+    const cfg = await loadConfig(path, {});
+    expect(cfg.loadWarnings).toBeUndefined();
+  });
+
+  test('countTokens: true on a type "openai" provider warns', async () => {
+    writeProviders(`"oa": {
+      "type": "openai",
+      "credential": "k",
+      "auth": "bearer",
+      "baseUrl": "https://api.example.com/v1",
+      "countTokens": true,
+      "modelsUrl": "https://api.example.com/v1/models"
+    }`);
+    const cfg = await loadConfig(path, {});
+    expect((cfg.loadWarnings ?? []).some((w) => w.includes("providers.oa.countTokens"))).toBe(true);
+  });
+
+  test('strictTools on a type "anthropic" provider warns', async () => {
+    writeProviders(`"anthropicp": {
+      "type": "anthropic",
+      "credential": "k",
+      "auth": "bearer",
+      "baseUrl": "https://api.example.com/anthropic",
+      "countTokens": true,
+      "modelsUrl": "https://api.example.com/v1/models",
+      "strictTools": true
+    }`);
+    const cfg = await loadConfig(path, {});
+    expect(
+      (cfg.loadWarnings ?? []).some((w) => w.includes("providers.anthropicp.strictTools")),
+    ).toBe(true);
+  });
+
+  test("a well-typed provider produces no warning (loadWarnings undefined)", async () => {
+    writeProviders(`"zai": {
+      "type": "anthropic",
+      "credential": "k",
+      "auth": "bearer",
+      "baseUrl": "https://api.z.ai/api/anthropic",
+      "countTokens": true,
+      "modelsUrl": "https://api.z.ai/api/paas/v4/models"
+    }`);
+    const cfg = await loadConfig(path, {});
+    expect(cfg.loadWarnings).toBeUndefined();
   });
 });

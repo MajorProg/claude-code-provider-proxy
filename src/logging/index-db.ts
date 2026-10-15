@@ -30,6 +30,7 @@
 
 import { Database } from "bun:sqlite";
 import type { Statement } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
@@ -46,8 +47,11 @@ import {
   ERROR_CLASSES,
   type ErrorClass,
   type FailoverEvent,
+  type PromptPartRef,
+  type PromptVersionMeta,
   type PromptVersionRecord,
   type PromptVersionStats,
+  type PromptVersionWrite,
   type SessionSummary,
   type ToolCallShape,
   type TurnMeta,
@@ -97,6 +101,29 @@ const SCHEMA_SQL: readonly string[] = [
      subagent_of INTEGER,
      UNIQUE(session_id, seq)
    )`,
+  // Content addressing for a prompt surface's three parts. `prompt_versions`
+  // keeps its shape (metadata + the legacy inline JSON columns, which new writes
+  // NULL out); the part STRINGS live here keyed by their own sha256, and the
+  // version -> parts mapping lives in `prompt_version_content`. A new TABLE can
+  // be added to an existing index.db (a new COLUMN cannot — there is no
+  // migration), which is why the content lives in tables rather than columns.
+  //
+  // HONEST LIMITS: content addressing is EXACT-MATCH, so two versions whose tool
+  // sets differ by a single schema field do NOT share a tools part — the win is
+  // one tools_json per genuinely distinct tool set, not a perfect collapse. And
+  // this only stops ADDING duplicates; it does not reclaim the bytes already
+  // stored inline in an existing index.db (a backfill + VACUUM is deferred).
+  `CREATE TABLE IF NOT EXISTS prompt_parts (
+     part_hash TEXT PRIMARY KEY,
+     content TEXT NOT NULL,
+     bytes INTEGER NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS prompt_version_content (
+     hash TEXT PRIMARY KEY,
+     system_part TEXT NOT NULL,
+     tools_part TEXT NOT NULL,
+     injected_part TEXT NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS prompt_versions (
      hash TEXT PRIMARY KEY,
      created_at TEXT,
@@ -121,11 +148,19 @@ const SCHEMA_SQL: readonly string[] = [
      to_label TEXT,
      reason TEXT
    )`,
-  "CREATE INDEX IF NOT EXISTS idx_turns_session_seq ON turns(session_id, seq)",
   "CREATE INDEX IF NOT EXISTS idx_turns_requested_at ON turns(requested_at)",
   "CREATE INDEX IF NOT EXISTS idx_turns_prompt_version ON turns(prompt_version)",
   "CREATE INDEX IF NOT EXISTS idx_turns_model_served ON turns(model_served)",
 ];
+
+/**
+ * Cleanup run once at open, AFTER the schema. `idx_turns_session_seq` duplicated
+ * the auto-index SQLite creates for `UNIQUE(session_id, seq)` (~220 KB each per
+ * live dbstat); dropping it here, not just removing it from {@link SCHEMA_SQL},
+ * is what retires it on an already-populated index.db. `IF EXISTS` keeps it a
+ * no-op on a fresh database.
+ */
+const DROP_SQL: readonly string[] = ["DROP INDEX IF EXISTS idx_turns_session_seq"];
 
 /** Column list shared by the read queries, in `TurnDbRow` order. */
 const TURN_COLUMNS = `turn_id, session_id, seq, requested_at, responded_at,
@@ -147,25 +182,66 @@ const SQL_DELETE_FAILOVER = "DELETE FROM failover_events WHERE turn_id = ?";
 const SQL_INSERT_FAILOVER = `INSERT INTO failover_events (turn_id, from_label, to_label, reason)
   VALUES (?, ?, ?, ?)`;
 
+/**
+ * Prompt-version METADATA row. The three legacy inline JSON columns are written
+ * NULL — the content now lives in `prompt_parts` / `prompt_version_content`,
+ * written in the SAME transaction. NULLing the inline columns atomically with
+ * inserting the content row is what keeps a mid-batch failure from blanking
+ * content with the parts row absent. `created_at` is set once, on first insert,
+ * and never touched on conflict.
+ */
 const SQL_UPSERT_PROMPT = `INSERT INTO prompt_versions (
   hash, created_at, last_seen, seen_count, system_json, tools_json, injected_json,
   system_bytes, tools_bytes
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
 ON CONFLICT(hash) DO UPDATE SET
   last_seen = excluded.last_seen,
   seen_count = excluded.seen_count,
-  system_json = excluded.system_json,
-  tools_json = excluded.tools_json,
-  injected_json = excluded.injected_json,
+  system_json = NULL,
+  tools_json = NULL,
+  injected_json = NULL,
   system_bytes = excluded.system_bytes,
   tools_bytes = excluded.tools_bytes`;
 
 /**
- * Session rollup, DERIVED from the authoritative `turns` rows rather than
- * accumulated: this keeps `sessions` replay-safe and drift-free (re-running it
- * yields the same row), which plain increment-on-conflict could not.
+ * One content-addressed part. `DO NOTHING` on conflict: the key IS the sha256 of
+ * `content`, so a hash that already exists already holds the same string — there
+ * is nothing to rewrite.
+ */
+const SQL_UPSERT_PROMPT_PART = `INSERT INTO prompt_parts (part_hash, content, bytes)
+  VALUES (?, ?, ?)
+  ON CONFLICT(part_hash) DO NOTHING`;
+
+/** The version -> three part-hash mapping, re-pointable on conflict. */
+const SQL_UPSERT_PROMPT_CONTENT = `INSERT INTO prompt_version_content
+  (hash, system_part, tools_part, injected_part)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(hash) DO UPDATE SET
+    system_part = excluded.system_part,
+    tools_part = excluded.tools_part,
+    injected_part = excluded.injected_part`;
+
+/**
+ * Incremental session rollup, applied inside the SAME transaction as the turn
+ * inserts that fed it (a per-batch {@link SessionDelta}). `MIN`/`MAX` against the
+ * EXISTING row (not blind assignment) so an out-of-order replay can never move
+ * `first_seen` later; `turns` accumulates by the count actually INSERTED, so a
+ * replayed batch that already landed (changes === 0) adds nothing.
  */
 const SQL_UPSERT_SESSION = `INSERT INTO sessions (session_id, first_seen, last_seen, turns)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET
+    first_seen = MIN(sessions.first_seen, excluded.first_seen),
+    last_seen  = MAX(sessions.last_seen,  excluded.last_seen),
+    turns      = sessions.turns + excluded.turns`;
+
+/**
+ * Derive/repair rollup: recompute a session's row from the authoritative `turns`
+ * rows. Idempotent (re-running yields the same row), so it is kept as
+ * {@link IndexDb.upsertSessions} for spool replay of legacy `sessions` entries
+ * and as a repair path — the flush path no longer uses it.
+ */
+const SQL_REDERIVE_SESSION = `INSERT INTO sessions (session_id, first_seen, last_seen, turns)
   SELECT session_id, MIN(requested_at), MAX(COALESCE(responded_at, requested_at)), COUNT(*)
   FROM turns WHERE session_id = ? GROUP BY session_id
   ON CONFLICT(session_id) DO UPDATE SET
@@ -184,13 +260,34 @@ const SQL_LIST_SESSIONS = `SELECT s.session_id AS id, s.turns AS turnCount,
 
 const SQL_GET_TURN = `SELECT ${TURN_COLUMNS} FROM turns WHERE session_id = ? AND seq = ?`;
 
-const SQL_LIST_PROMPT_VERSIONS = `SELECT hash, created_at, last_seen, seen_count,
-    system_json, tools_json, injected_json, system_bytes, tools_bytes
+/** Metadata columns shared by the list/meta reads (no ~244 KB content). */
+const PROMPT_META_COLUMNS = "hash, created_at, last_seen, seen_count, system_bytes, tools_bytes";
+
+const SQL_LIST_PROMPT_VERSIONS = `SELECT ${PROMPT_META_COLUMNS}
   FROM prompt_versions ORDER BY last_seen DESC, hash ASC`;
 
-const SQL_GET_PROMPT_VERSION = `SELECT hash, created_at, last_seen, seen_count,
-    system_json, tools_json, injected_json, system_bytes, tools_bytes
+const SQL_GET_PROMPT_VERSION_META = `SELECT ${PROMPT_META_COLUMNS}
   FROM prompt_versions WHERE hash = ?`;
+
+/**
+ * Reconstitute one version PARTS-FIRST with the legacy inline columns as
+ * fallback: a row written by the current writer has no inline JSON (they are
+ * NULL) and joins to its `prompt_version_content` + three `prompt_parts` rows; a
+ * legacy row has no content row, so every join yields NULL and COALESCE returns
+ * the inline columns it was written with. No migration needed — legacy rows read
+ * correctly and are lazily migrated to parts when they are next re-seen.
+ */
+const SQL_GET_PROMPT_VERSION = `SELECT v.hash, v.created_at, v.last_seen, v.seen_count,
+    COALESCE(sp.content, v.system_json) AS system_json,
+    COALESCE(tp.content, v.tools_json) AS tools_json,
+    COALESCE(ip.content, v.injected_json) AS injected_json,
+    v.system_bytes, v.tools_bytes
+  FROM prompt_versions v
+  LEFT JOIN prompt_version_content c ON c.hash = v.hash
+  LEFT JOIN prompt_parts sp ON sp.part_hash = c.system_part
+  LEFT JOIN prompt_parts tp ON tp.part_hash = c.tools_part
+  LEFT JOIN prompt_parts ip ON ip.part_hash = c.injected_part
+  WHERE v.hash = ?`;
 
 const SQL_STATS_AGG = `SELECT COUNT(*) AS turns,
     COUNT(DISTINCT session_id) AS sessions,
@@ -265,6 +362,28 @@ export interface TurnRow {
   readonly failoverEvents?: readonly FailoverEvent[];
 }
 
+/**
+ * The per-session contribution of one batch of INSERTED turns: `firstSeen` /
+ * `lastSeen` are the extremes over the rows that actually landed in this batch
+ * and `inserted` how many did. Applied incrementally to the `sessions` rollup in
+ * the same transaction as the inserts.
+ */
+export interface SessionDelta {
+  readonly firstSeen: string;
+  readonly lastSeen: string;
+  readonly inserted: number;
+}
+
+/**
+ * Result of inserting a batch of turns: the assigned `turn_id`s in input order
+ * (0 for a row that could not be resolved) plus the per-session deltas the
+ * rollup was (or would have been) advanced by.
+ */
+export interface TurnBatchResult {
+  readonly ids: readonly number[];
+  readonly sessions: ReadonlyMap<string, SessionDelta>;
+}
+
 /** Options for {@link IndexDb.listTurns}. */
 export interface ListTurnsOptions {
   /** Max rows to return; omitted means no limit. */
@@ -337,16 +456,19 @@ interface TurnDbRow {
   subagent_of: number | null;
 }
 
-interface PromptVersionDbRow {
+interface PromptVersionMetaDbRow {
   hash: string;
   created_at: string | null;
   last_seen: string | null;
   seen_count: number | null;
+  system_bytes: number | null;
+  tools_bytes: number | null;
+}
+
+interface PromptVersionDbRow extends PromptVersionMetaDbRow {
   system_json: string | null;
   tools_json: string | null;
   injected_json: string | null;
-  system_bytes: number | null;
-  tools_bytes: number | null;
 }
 
 interface SessionDbRow {
@@ -421,18 +543,60 @@ function toTurnMeta(r: TurnDbRow): TurnMeta {
   };
 }
 
-/** Map a `prompt_versions` row to the public {@link PromptVersionRecord} shape. */
-function toPromptVersionRecord(r: PromptVersionDbRow): PromptVersionRecord {
+/** Map a `prompt_versions` row to the public {@link PromptVersionMeta} shape. */
+function toPromptVersionMeta(r: PromptVersionMetaDbRow): PromptVersionMeta {
   return {
     hash: r.hash,
     createdAt: r.created_at ?? "",
     lastSeen: r.last_seen ?? r.created_at ?? "",
     seenCount: r.seen_count ?? 0,
+    systemBytes: r.system_bytes ?? 0,
+    toolsBytes: r.tools_bytes ?? 0,
+  };
+}
+
+/** Map a full (content-reconstituting) `prompt_versions` row to its record. */
+function toPromptVersionRecord(r: PromptVersionDbRow): PromptVersionRecord {
+  return {
+    ...toPromptVersionMeta(r),
     systemJson: r.system_json ?? "",
     toolsJson: r.tools_json ?? "",
     injectedJson: r.injected_json ?? "",
-    systemBytes: r.system_bytes ?? 0,
-    toolsBytes: r.tools_bytes ?? 0,
+  };
+}
+
+/** sha256 of a canonical prompt part string. */
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+/** Build a content-addressed part ref from a part's canonical string. */
+function makePartRef(content: string): PromptPartRef {
+  return { hash: sha256Hex(content), content, bytes: Buffer.byteLength(content, "utf8") };
+}
+
+/** A prompt version as persisted: new part-ref form, or a legacy inline record. */
+type PromptPersist = PromptVersionWrite | PromptVersionRecord;
+
+/**
+ * Normalize a persistable prompt version to the part-ref form. A record from the
+ * current writer already carries `system`/`tools`/`injected` part refs; a LEGACY
+ * record (an old `index-spool.jsonl` line, or a caller that predates content
+ * addressing) carries inline JSON, which is hashed here to build the refs — the
+ * same lazy migration the read path performs when it re-sees such a row.
+ */
+function toPromptVersionWrite(rec: PromptPersist): PromptVersionWrite {
+  if ("system" in rec) return rec;
+  return {
+    hash: rec.hash,
+    createdAt: rec.createdAt,
+    lastSeen: rec.lastSeen,
+    seenCount: rec.seenCount,
+    systemBytes: rec.systemBytes,
+    toolsBytes: rec.toolsBytes,
+    system: makePartRef(rec.systemJson),
+    tools: makePartRef(rec.toolsJson),
+    injected: makePartRef(rec.injectedJson),
   };
 }
 
@@ -443,7 +607,7 @@ function toPromptVersionRecord(r: PromptVersionDbRow): PromptVersionRecord {
 /** A deferred batch: the unit spooled on failure and replayed on next open. */
 type SpoolEntry =
   | { readonly kind: "turns"; readonly rows: readonly TurnRow[] }
-  | { readonly kind: "prompt_versions"; readonly records: readonly PromptVersionRecord[] }
+  | { readonly kind: "prompt_versions"; readonly records: readonly PromptPersist[] }
   | { readonly kind: "sessions"; readonly sessionIds: readonly string[] };
 
 /** Parse one spool line into a typed entry, or null when unusable. */
@@ -458,7 +622,9 @@ function parseSpoolEntry(raw: string): SpoolEntry | null {
   const { kind, payload } = parsed as { kind?: unknown; payload?: unknown };
   if (!Array.isArray(payload)) return null;
   if (kind === "turns") return { kind, rows: payload as TurnRow[] };
-  if (kind === "prompt_versions") return { kind, records: payload as PromptVersionRecord[] };
+  // Legacy lines carry inline systemJson/toolsJson/injectedJson; new lines carry
+  // system/tools/injected part refs. Both are re-normalized on apply.
+  if (kind === "prompt_versions") return { kind, records: payload as PromptPersist[] };
   if (kind === "sessions") return { kind, sessionIds: payload as string[] };
   return null;
 }
@@ -518,45 +684,59 @@ export class IndexDb {
     this.#opened = true;
     this.#configure();
     for (const sql of SCHEMA_SQL) this.#db.run(sql);
+    // A DROP (not just a missing CREATE) is what retires a redundant index on an
+    // already-populated index.db.
+    for (const sql of DROP_SQL) this.#db.run(sql);
     this.replaySpool();
   }
 
   /* ------------------------------- writes ------------------------------- */
 
   /**
-   * Insert turn rows (plus their failover events) in ONE transaction, returning
-   * the assigned `turn_id`s in input order. Idempotent per `(session_id, seq)`:
-   * a re-insert of an existing turn is ignored and its id re-read. Never throws —
-   * on any SQLite error the batch is spooled and `[]` is returned.
+   * Insert turn rows (plus their failover events and the incremental `sessions`
+   * rollup) in ONE transaction, returning the assigned `turn_id`s in input order
+   * plus the per-session deltas. Idempotent per `(session_id, seq)`: a re-insert
+   * of an existing turn is ignored (changes === 0), contributes nothing to the
+   * rollup, and its id is re-read. Never throws — on any SQLite error the batch
+   * is spooled and an empty result is returned.
    */
-  insertTurnRows(rows: readonly TurnRow[]): number[] {
-    if (rows.length === 0) return [];
-    try {
-      return this.#insertTurns(rows);
-    } catch (err) {
-      this.#spool({ kind: "turns", rows }, err);
-      return [];
-    }
+  insertTurnRows(rows: readonly TurnRow[]): TurnBatchResult {
+    return this.#writeBatch(rows, []);
   }
 
   /**
-   * Upsert prompt versions in ONE transaction. Each record is written to its
-   * stated ABSOLUTE state (`created_at` is set once, on first insert, and
-   * preserved thereafter). Callers should pre-aggregate per hash; a repeated hash
-   * in one call simply leaves the last record's values. Never throws.
+   * Atomic flush (the writer's hot path): turn rows (+ failover + the
+   * incremental `sessions` rollup) AND prompt versions committed as ONE
+   * transaction, so a flush is a single commit rather than one per kind. Never
+   * throws — on failure BOTH entry kinds are spooled, so replay is unchanged.
    */
-  upsertPromptVersions(records: readonly PromptVersionRecord[]): void {
+  commitFlush(rows: readonly TurnRow[], prompts: readonly PromptPersist[]): TurnBatchResult {
+    return this.#writeBatch(rows, prompts);
+  }
+
+  /**
+   * Upsert prompt versions in ONE transaction: the metadata row, the three
+   * content-addressed parts and the version -> parts mapping together. Each
+   * record is written to its stated ABSOLUTE state (`created_at` is set once, on
+   * first insert, and preserved thereafter). Callers should pre-aggregate per
+   * hash; a repeated hash in one call simply leaves the last record's values.
+   * Never throws.
+   */
+  upsertPromptVersions(records: readonly PromptPersist[]): void {
     if (records.length === 0) return;
     try {
-      this.#upsertPromptVersions(records);
+      this.#commitPrompts(records);
     } catch (err) {
       this.#spool({ kind: "prompt_versions", records }, err);
     }
   }
 
   /**
-   * Refresh the `sessions` rollup for the given session ids (derived from their
-   * `turns` rows) in ONE transaction. Never throws.
+   * DERIVE/REPAIR the `sessions` rollup for the given session ids from their
+   * authoritative `turns` rows, in ONE transaction. The flush path no longer
+   * needs this (the rollup now travels with the turn inserts), but it stays as
+   * the idempotent repair path and the applier for legacy `sessions` spool
+   * entries. Never throws.
    */
   upsertSessions(sessionIds: readonly string[]): void {
     if (sessionIds.length === 0) return;
@@ -599,13 +779,26 @@ export class IndexDb {
     return row ? toTurnMeta(row) : null;
   }
 
-  /** All prompt versions, most recently seen first. */
-  listPromptVersions(): PromptVersionRecord[] {
-    const rows = this.#prep(SQL_LIST_PROMPT_VERSIONS).all() as PromptVersionDbRow[];
-    return rows.map(toPromptVersionRecord);
+  /**
+   * All prompt versions, most recently seen first. METADATA ONLY — the ~244 KB
+   * content of each version is deliberately not read, so a listing does not
+   * deserialize the whole library.
+   */
+  listPromptVersions(): PromptVersionMeta[] {
+    const rows = this.#prep(SQL_LIST_PROMPT_VERSIONS).all() as PromptVersionMetaDbRow[];
+    return rows.map(toPromptVersionMeta);
   }
 
-  /** One prompt version by hash, or null when absent. */
+  /** Metadata for one prompt version (no content), or null when absent. */
+  getPromptVersionMeta(hash: string): PromptVersionMeta | null {
+    const row = this.#prep(SQL_GET_PROMPT_VERSION_META).get(hash) as PromptVersionMetaDbRow | null;
+    return row ? toPromptVersionMeta(row) : null;
+  }
+
+  /**
+   * One prompt version WITH its reconstructed content by hash, or null when
+   * absent. Parts-first with the legacy inline columns as fallback.
+   */
   getPromptVersion(hash: string): PromptVersionRecord | null {
     const row = this.#prep(SQL_GET_PROMPT_VERSION).get(hash) as PromptVersionDbRow | null;
     return row ? toPromptVersionRecord(row) : null;
@@ -808,76 +1001,148 @@ export class IndexDb {
     if (pageSize > 0) this.#db.run(`PRAGMA page_size = ${pageSize}`);
   }
 
-  /** Insert turns + their failover events; throws on any SQLite error. */
-  #insertTurns(rows: readonly TurnRow[]): number[] {
-    return this.#transaction(() => {
-      const ids: number[] = [];
-      for (const row of rows) {
-        this.#prep(SQL_INSERT_TURN).run(
-          row.sessionId,
-          row.seq,
-          row.requestedAt,
-          row.respondedAt ?? null,
-          row.modelRequested ?? null,
-          row.modelServed ?? null,
-          row.backend ?? null,
-          row.path ?? null,
-          row.promptVersion ?? null,
-          row.stopReason ?? null,
-          row.inputTokens ?? null,
-          row.outputTokens ?? null,
-          row.cacheReadTokens ?? null,
-          row.latencyMs ?? null,
-          row.failover ? 1 : 0,
-          row.errorClass ?? null,
-          row.bodyFile ?? null,
-          row.bodyBytes ?? null,
-          row.bodyState ?? null,
-          row.toolCalls != null ? JSON.stringify(row.toolCalls) : null,
-          row.subagentOf ?? null,
-        );
+  /**
+   * Commit a flush atomically: turn rows (+ failover + the incremental
+   * `sessions` rollup) and prompt versions in ONE transaction. On any SQLite
+   * error the whole transaction rolls back and BOTH entry kinds are spooled, so
+   * a replay re-applies exactly what the old per-kind spooling would have. Never
+   * throws.
+   */
+  #writeBatch(rows: readonly TurnRow[], prompts: readonly PromptPersist[]): TurnBatchResult {
+    if (rows.length === 0 && prompts.length === 0) {
+      return { ids: [], sessions: new Map() };
+    }
+    try {
+      return this.#transaction(() => {
+        const result = this.#commitTurnsInner(rows);
+        this.#commitPromptsInner(prompts);
+        return result;
+      });
+    } catch (err) {
+      if (rows.length > 0) this.#spool({ kind: "turns", rows }, err);
+      if (prompts.length > 0) this.#spool({ kind: "prompt_versions", records: prompts }, err);
+      return { ids: [], sessions: new Map() };
+    }
+  }
+
+  /** Wrap {@link #commitTurnsInner} in its own transaction (spool replay). */
+  #commitTurns(rows: readonly TurnRow[]): TurnBatchResult {
+    return this.#transaction(() => this.#commitTurnsInner(rows));
+  }
+
+  /**
+   * Insert turns + their failover events and advance each affected session's
+   * rollup by the delta of the rows that actually landed — all without opening a
+   * transaction (the caller owns it). Throws on any SQLite error.
+   */
+  #commitTurnsInner(rows: readonly TurnRow[]): TurnBatchResult {
+    const ids: number[] = [];
+    const deltas = new Map<string, { firstSeen: string; lastSeen: string; inserted: number }>();
+    for (const row of rows) {
+      const info = this.#prep(SQL_INSERT_TURN).run(
+        row.sessionId,
+        row.seq,
+        row.requestedAt,
+        row.respondedAt ?? null,
+        row.modelRequested ?? null,
+        row.modelServed ?? null,
+        row.backend ?? null,
+        row.path ?? null,
+        row.promptVersion ?? null,
+        row.stopReason ?? null,
+        row.inputTokens ?? null,
+        row.outputTokens ?? null,
+        row.cacheReadTokens ?? null,
+        row.latencyMs ?? null,
+        row.failover ? 1 : 0,
+        row.errorClass ?? null,
+        row.bodyFile ?? null,
+        row.bodyBytes ?? null,
+        row.bodyState ?? null,
+        row.toolCalls != null ? JSON.stringify(row.toolCalls) : null,
+        row.subagentOf ?? null,
+      );
+      const inserted = info.changes === 1;
+      // On insert, lastInsertRowid IS the turn_id; only an ignored re-insert
+      // (changes === 0) needs the id re-read.
+      let turnId: number;
+      if (inserted) {
+        turnId = Number(info.lastInsertRowid);
+      } else {
         const found = this.#prep(SQL_SELECT_TURN_ID).get(row.sessionId, row.seq) as {
           turn_id: number;
         } | null;
-        const turnId = found?.turn_id ?? 0;
-        ids.push(turnId);
-        const events = row.failoverEvents;
-        if (turnId > 0 && events && events.length > 0) {
-          // Replace any prior rows for this turn so a spool replay is idempotent
-          // rather than appending duplicates.
-          this.#prep(SQL_DELETE_FAILOVER).run(turnId);
-          for (const ev of events) {
-            this.#prep(SQL_INSERT_FAILOVER).run(turnId, ev.fromLabel, ev.toLabel, ev.reason);
-          }
+        turnId = found?.turn_id ?? 0;
+      }
+      ids.push(turnId);
+      const events = row.failoverEvents;
+      if (turnId > 0 && events && events.length > 0) {
+        // Replace any prior rows for this turn so a spool replay is idempotent
+        // rather than appending duplicates.
+        this.#prep(SQL_DELETE_FAILOVER).run(turnId);
+        for (const ev of events) {
+          this.#prep(SQL_INSERT_FAILOVER).run(turnId, ev.fromLabel, ev.toLabel, ev.reason);
         }
       }
-      return ids;
-    });
-  }
-
-  /** Upsert prompt versions; throws on any SQLite error. */
-  #upsertPromptVersions(records: readonly PromptVersionRecord[]): void {
-    this.#transaction(() => {
-      for (const rec of records) {
-        this.#prep(SQL_UPSERT_PROMPT).run(
-          rec.hash,
-          rec.createdAt,
-          rec.lastSeen,
-          rec.seenCount,
-          rec.systemJson,
-          rec.toolsJson,
-          rec.injectedJson,
-          rec.systemBytes,
-          rec.toolsBytes,
-        );
+      if (inserted) {
+        const responded = row.respondedAt ?? row.requestedAt;
+        const delta = deltas.get(row.sessionId);
+        if (delta === undefined) {
+          deltas.set(row.sessionId, {
+            firstSeen: row.requestedAt,
+            lastSeen: responded,
+            inserted: 1,
+          });
+        } else {
+          if (row.requestedAt < delta.firstSeen) delta.firstSeen = row.requestedAt;
+          if (responded > delta.lastSeen) delta.lastSeen = responded;
+          delta.inserted += 1;
+        }
       }
-    });
+    }
+    for (const [sid, delta] of deltas) {
+      this.#prep(SQL_UPSERT_SESSION).run(sid, delta.firstSeen, delta.lastSeen, delta.inserted);
+    }
+    return { ids, sessions: deltas };
   }
 
-  /** Refresh the sessions rollup; throws on any SQLite error. */
+  /** Wrap {@link #commitPromptsInner} in its own transaction. */
+  #commitPrompts(records: readonly PromptPersist[]): void {
+    this.#transaction(() => this.#commitPromptsInner(records));
+  }
+
+  /**
+   * Write each prompt version's parts, its parts mapping and its metadata row —
+   * no transaction opened (the caller owns it). A legacy inline record is
+   * normalized to part refs first. Throws on any SQLite error.
+   */
+  #commitPromptsInner(records: readonly PromptPersist[]): void {
+    for (const rec of records) {
+      const write = toPromptVersionWrite(rec);
+      this.#prep(SQL_UPSERT_PROMPT).run(
+        write.hash,
+        write.createdAt,
+        write.lastSeen,
+        write.seenCount,
+        write.systemBytes,
+        write.toolsBytes,
+      );
+      for (const part of [write.system, write.tools, write.injected]) {
+        this.#prep(SQL_UPSERT_PROMPT_PART).run(part.hash, part.content, part.bytes);
+      }
+      this.#prep(SQL_UPSERT_PROMPT_CONTENT).run(
+        write.hash,
+        write.system.hash,
+        write.tools.hash,
+        write.injected.hash,
+      );
+    }
+  }
+
+  /** Refresh the sessions rollup by derivation; throws on any SQLite error. */
   #upsertSessions(sessionIds: readonly string[]): void {
     this.#transaction(() => {
-      for (const sid of sessionIds) this.#prep(SQL_UPSERT_SESSION).run(sid);
+      for (const sid of sessionIds) this.#prep(SQL_REDERIVE_SESSION).run(sid);
     });
   }
 
@@ -885,10 +1150,10 @@ export class IndexDb {
   #applyEntry(entry: SpoolEntry): void {
     switch (entry.kind) {
       case "turns":
-        this.#insertTurns(entry.rows);
+        this.#commitTurns(entry.rows);
         break;
       case "prompt_versions":
-        this.#upsertPromptVersions(entry.records);
+        this.#commitPrompts(entry.records);
         break;
       case "sessions":
         this.#upsertSessions(entry.sessionIds);

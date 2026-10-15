@@ -167,9 +167,14 @@ flowchart TD
 | **M** | `mantle` | Non-Claude on Bedrock Mantle; external `type: openai` providers | Anthropic ⇄ OpenAI Chat Completions (via IR) | `openai-sse.ts` parses OpenAI SSE → Anthropic SSE |
 
 Key routing rules (from `router.ts`):
-- The **converse backend always uses the Converse API**, even for Claude — no
-  cross-backend fallback. Native Anthropic passthrough is reserved for the
-  Mantle backend and external anthropic providers.
+- The **converse backend uses the Converse API** for every model, Claude and
+  non-Claude alike. The single opt-in exception is `claudeFallbackToMantle`
+  (default **off**): a **route-time** fallback, not a retry after a runtime
+  rejection — when a Claude model cannot be resolved on Converse *at all*
+  (absent from the converse catalog, or with neither an inference profile nor
+  on-demand support), it is routed over Mantle's native Anthropic passthrough
+  (Path P) instead of returning `404`. Otherwise native Anthropic passthrough
+  serves the Mantle backend and external `anthropic` providers.
 - **Claude is rejected on Mantle's OpenAI route**, so Claude on Mantle uses the
   native `/anthropic/v1/messages` route (Path P).
 - The **Converse route requires `Authorization: Bearer`** and rejects

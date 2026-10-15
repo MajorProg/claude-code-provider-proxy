@@ -8,10 +8,23 @@
  * GET /v1/models. It complements management-auth.test.ts (auth/CSRF matrix) and
  * paths-fixture.test.ts (per-handler translation).
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type ProxyConfig, validateConfig } from "../src/config.ts";
+import { renderLogViewerHtml } from "../src/http/log-viewer-page.ts";
+import { LogStore } from "../src/logging/log-store.ts";
+import type { TurnRecord } from "../src/logging/log-types.ts";
+import { logger } from "../src/logging/logger.ts";
+import { computePromptSurface } from "../src/logging/prompt-surface.ts";
 import { Catalog, type DiscoveredModel } from "../src/model/catalog.ts";
-import { type Runtime, createFetchHandler, errorResponse } from "../src/server.ts";
+import {
+  EXPORT_YIELD_INTERVAL,
+  type Runtime,
+  createFetchHandler,
+  errorResponse,
+} from "../src/server.ts";
 import { installFetchMock, readFixtureText } from "./helpers/fetch-mock.ts";
 
 const KEY = "ccpp-dispatch-key";
@@ -126,7 +139,8 @@ describe("POST /v1/messages end-to-end (Converse via fixture)", () => {
     expect(res.status).toBe(413);
     const json = (await res.json()) as { type: string; error?: { type: string } };
     expect(json.type).toBe("error");
-    expect(json.error?.type).toBe("invalid_request_error");
+    // Anthropic's own 413 type — the ONE 413 shape every surface now shares.
+    expect(json.error?.type).toBe("request_too_large");
   });
 
   test("missing inbound key -> 401 (no upstream call)", async () => {
@@ -313,5 +327,281 @@ describe("GET /v1/models + /api/config/status with virtual tiers & pools", () =>
     // PUBLIC-surface hygiene even on the auth-gated status: no key material.
     expect(text.includes(POOL_KEY_PRIMARY)).toBe(false);
     expect(text.includes(POOL_KEY_SECONDARY)).toBe(false);
+  });
+});
+
+/* ==================================================================== *
+ * HTTP-surface behaviours (Workstream C): path-consistent max_tokens,
+ * log-route traversal + malformed-escape hardening, single-row reads,
+ * event-loop yields, and the viewer's messagesOmitted notice.
+ * ==================================================================== */
+
+describe("POST /v1/messages requires max_tokens on EVERY path (C6)", () => {
+  // The canonical id need not resolve to a catalog model for the 400 cases:
+  // the check fires before routing/inference. The count_tokens success case
+  // uses a Claude-on-mantle id (Path P passthrough has a count endpoint).
+  const paths: Array<{ label: string; cid: string }> = [
+    { label: "converse", cid: CID },
+    { label: "mantle", cid: "bedrock.mantle.us.some.mantle-model" },
+    { label: "passthrough (Claude on mantle)", cid: "bedrock.mantle.us.anthropic.claude-sonnet" },
+  ];
+
+  for (const { label, cid } of paths) {
+    test(`an absent max_tokens is a 400 on the ${label} path`, async () => {
+      const mock = installFetchMock({ text: "{}" });
+      try {
+        const res = await handler()(
+          post("/v1/messages", { model: cid, messages: [{ role: "user", content: "hi" }] }),
+        );
+        expect(res.status).toBe(400);
+        const json = (await res.json()) as { error: { type: string; message: string } };
+        expect(json.error.type).toBe("invalid_request_error");
+        expect(json.error.message).toContain("max_tokens");
+        // Rejected before any upstream call.
+        expect(mock.requests).toHaveLength(0);
+      } finally {
+        mock.restore();
+      }
+    });
+  }
+
+  test("count_tokens still accepts a body WITHOUT max_tokens", async () => {
+    const mock = installFetchMock({ text: readFixtureText("anthropic-count.json") });
+    try {
+      const res = await handler()(
+        post("/v1/messages/count_tokens", {
+          model: "bedrock.mantle.us.anthropic.claude-sonnet",
+          messages: [{ role: "user", content: "count me" }],
+        }),
+      );
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as { input_tokens: number };
+      expect(json.input_tokens).toBe(19);
+    } finally {
+      mock.restore();
+    }
+  });
+});
+
+describe("log routes: traversal, malformed escapes, single-row reads, yields", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "ccpp-server-dispatch-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A config whose logging is ENABLED and writes into the test's temp dir. */
+  function logsConfig(): ProxyConfig {
+    return validateConfig({
+      server: { host: "127.0.0.1", port: 8787 },
+      inboundAuth: { keys: [KEY] },
+      primaryRegion: "us",
+      profilePreference: "global",
+      refreshIntervalMinutes: 60,
+      claudeFallbackToMantle: false,
+      regions: [{ key: "us", awsRegion: "us-east-1" }],
+      providers: {
+        bedrock: {
+          credential: "long-term-secret",
+          hosts: {
+            converse: "bedrock-runtime.{region}.amazonaws.com",
+            mantle: "bedrock-mantle.{region}.api.aws",
+            control: "bedrock.{region}.amazonaws.com",
+          },
+        },
+      },
+      logging: { enabled: true, dir: root, systemDir: "system", sessionDir: "sessions" },
+      chatPage: { enabled: true },
+    });
+  }
+
+  function logsStore(): LogStore {
+    return new LogStore(logsConfig().logging, { writerMode: "inline" });
+  }
+
+  function logsHandler(store: LogStore) {
+    const config = logsConfig();
+    const catalog = new Catalog([novaModel]);
+    const runtime = {
+      config,
+      tokenProvider: async () => "test-bearer",
+      catalogManager: { current: () => catalog, stop: () => {} },
+      logStore: store,
+    } as unknown as Runtime;
+    return createFetchHandler(
+      () => runtime,
+      async () => undefined,
+    );
+  }
+
+  function turnRecord(sessionId: string, at: string): TurnRecord {
+    return {
+      sessionId,
+      canonicalModel: CID,
+      invocationModel: "amazon.nova-lite-v1:0",
+      backend: "converse",
+      translationPath: "converse",
+      streamed: false,
+      systemHash: null,
+      messages: [{ role: "user", content: "hello" }],
+      responseContent: [{ type: "text", text: "hi" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 5, outputTokens: 2 },
+      requestedAt: at,
+      respondedAt: at,
+    };
+  }
+
+  function authedGet(path: string): Request {
+    return new Request(`http://localhost${path}`, {
+      headers: { authorization: `Bearer ${KEY}` },
+    });
+  }
+
+  /** Walk a STORE-method ZIP's local file headers into { name, content }. */
+  function zipEntries(zip: Uint8Array): Array<{ name: string; content: string }> {
+    const dv = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
+    const decoder = new TextDecoder();
+    const out: Array<{ name: string; content: string }> = [];
+    let pos = 0;
+    while (pos + 30 <= zip.length && dv.getUint32(pos, true) === 0x04034b50) {
+      const dataLen = dv.getUint32(pos + 18, true);
+      const nameLen = dv.getUint16(pos + 26, true);
+      const extraLen = dv.getUint16(pos + 28, true);
+      const nameStart = pos + 30;
+      const name = decoder.decode(zip.subarray(nameStart, nameStart + nameLen));
+      const dataStart = nameStart + nameLen + extraLen;
+      const content = decoder.decode(zip.subarray(dataStart, dataStart + dataLen));
+      out.push({ name, content });
+      pos = dataStart + dataLen;
+    }
+    return out;
+  }
+
+  test("C2: a malformed percent-escape session path is a 404 and logs nothing at error level", async () => {
+    const store = logsStore();
+    const handlerFn = logsHandler(store);
+    const originalError = logger.error;
+    let errorLogs = 0;
+    logger.error = () => {
+      errorLogs++;
+    };
+    try {
+      const res = await handlerFn(authedGet("/api/logs/sessions/%"));
+      expect(res.status).toBe(404);
+    } finally {
+      logger.error = originalError;
+      await store.close();
+    }
+    // A route miss must never reach the error renderer's error-level line.
+    expect(errorLogs).toBe(0);
+  });
+
+  test("C3: the one-turn detail route returns { meta, body } and 404s when both are absent", async () => {
+    const store = logsStore();
+    await store.recordTurn(turnRecord("sess-1", "2026-10-01T10:00:00.000Z"));
+    await store.flush();
+    const handlerFn = logsHandler(store);
+    try {
+      const ok = await handlerFn(authedGet("/api/logs/sessions/sess-1/1"));
+      expect(ok.status).toBe(200);
+      const json = (await ok.json()) as { meta: { seq: number } | null; body: unknown };
+      expect(json.meta?.seq).toBe(1);
+      expect(json.body).not.toBeNull();
+
+      const missing = await handlerFn(authedGet("/api/logs/sessions/sess-1/99"));
+      expect(missing.status).toBe(404);
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("C1: a session id with ../ yields NO traversal entry name in the export ZIP", async () => {
+    const store = logsStore();
+    await store.recordTurn(turnRecord("../../evil", "2026-10-01T10:00:00.000Z"));
+    await store.flush();
+    const handlerFn = logsHandler(store);
+    try {
+      const res = await handlerFn(authedGet("/api/logs/export/sessions"));
+      expect(res.status).toBe(200);
+      const names = zipEntries(new Uint8Array(await res.arrayBuffer())).map((e) => e.name);
+      expect(names.length).toBeGreaterThan(0);
+      for (const name of names) {
+        expect(name.startsWith("/")).toBe(false);
+        expect(name.split("/")).not.toContain("..");
+      }
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("C0: the system export carries each version's FULL content, not just metadata", async () => {
+    const store = logsStore();
+    const surface = computePromptSurface({
+      system: "You are terse.",
+      tools: [{ name: "Read", input_schema: { type: "object", properties: {} } }],
+      messages: [],
+    });
+    await store.recordTurn({
+      ...turnRecord("sess-1", "2026-10-01T10:00:00.000Z"),
+      promptSurface: surface,
+    });
+    await store.flush();
+    const handlerFn = logsHandler(store);
+    try {
+      const res = await handlerFn(authedGet("/api/logs/export/system"));
+      expect(res.status).toBe(200);
+      const entries = zipEntries(new Uint8Array(await res.arrayBuffer()));
+      const entry = entries.find((e) => e.name === `prompts/${surface.hash}.json`);
+      expect(entry).toBeDefined();
+      const rec = JSON.parse(entry?.content ?? "{}") as {
+        systemJson?: string;
+        toolsJson?: string;
+        injectedJson?: string;
+      };
+      // listPromptVersions is metadata-only; the export must still resolve content.
+      expect(rec.systemJson).toEqual(surface.systemJson);
+      expect(rec.toolsJson).toContain("Read");
+      expect(rec.injectedJson).toBeDefined();
+    } finally {
+      await store.close();
+    }
+  });
+
+  test("C4: a multi-entry export yields to the event loop every EXPORT_YIELD_INTERVAL entries", async () => {
+    const store = logsStore();
+    const count = EXPORT_YIELD_INTERVAL * 3;
+    for (let i = 0; i < count; i++) {
+      await store.recordTurn(turnRecord("bulk", "2026-10-01T10:00:00.000Z"));
+    }
+    await store.flush();
+    const handlerFn = logsHandler(store);
+
+    const originalSetImmediate = globalThis.setImmediate;
+    let yields = 0;
+    globalThis.setImmediate = ((...args: Parameters<typeof originalSetImmediate>) => {
+      yields++;
+      return originalSetImmediate(...args);
+    }) as typeof originalSetImmediate;
+    try {
+      const res = await handlerFn(authedGet("/api/logs/export/sessions"));
+      expect(res.status).toBe(200);
+    } finally {
+      globalThis.setImmediate = originalSetImmediate;
+      await store.close();
+    }
+    // One yield per full interval of entries (count entries -> count/interval).
+    expect(yields).toBeGreaterThanOrEqual(Math.floor(count / EXPORT_YIELD_INTERVAL));
+  });
+
+  test("C8: the viewer renders a messagesOmitted notice (escaped) instead of an empty list", () => {
+    const html = renderLogViewerHtml(true);
+    expect(html).toContain("Request messages omitted:");
+    expect(html).toContain("body.messagesOmitted");
+    expect(html).toContain("window.esc(o.inboundBytes)");
+    expect(html).toContain("window.esc(o.limitBytes)");
   });
 });

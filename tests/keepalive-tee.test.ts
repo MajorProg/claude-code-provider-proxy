@@ -79,4 +79,50 @@ describe("keepAliveTee (P1)", () => {
     await rd.cancel(new Error("client gone"));
     expect(cancelled).toBe(true);
   });
+
+  // A1: Path P had NO upstream stall bound — a bare reader.read() hangs forever
+  // on a silent upstream, and the tee's own pings keep the client watchdog from
+  // firing either. The pump now uses readWithIdleTimeout, so a stalled upstream
+  // fails the client stream cleanly within the idle bound instead of hanging.
+  test("a stalled upstream fails the client stream within the idle bound", async () => {
+    const upstream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(enc.encode("event: message_start\ndata: {}\n\n"));
+        // Then silence forever (never closes).
+      },
+    });
+    // ping idle 5ms (pings keep flowing), stream idle 60ms (the stall bound).
+    const teed = keepAliveTee(upstream, 5, 60);
+    const start = Date.now();
+    // collect() rejects when the teed stream errors (rather than ending cleanly).
+    await expect(collect(teed)).rejects.toThrow(/idle for more than 60ms/);
+    // It failed on the idle bound — not by hanging.
+    expect(Date.now() - start).toBeLessThan(2_000);
+  });
+
+  // A1 (regression): the idle bound must not trip a HEALTHY-but-slow stream.
+  // A gap larger than the ping idle (so a ping is injected) but smaller than the
+  // stream idle still relays every byte verbatim.
+  test("a healthy slow stream relays every byte verbatim and still pings", async () => {
+    let enqueueLate: (() => void) | undefined;
+    const upstream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(enc.encode("event: message_start\ndata: {}\n\n"));
+        enqueueLate = () => {
+          c.enqueue(enc.encode("event: message_stop\ndata: {}\n\n"));
+          c.close();
+        };
+      },
+    });
+    // ping idle 10ms, stream idle 5s — a 50ms gap pings but never trips the bound.
+    const teed = keepAliveTee(upstream, 10, 5_000);
+    const collected = collect(teed);
+    await new Promise((r) => setTimeout(r, 50)); // idle gap -> ping(s) injected
+    enqueueLate?.();
+    const out = await collected;
+    expect(out).toContain('event: ping\ndata: {"type":"ping"}');
+    // Both real frames are relayed byte-for-byte, in order, uninterrupted.
+    expect(out).toContain("event: message_start\ndata: {}\n\n");
+    expect(out).toContain("event: message_stop\ndata: {}\n\n");
+  });
 });

@@ -174,6 +174,11 @@ classDiagram
 - `RegionKey = "us" | "eu"`; `ProfilePreference = "global" | "regional" | "auto"`.
 - `providers.bedrock` is required; `providers.external` is a keyed map of
   `ExternalProviderConfig`.
+- `claudeFallbackToMantle` (default `false`) is an opt-in **route-time** fallback
+  for a Claude model with no resolvable Converse route (absent from the converse
+  catalog, or no inference profile and no on-demand support): when on, it is
+  routed over Mantle's native Anthropic passthrough (Path P) instead of a `404`.
+  It is not a retry after a runtime rejection.
 - `externalProviderOrigin(p)` computes the effective origin from `hostTemplate`
   (with `{workspaceId}`/`{region}` substitution) when present, else `baseUrl`.
 

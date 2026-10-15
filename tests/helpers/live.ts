@@ -65,3 +65,20 @@ export function awsCreds(): AwsCreds {
 export function providerKeyPresent(envVar: string): boolean {
   return Boolean(process.env[envVar]);
 }
+
+/**
+ * Gate for a LIVE suite that depends on ONE external provider's API key rather
+ * than on AWS. Unlike {@link liveEnabled} — which additionally requires AWS
+ * creds because it gates Bedrock suites — this needs only the live lane flag
+ * plus this provider's own key, so an operator holding just, say, a z.ai key
+ * can still run the z.ai suite. Default-off is unchanged: with no `RUN_LIVE=1`
+ * nothing runs.
+ *
+ * Usage:
+ *
+ *   import { providerLiveEnabled } from "./helpers/live.ts";
+ *   describe.if(providerLiveEnabled("ZAI_API_KEY"))("z.ai live", () => { ... });
+ */
+export function providerLiveEnabled(envVar: string): boolean {
+  return process.env.RUN_LIVE === "1" && providerKeyPresent(envVar);
+}

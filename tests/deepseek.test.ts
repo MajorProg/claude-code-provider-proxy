@@ -15,7 +15,7 @@ import { buildAnthropicHeaders } from "../src/http/upstream.ts";
 import { parseCanonicalId } from "../src/model/canonical-id.ts";
 import { Catalog } from "../src/model/catalog.ts";
 import { route } from "../src/router.ts";
-import { liveEnabled } from "./helpers/live.ts";
+import { providerLiveEnabled } from "./helpers/live.ts";
 
 const CONFIG: ProxyConfig = validateConfig({
   server: { host: "127.0.0.1", port: 8787 },
@@ -73,7 +73,7 @@ describe("DeepSeek routing (unit)", () => {
   });
 });
 
-describe.if(liveEnabled() && !!DEEPSEEK_KEY)("DeepSeek live (api.deepseek.com)", () => {
+describe.if(providerLiveEnabled("DEEPSEEK_API_KEY"))("DeepSeek live (api.deepseek.com)", () => {
   const base = "https://api.deepseek.com/anthropic";
   const headers = {
     "content-type": "application/json",

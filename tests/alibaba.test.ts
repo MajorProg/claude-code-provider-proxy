@@ -18,7 +18,7 @@ import { buildAnthropicHeaders } from "../src/http/upstream.ts";
 import { parseCanonicalId } from "../src/model/canonical-id.ts";
 import { Catalog } from "../src/model/catalog.ts";
 import { route } from "../src/router.ts";
-import { liveEnabled } from "./helpers/live.ts";
+import { providerLiveEnabled } from "./helpers/live.ts";
 
 const BASE = "https://dashscope-intl.aliyuncs.com/apps/anthropic";
 
@@ -260,7 +260,7 @@ describe("Alibaba boot-resilience routing (unit)", () => {
   });
 });
 
-describe.if(liveEnabled() && !!DASHSCOPE_KEY)("Alibaba live (dashscope-intl)", () => {
+describe.if(providerLiveEnabled("DASHSCOPE_API_KEY_INTL"))("Alibaba live (dashscope-intl)", () => {
   const headers = {
     "content-type": "application/json",
     "x-api-key": DASHSCOPE_KEY as string,

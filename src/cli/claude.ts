@@ -29,7 +29,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { ok, warn } from "./util.ts";
 
 export interface ClaudeSettingsInput {
@@ -168,13 +168,20 @@ export function backupClaudeSettings(settingsFile: string, now: Date = new Date(
  *
  * Note ANTHROPIC_API_KEY is intentionally set to "" — a non-empty value makes
  * Claude Code bypass the proxy (README "mandatory gotcha").
+ *
+ * `settingsFile` defaults to the standard {@link claudeSettingsPath}
+ * (~/.claude/settings.json); the parameter exists so an in-process test can
+ * point the writer at a temp dir without touching the operator's live config.
  */
-export function writeClaudeSettings(input: ClaudeSettingsInput): {
+export function writeClaudeSettings(
+  input: ClaudeSettingsInput,
+  settingsFile?: string,
+): {
   backup: string | null;
   file: string;
 } {
-  const file = claudeSettingsPath();
-  const dir = join(homedir(), ".claude");
+  const file = settingsFile ?? claudeSettingsPath();
+  const dir = dirname(file);
   mkdirSync(dir, { recursive: true });
 
   const backup = backupClaudeSettings(file);

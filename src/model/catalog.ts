@@ -181,6 +181,13 @@ export function createHttpDiscoveryClient(
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+      // A3: a CREDENTIALED discovery fetch never follows a provider-issued
+      // redirect. The control-plane host is operator-configured, but a 3xx
+      // Location is not — following it could aim the authoritative Bearer token
+      // at a link-local/RFC-1918/metadata host. "manual" surfaces the 3xx; the
+      // !res.ok branch below turns it into a per-source discovery error (never
+      // fatal to boot). Mirrors src/http/upstream.ts.
+      redirect: "manual",
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -307,6 +314,11 @@ async function fetchModelsWithPool(
     const res = await fetch(url, {
       headers: { authorization: `Bearer ${entry.credential}` },
       signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+      // A3: a credentialed /models fetch never follows a redirect (same policy
+      // as {@link createHttpDiscoveryClient}). A 3xx is neither 401 nor 403, so
+      // it stops the credential-pool walk and surfaces as a source error rather
+      // than being followed with the key attached.
+      redirect: "manual",
     });
     if (res.ok) {
       const body = (await res.json()) as { data?: { id?: string }[] };
