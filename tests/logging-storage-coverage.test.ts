@@ -83,6 +83,7 @@ function logConfig(over: Partial<LoggingConfig> = {}): LoggingConfig {
     sessionDir: "sessions",
     captureTimeoutMs: 120_000,
     compression: { enabled: false, minAgeMinutes: 10 },
+    capture: { systemPrompts: true, chatTurns: true },
     retentionDays: 30,
     maxTurnBytes: 8 * 1024 * 1024,
     inFlightBudgetBytes: 256 * 1024 * 1024,
@@ -335,6 +336,9 @@ describe("capture: a rejected capture task is swallowed (never an unhandled cras
     };
     const store = {
       isEnabled: () => true,
+      capturesTurns: () => true,
+      capturesPrompts: () => true,
+      recordPromptSurface: () => {},
       // The log-branch pump reads this BEFORE its own try/guard; a throwing
       // accessor stands in for any future edit that throws before the guarded
       // block, proving runDetached's terminal .catch swallows the rejection.
@@ -462,6 +466,9 @@ function parkingStore(timeoutMs: number): {
   const calls = { system: 0, turns: 0 };
   const store = {
     isEnabled: () => true,
+    capturesTurns: () => true,
+    capturesPrompts: () => true,
+    recordPromptSurface: () => {},
     captureTimeoutMs: timeoutMs,
     recordSystemPrompt: () => {
       calls.system++;

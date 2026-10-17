@@ -72,7 +72,7 @@ function makeRuntime(config: ProxyConfig): Runtime {
     config,
     tokenProvider: null,
     catalogManager: { current: () => catalog, stop: () => {} },
-    logStore: { isEnabled: () => false },
+    logStore: { isEnabled: () => false, captureActive: () => false },
   };
   return runtime as unknown as Runtime;
 }

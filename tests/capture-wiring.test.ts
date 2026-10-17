@@ -15,17 +15,25 @@
 import { describe, expect, test } from "bun:test";
 import { type CaptureContext, captureTurn } from "../src/logging/capture.ts";
 import type { LogStore, TurnRecord } from "../src/logging/log-store.ts";
+import type { PromptSurface } from "../src/logging/log-types.ts";
+import { computePromptSurface } from "../src/logging/prompt-surface.ts";
 import { readFixtureText, streamOf } from "./helpers/fetch-mock.ts";
 
 interface Recorded {
   turns: TurnRecord[];
   systemHashes: number;
+  promptSurfaces: PromptSurface[];
 }
 
-function stubStore(enabled = true): { store: LogStore; rec: Recorded } {
-  const rec: Recorded = { turns: [], systemHashes: 0 };
+function stubStore(enabled = true, turns = enabled): { store: LogStore; rec: Recorded } {
+  const rec: Recorded = { turns: [], systemHashes: 0, promptSurfaces: [] };
   const store = {
     isEnabled: () => enabled,
+    capturesTurns: () => enabled && turns,
+    capturesPrompts: () => enabled,
+    recordPromptSurface: (surface: PromptSurface) => {
+      rec.promptSurfaces.push(surface);
+    },
     captureTimeoutMs: 120_000,
     recordSystemPrompt: async (_system: unknown) => {
       rec.systemHashes++;
@@ -213,5 +221,73 @@ describe("captureTurn servingKeyLabel (docs/VIRTUAL_MODELS.md cost attribution)"
     await out.text();
     await flush();
     expect("servingKeyLabel" in (rec.turns[0] ?? {})).toBe(false);
+  });
+});
+
+describe("captureTurn with chat-turn capture off (prompt library only)", () => {
+  const surface = computePromptSurface({
+    system: "You are helpful.",
+    tools: [],
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  test("streaming: records the prompt surface and returns the response untouched", async () => {
+    const { store, rec } = stubStore(true, false);
+    const resp = sseResponse(new TextEncoder().encode(readFixtureText("anthropic-stream.sse")));
+
+    const out = captureTurn(store, { ...ctx(), promptSurface: surface }, resp);
+
+    // No tee at all: the caller gets the SAME Response back.
+    expect(out).toBe(resp);
+    expect(rec.promptSurfaces.map((s) => s.hash)).toEqual([surface.hash]);
+    await flush();
+    expect(rec.turns).toEqual([]);
+    expect(rec.systemHashes).toBe(0);
+  });
+
+  test("non-streaming: no clone is taken and no turn is recorded", async () => {
+    const { store, rec } = stubStore(true, false);
+    const body = {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "text", text: "OK" }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+    const resp = new Response(JSON.stringify(body), {
+      headers: { "content-type": "application/json" },
+    });
+
+    const out = captureTurn(store, { ...ctx(), promptSurface: surface }, resp);
+    expect(out).toBe(resp);
+    await flush();
+    expect(rec.turns).toEqual([]);
+    expect(rec.promptSurfaces).toHaveLength(1);
+  });
+
+  test("a FAILED response still records the prompt surface (it was used)", () => {
+    const { store, rec } = stubStore(true, false);
+    const resp = new Response("upstream boom", { status: 502 });
+
+    const out = captureTurn(store, { ...ctx(), promptSurface: surface }, resp);
+    expect(out).toBe(resp);
+    expect(rec.promptSurfaces.map((s) => s.hash)).toEqual([surface.hash]);
+    expect(rec.turns).toEqual([]);
+  });
+
+  test("a failed response with chat turns ON records the prompt but no turn", () => {
+    const { store, rec } = stubStore(true, true);
+    const resp = new Response("upstream boom", { status: 502 });
+
+    captureTurn(store, { ...ctx(), promptSurface: surface }, resp);
+    expect(rec.promptSurfaces).toHaveLength(1);
+    expect(rec.turns).toEqual([]);
+  });
+
+  test("no prompt surface computed means nothing is recorded", async () => {
+    const { store, rec } = stubStore(true, false);
+    const out = captureTurn(store, ctx(), sseResponse(new TextEncoder().encode("")));
+    await out.text();
+    await flush();
+    expect(rec.promptSurfaces).toEqual([]);
   });
 });

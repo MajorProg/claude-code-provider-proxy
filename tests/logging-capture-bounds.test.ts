@@ -62,6 +62,7 @@ function logConfig(over: Partial<LoggingConfig> = {}): LoggingConfig {
     sessionDir: "sessions",
     captureTimeoutMs: 5_000,
     compression: { enabled: false, minAgeMinutes: 10 },
+    capture: { systemPrompts: true, chatTurns: true },
     retentionDays: 30,
     maxTurnBytes: DEFAULT_CAP,
     inFlightBudgetBytes: DEFAULT_BUDGET,

@@ -115,7 +115,7 @@ function ephemeralRuntime(cfg: ProxyConfig): Runtime {
     config: cfg,
     tokenProvider: null,
     catalogManager: { current: () => catalog, stop: () => {} },
-    logStore: { isEnabled: () => false },
+    logStore: { isEnabled: () => false, captureActive: () => false },
   } as unknown as Runtime;
 }
 

@@ -26,7 +26,10 @@ const KEY = "ccpp-server-coverage-key";
 const BASE = "http://localhost";
 
 /** A disabled store stub for routes that never touch logging. */
-const DISABLED_STORE = { isEnabled: () => false } as unknown as LogStore;
+const DISABLED_STORE = {
+  isEnabled: () => false,
+  captureActive: () => false,
+} as unknown as LogStore;
 
 /** The base raw config, extended by each case. Bedrock enabled (long-term key). */
 function rawConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -320,7 +323,13 @@ describe("POST /api/chat", () => {
     const config = validateConfig(
       rawConfig({
         providers: MANTLE_PROVIDERS,
-        logging: { enabled: true, dir: root, systemDir: "system", sessionDir: "sessions" },
+        logging: {
+          enabled: true,
+          dir: root,
+          systemDir: "system",
+          sessionDir: "sessions",
+          capture: { systemPrompts: true, chatTurns: true },
+        },
       }),
     );
     const store = new LogStore(config.logging, { writerMode: "inline" });
@@ -480,7 +489,13 @@ describe("log routes", () => {
   function logsConfig(): ProxyConfig {
     return validateConfig(
       rawConfig({
-        logging: { enabled: true, dir: root, systemDir: "system", sessionDir: "sessions" },
+        logging: {
+          enabled: true,
+          dir: root,
+          systemDir: "system",
+          sessionDir: "sessions",
+          capture: { systemPrompts: true, chatTurns: true },
+        },
       }),
     );
   }
@@ -852,7 +867,13 @@ describe("server bootstrap: main() + import.meta.main", () => {
         claudeFallbackToMantle: false,
         regions: [{ key: "us", awsRegion: "us-east-1" }],
         providers: {}, // Bedrock absent -> disabled (external-only)
-        logging: { enabled: true, dir: logDir, systemDir: "system", sessionDir: "sessions" },
+        logging: {
+          enabled: true,
+          dir: logDir,
+          systemDir: "system",
+          sessionDir: "sessions",
+          capture: { systemPrompts: true, chatTurns: true },
+        },
         chatPage: { enabled: false },
       });
       const result = await bootServer(

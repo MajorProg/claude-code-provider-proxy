@@ -59,6 +59,52 @@ describe("logging captureTimeoutMs config (PC8)", () => {
   });
 });
 
+describe("logging capture + compression config", () => {
+  test("defaults: prompt capture on, chat turns off, compression on", () => {
+    const cfg = validateConfig(VALID_RAW);
+    expect(cfg.logging.capture).toEqual({ systemPrompts: true, chatTurns: false });
+    expect(cfg.logging.compression.enabled).toBe(true);
+  });
+
+  test("honors explicit capture switches", () => {
+    const cfg = validateConfig({
+      ...VALID_RAW,
+      logging: { enabled: true, capture: { systemPrompts: false, chatTurns: true } },
+    });
+    expect(cfg.logging.capture).toEqual({ systemPrompts: false, chatTurns: true });
+  });
+
+  test("non-boolean capture values fall back to the defaults", () => {
+    const cfg = validateConfig({
+      ...VALID_RAW,
+      logging: { enabled: false, capture: { systemPrompts: "no", chatTurns: "yes" } },
+    });
+    expect(cfg.logging.capture).toEqual({ systemPrompts: true, chatTurns: false });
+  });
+
+  test("compression can be switched off at write", () => {
+    const cfg = validateConfig({
+      ...VALID_RAW,
+      logging: { enabled: false, compression: { enabled: false } },
+    });
+    expect(cfg.logging.compression.enabled).toBe(false);
+  });
+
+  test("a config save round-trips capture and compression verbatim", () => {
+    const cfg = validateConfig({
+      ...VALID_RAW,
+      logging: {
+        enabled: true,
+        compression: { enabled: false, minAgeMinutes: 3 },
+        capture: { systemPrompts: false, chatTurns: true },
+      },
+    });
+    const logging = serializeConfig(cfg).logging as Record<string, unknown>;
+    expect(logging.capture).toEqual({ systemPrompts: false, chatTurns: true });
+    expect(logging.compression).toEqual({ enabled: false, minAgeMinutes: 3 });
+  });
+});
+
 describe("assertSafeExternalOrigin (SEC-9 SSRF guard)", () => {
   test("allows public https origins", () => {
     expect(() => assertSafeExternalOrigin("https://api.openai.com/v1")).not.toThrow();

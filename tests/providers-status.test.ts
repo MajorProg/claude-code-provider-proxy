@@ -56,7 +56,7 @@ function makeRuntime(config: ProxyConfig, cooldownStore: CredentialCooldownStore
     config,
     tokenProvider: null,
     catalogManager: { current: () => catalog, stop: () => {} },
-    logStore: { isEnabled: () => false },
+    logStore: { isEnabled: () => false, captureActive: () => false },
     cooldownStore,
   };
   return runtime as unknown as Runtime;

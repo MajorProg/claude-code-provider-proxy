@@ -179,12 +179,24 @@
     "dir": "./logs",
     "systemDir": "system",
     "sessionDir": "sessions",
-    // DEPRECATED / accepted-and-ignored: turn bodies are now zstd-compressed at
-    // write, so this block no longer drives behavior. It is still accepted (and
-    // preserved on save) so existing configs keep loading.
+    // Compress turn bodies AT WRITE (zstd). Default true. When false, bodies
+    // are stored as plain `.json` — readable on disk, but roughly 4x larger.
+    // Readers branch on the stored extension, so flipping this never strands
+    // bodies written under the other setting. `minAgeMinutes` is legacy and
+    // ignored (there is no background sweep anymore).
     "compression": { "enabled": true, "minAgeMinutes": 10 },
+    // Capture modules, independently switchable (both require "enabled": true):
+    //  - systemPrompts: the DEDUPED instruction surface — system prompt, tool
+    //    schemas and injected instruction envelopes — recorded in the prompt
+    //    library. Content-addressed, so N turns under one surface cost one copy.
+    //  - chatTurns: per-turn records and body files. OFF by default: a turn body
+    //    carries the WHOLE conversation, so a session of N turns stores O(N^2)
+    //    bytes and a busy log tree grows fast.
+    "capture": { "systemPrompts": true, "chatTurns": false },
     // Retention window for turn BODIES, in days (0 = keep forever). Pruned
-    // bodies set body_state="pruned"; index rows and prompt versions are kept.
+    // bodies set body_state="pruned"; index rows are kept. This applies to
+    // CHAT TURN BODIES ONLY — the prompt library (system prompts, tool schemas,
+    // injected envelopes) is NEVER pruned and has no expiry of any kind.
     "retentionDays": 30,
     // Per-turn body byte cap (8 MiB). Larger bodies are written clipped and
     // marked body_state="truncated".

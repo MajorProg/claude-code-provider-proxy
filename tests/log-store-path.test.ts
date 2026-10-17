@@ -41,6 +41,7 @@ function logConfig(over: Partial<LoggingConfig> = {}): LoggingConfig {
     captureTimeoutMs: 120_000,
     // Accepted-and-ignored: bodies are zstd-compressed at write now.
     compression: { enabled: false, minAgeMinutes: 10 },
+    capture: { systemPrompts: true, chatTurns: true },
     retentionDays: 30,
     maxTurnBytes: 8 * 1024 * 1024,
     inFlightBudgetBytes: 256 * 1024 * 1024,

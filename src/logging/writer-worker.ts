@@ -66,11 +66,22 @@ function handle(msg: WriterRequest): void {
         return;
       }
       const wire: WireJob = {
+        kind: "turn",
         id: msg.id,
         meta: msg.meta,
         body: msg.body === null ? null : new Uint8Array(msg.body),
       };
       active.apply(wire);
+      post({ type: "written", id: msg.id });
+      return;
+    }
+    case "prompt": {
+      const active = core;
+      if (!active) {
+        post({ type: "error", id: msg.id, message: "prompt received before init" });
+        return;
+      }
+      active.apply({ kind: "prompt", id: msg.id, surface: msg.surface });
       post({ type: "written", id: msg.id });
       return;
     }

@@ -438,22 +438,28 @@ export interface LoggingConfig {
    */
   readonly captureTimeoutMs: number;
   /**
-   * Background gzip compression of turn files (`.json` -> `.json.gz`). Readers
-   * (log viewer, API, ZIP export) decompress transparently; listings serve
-   * from the summary index and never touch bodies. Defaults to
-   * {@link DEFAULT_LOG_COMPRESSION} when absent.
-   *
-   * ACCEPTED-AND-IGNORED: turn bodies are now zstd-compressed at write, so this
-   * block no longer drives behavior. It is still parsed, validated and
-   * serialized so an on-disk config keeps loading and a UI save round-trips it
-   * verbatim (removing it would break boot).
+   * Turn-body compression AT WRITE. When enabled (the default) a body is stored
+   * as a zstd frame (`<seq>-<stamp>.json.zst`); when disabled it is stored as
+   * plain JSON (`<seq>-<stamp>.json`). Readers branch on the stored extension,
+   * so both forms coexist and flipping the switch never strands previously
+   * written bodies. Defaults to {@link DEFAULT_LOG_COMPRESSION} when absent.
    */
   readonly compression: LogCompressionConfig;
   /**
+   * Which capture modules run. Both are master-gated by {@link enabled} and can
+   * be switched independently; defaults in {@link DEFAULT_LOG_CAPTURE}.
+   */
+  readonly capture: LogCaptureConfig;
+  /**
    * Retention window for turn BODIES, in days. Bodies older than this are
-   * pruned (file deleted, `body_state` set to `pruned`); the index rows and
-   * `prompt_versions` are kept forever. `0` = keep bodies forever. Defaults to
+   * pruned (file deleted, `body_state` set to `pruned`); the index rows are
+   * kept. `0` = keep bodies forever. Defaults to
    * {@link DEFAULT_LOG_RETENTION_DAYS} when absent.
+   *
+   * This applies to CHAT TURN BODIES ONLY. The prompt library — system prompts,
+   * tool schemas and injected instruction envelopes (`prompt_versions`,
+   * `prompt_version_content`, `prompt_parts`) — is NEVER pruned, deleted or
+   * aged out, at any value of this setting.
    */
   readonly retentionDays: number;
   /**
@@ -481,25 +487,47 @@ export interface LoggingConfig {
   readonly zstdLevel: number;
 }
 
-/** Knobs for background turn-file compression. */
+/** Knobs for at-write turn-body compression. */
 export interface LogCompressionConfig {
+  /** Compress turn bodies at write (zstd). Off stores plain, readable JSON. */
   readonly enabled: boolean;
   /**
-   * Only compress turn files at least this many minutes old. Not a correctness
-   * guard (a basename re-write after compression is handled by preferring the
-   * plain file and dropping the stale `.gz`) — it avoids churning files a
-   * resumed session may still re-write.
+   * ACCEPTED-AND-IGNORED. It belonged to the retired background-gzip sweep;
+   * compression now happens at write. Kept in the shape so an existing config
+   * keeps loading and a UI save round-trips it verbatim.
    */
   readonly minAgeMinutes: number;
+}
+
+/**
+ * Independent capture modules, both master-gated by `logging.enabled`.
+ *
+ * - `systemPrompts` records the DEDUPED instruction surface (system prompt +
+ *   tool schemas + injected instruction envelopes) into the prompt library. It
+ *   is content-addressed, so N turns under one surface cost one copy.
+ * - `chatTurns` records per-turn records and their body files. A turn body
+ *   carries the WHOLE inbound conversation, so a session of N turns stores
+ *   O(N^2) bytes — this is what makes a busy log tree grow fast, which is why
+ *   it is OFF by default.
+ */
+export interface LogCaptureConfig {
+  readonly systemPrompts: boolean;
+  readonly chatTurns: boolean;
 }
 
 /** Default backstop for the streaming log-capture branch (PC8). */
 export const DEFAULT_LOG_CAPTURE_TIMEOUT_MS = 2 * 60 * 1000;
 
-/** Default background-compression policy: on, files >= 10 minutes old. */
+/** Default compression policy: compress at write. */
 export const DEFAULT_LOG_COMPRESSION: LogCompressionConfig = {
   enabled: true,
   minAgeMinutes: 10,
+};
+
+/** Default capture policy: prompt library on, chat turns off. */
+export const DEFAULT_LOG_CAPTURE: LogCaptureConfig = {
+  systemPrompts: true,
+  chatTurns: false,
 };
 
 /** Default turn-body retention window (days); 0 would keep bodies forever. */
@@ -1147,6 +1175,7 @@ function validateLogging(raw: unknown): LoggingConfig {
       : DEFAULT_LOG_CAPTURE_TIMEOUT_MS;
   const rawCompression = isRecord(rawLogging.compression) ? rawLogging.compression : {};
   const rawMinAge = rawCompression.minAgeMinutes;
+  const rawCapture = isRecord(rawLogging.capture) ? rawLogging.capture : {};
   // Bounded integer option: an absent/invalid value falls back to `dflt`.
   const intOption = (
     v: unknown,
@@ -1166,6 +1195,16 @@ function validateLogging(raw: unknown): LoggingConfig {
         typeof rawMinAge === "number" && Number.isInteger(rawMinAge) && rawMinAge >= 0
           ? rawMinAge
           : DEFAULT_LOG_COMPRESSION.minAgeMinutes,
+    },
+    capture: {
+      systemPrompts:
+        typeof rawCapture.systemPrompts === "boolean"
+          ? rawCapture.systemPrompts
+          : DEFAULT_LOG_CAPTURE.systemPrompts,
+      chatTurns:
+        typeof rawCapture.chatTurns === "boolean"
+          ? rawCapture.chatTurns
+          : DEFAULT_LOG_CAPTURE.chatTurns,
     },
     retentionDays: intOption(rawLogging.retentionDays, DEFAULT_LOG_RETENTION_DAYS, 0),
     maxTurnBytes: intOption(rawLogging.maxTurnBytes, DEFAULT_LOG_MAX_TURN_BYTES, 1),
@@ -1719,11 +1758,15 @@ export function serializeConfig(
       systemDir: config.logging.systemDir,
       sessionDir: config.logging.sessionDir,
       captureTimeoutMs: config.logging.captureTimeoutMs,
-      // Accepted-and-ignored: preserved verbatim so a UI save never drops a key
-      // an on-disk config still carries.
       compression: {
         enabled: config.logging.compression.enabled,
+        // Accepted-and-ignored: preserved verbatim so a UI save never drops a
+        // key an on-disk config still carries.
         minAgeMinutes: config.logging.compression.minAgeMinutes,
+      },
+      capture: {
+        systemPrompts: config.logging.capture.systemPrompts,
+        chatTurns: config.logging.capture.chatTurns,
       },
       retentionDays: config.logging.retentionDays,
       maxTurnBytes: config.logging.maxTurnBytes,

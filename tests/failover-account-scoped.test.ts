@@ -101,7 +101,7 @@ function handlerWithStore(config: ProxyConfig, store: CredentialCooldownStore) {
     config,
     tokenProvider: null,
     catalogManager: { current: () => new Catalog([]), stop: () => {} },
-    logStore: { isEnabled: () => false },
+    logStore: { isEnabled: () => false, captureActive: () => false },
     cooldownStore: store,
   } as unknown as Runtime;
   return createFetchHandler(

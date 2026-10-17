@@ -86,7 +86,7 @@ function makeRuntime(withBedrockBlock: boolean): Runtime {
     config: makeConfig(withBedrockBlock),
     tokenProvider: null, // bedrock disabled
     catalogManager: { current: () => catalog, stop: () => {} },
-    logStore: { isEnabled: () => false },
+    logStore: { isEnabled: () => false, captureActive: () => false },
   };
   return runtime as unknown as Runtime;
 }

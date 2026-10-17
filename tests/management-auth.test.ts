@@ -60,7 +60,7 @@ function makeRuntime(config: ProxyConfig): Runtime {
     config,
     tokenProvider: async () => "unused-in-these-tests",
     catalogManager: { current: () => emptyCatalog, stop: () => {} },
-    logStore: { isEnabled: () => false },
+    logStore: { isEnabled: () => false, captureActive: () => false },
   };
   // Structural stub — only the members touched by the routes under test exist.
   return runtime as unknown as Runtime;

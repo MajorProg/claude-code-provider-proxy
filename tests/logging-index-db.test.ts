@@ -583,6 +583,40 @@ describe("retention marking", () => {
     expect(index.getTurn("s1", 2)?.bodyState).toBe("full");
   });
 
+  test("retention NEVER ages out the prompt library, however old it is", () => {
+    const index = db();
+    // A prompt version dated 2000 and a turn body dated 2000, under a 1-day
+    // retention window: the BODY must age out, the prompt must not. System
+    // prompts and tool schemas are permanent records — `retentionDays` applies
+    // to turn bodies only.
+    index.upsertPromptVersions([
+      promptRecord({
+        createdAt: "2000-01-01T00:00:00.000Z",
+        lastSeen: "2000-01-01T00:00:00.000Z",
+        systemJson: '"immortal system"',
+        toolsJson: '[{"name":"Read"}]',
+      }),
+    ]);
+    index.insertTurnRows([
+      row("s1", 1, {
+        requestedAt: "2000-01-01T00:00:00.000Z",
+        bodyFile: "sessions/s1/ancient.json.zst",
+        bodyBytes: 10,
+        bodyState: "full",
+        promptVersion: "H1",
+      }),
+    ]);
+
+    const result = index.pruneBodiesOlderThan(1, new Date("2026-10-15T00:00:00.000Z"));
+    expect(result.pruned).toBe(1);
+    expect(index.getTurn("s1", 1)?.bodyState).toBe("pruned");
+
+    // Metadata AND content survive, byte for byte.
+    expect(index.listPromptVersions().map((v) => v.hash)).toEqual(["H1"]);
+    expect(index.getPromptVersion("H1")?.systemJson).toBe('"immortal system"');
+    expect(index.getPromptVersion("H1")?.toolsJson).toBe('[{"name":"Read"}]');
+  });
+
   test("pruneBodiesOlderThan(0) is a no-op (retention off keeps bodies forever)", () => {
     const index = db();
     index.insertTurnRows([

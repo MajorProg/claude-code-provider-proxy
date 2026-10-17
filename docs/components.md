@@ -298,25 +298,26 @@ for best-effort diagnostics. Never logs secrets — callers pass identifiers onl
 (requestId, provider, model, status, latencyMs).
 
 ### `logging/log-store.ts`
-`LogStore` persists, when enabled, deduplicated system prompts (by sha256 hash)
-and per-turn session files. Types: `TurnRecord`, `TurnUsage`, `SystemPromptMeta`.
-Every method is a no-op when logging is disabled; writes are best-effort. Writes
-go through `writeAtomic` (write to a unique temp file then `rename` over the
-target, so a crash mid-write can never leave a truncated/half-written file for
-readers).
+`LogStore` is the request-path seam for the turn log. Capture is MODULAR,
+gated by `logging.enabled` plus two independent switches in `logging.capture`:
+`systemPrompts` records the deduped instruction surface (system prompt + tool
+schemas + injected envelopes) in the prompt library, and `chatTurns` records
+per-turn index rows and body files. Prompt capture is ON by default; chat-turn
+capture is OFF by default because a turn body carries the whole conversation,
+so a session of N turns stores O(N^2) bytes.
+`recordTurn`/`recordPromptSurface` are enqueue-only: a writer thread owns every
+blocking step (body compression, atomic file write, batched `index.db` commit),
+so storage never sits on the inference path. Bodies are zstd-compressed at
+write when `logging.compression.enabled` (the default) and stored as plain
+`.json` when it is off; readers branch on the stored extension, so both forms
+coexist and flipping the switch never strands previously written bodies. All
+reads are served from the SQLite index; every method is a no-op when logging is
+disabled, and writes are best-effort. Retention (`logging.retentionDays`)
+prunes TURN BODIES only: the prompt library (`prompt_versions`,
+`prompt_version_content`, `prompt_parts`) is never deleted or aged out.
 `stop()` (idempotent) marks the store stopped so `isEnabled()` returns false and
 `record*` calls become no-ops — called on hot-reload before the replacement
 runtime swaps in, mirroring `CatalogManager.stop()`; in-flight writes settle.
-A per-session `_summary.json` index (mirrored on every `recordTurn`) serves the
-listing endpoints (`listSessions`/`listTurns`) from lightweight metadata instead
-of turn-file bodies, which total many GB on a long-lived deployment and OOM the
-process when read per request; a bounded-concurrency rebuild backfills sessions
-recorded before the index existed and heals count drift. Turn files are
-gzip-compressed in the background (`.json` -> `.json.gz`, config-gated via
-`logging.compression`, age-bounded and budgeted per sweep so a pre-existing
-multi-GB backlog is compressed incrementally); all readers (listings, `getTurn`,
-ZIP export) decompress transparently, and a basename found in both forms
-resolves to the plain file (the newer write) with the stale `.gz` dropped.
 
 ### `logging/capture.ts`
 `captureTurn` builds a `TurnRecord` from a proxy `Response`. For streaming, it

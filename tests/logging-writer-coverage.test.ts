@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { IndexDb } from "../src/logging/index-db.ts";
 import type { TurnRecord, WriterConfig, WriterJob } from "../src/logging/log-types.ts";
+import { computePromptSurface } from "../src/logging/prompt-surface.ts";
 import {
   InlineWriter,
   WorkerWriter,
@@ -66,6 +67,7 @@ function config(over: Partial<WriterConfig> = {}): WriterConfig {
     // Large enough that a batch only commits when we flush explicitly.
     indexFlushMs: 60_000,
     zstdLevel: 3,
+    compress: true,
     ...over,
   };
 }
@@ -192,6 +194,29 @@ describe("writer-worker: the WriterRequest handler", () => {
     send({ type: "close", id: 11 });
   });
 
+  test("a prompt message writes a prompt version with no turn row", () => {
+    send({ type: "init", config: config() });
+    sent = [];
+    const surface = computePromptSurface({ system: "sys", tools: [], messages: [] });
+    send({ type: "prompt", id: 12, surface });
+    expect(sent).toEqual([{ type: "written", id: 12 }]);
+    send({ type: "flush", id: 13 });
+    const db = reader();
+    expect(db.listPromptVersions().map((v) => v.hash)).toEqual([surface.hash]);
+    expect(db.listSessions()).toEqual([]);
+    db.close();
+    send({ type: "close", id: 14 });
+  });
+
+  test("a prompt before init is refused with an error response", () => {
+    send({ type: "init", config: config() });
+    send({ type: "close", id: 1 });
+    sent = [];
+    const surface = computePromptSurface({ system: "sys", tools: [], messages: [] });
+    send({ type: "prompt", id: 2, surface });
+    expect(sent).toEqual([{ type: "error", id: 2, message: "prompt received before init" }]);
+  });
+
   test("a job before init is refused with an error response", () => {
     // A fresh module state would be needed to truly start null; instead assert
     // the code path via its observable contract: after `close` the core is null.
@@ -287,6 +312,21 @@ describe("WorkerWriter: real worker thread", () => {
 
     // Retention over the whole store: the body file is deleted, the row kept.
     expect(await w.pruneBodies()).toBeGreaterThanOrEqual(0);
+    await w.close();
+  });
+
+  test("a prompt-only job crosses the thread boundary with no turn row", async () => {
+    const w = new WorkerWriter(config());
+    const surface = computePromptSurface({ system: "sys", tools: [], messages: [] });
+    w.writePrompt(surface);
+    await w.flush();
+
+    expect(w.stats().writtenCount).toBe(1);
+    expect(w.stats().queueDepth).toBe(0);
+    const db = reader();
+    expect(db.listPromptVersions().map((v) => v.hash)).toEqual([surface.hash]);
+    expect(db.listSessions()).toEqual([]);
+    db.close();
     await w.close();
   });
 

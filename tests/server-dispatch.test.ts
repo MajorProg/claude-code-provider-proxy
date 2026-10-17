@@ -72,7 +72,7 @@ function makeRuntime(config: ProxyConfig): Runtime {
     config,
     tokenProvider: async () => "test-bearer",
     catalogManager: { current: () => catalog, stop: () => {} },
-    logStore: { isEnabled: () => false },
+    logStore: { isEnabled: () => false, captureActive: () => false },
   };
   return runtime as unknown as Runtime;
 }
@@ -413,7 +413,13 @@ describe("log routes: traversal, malformed escapes, single-row reads, yields", (
           },
         },
       },
-      logging: { enabled: true, dir: root, systemDir: "system", sessionDir: "sessions" },
+      logging: {
+        enabled: true,
+        dir: root,
+        systemDir: "system",
+        sessionDir: "sessions",
+        capture: { systemPrompts: true, chatTurns: true },
+      },
       chatPage: { enabled: true },
     });
   }

@@ -1,16 +1,16 @@
 /**
- * Turn bodies are zstd-compressed AT WRITE; readers decompress transparently.
+ * `logging.compression.enabled` drives turn-body compression AT WRITE.
  *
- * The old design wrote plain `.json` and swept it to `.json.gz` on a timer; the
- * new design compresses the body once, at write, in the writer's thread. The
- * legacy `logging.compression` block is still ACCEPTED but IGNORED (`config.local
- * .jsonc` on disk still carries it, so rejecting it would break boot) — it no
- * longer delays or drives compression.
+ * Enabled (the default) stores each body as a zstd frame (`.json.zst`);
+ * disabled stores plain, readable JSON (`.json`). Readers branch on the stored
+ * extension, so flipping the switch does not strand previously written bodies.
+ * There is no background sweep in either mode.
  *
  * These tests pin the on-disk contract:
- *   - a recorded body is a zstd frame (`.json.zst`), not plaintext JSON;
- *   - `getTurnBody` decompresses it back to the original turn record;
- *   - `compression.enabled = true` does NOT defer compression (no sweep).
+ *   - a compressed body is a zstd frame (`.json.zst`), not plaintext JSON;
+ *   - an uncompressed body is plain `.json` and stays byte-readable;
+ *   - `getTurnBody` reads BOTH forms back to the original turn record;
+ *   - both forms coexist within one session directory across a config flip.
  *
  * Hermetic: temp directories only, never the repo `./logs`.
  */
@@ -40,7 +40,8 @@ function logConfig(over: Partial<LoggingConfig> = {}): LoggingConfig {
     systemDir: "system",
     sessionDir: "sessions",
     captureTimeoutMs: 120_000,
-    compression: { enabled: false, minAgeMinutes: 10 },
+    compression: { enabled: true, minAgeMinutes: 10 },
+    capture: { systemPrompts: true, chatTurns: true },
     retentionDays: 30,
     maxTurnBytes: 8 * 1024 * 1024,
     inFlightBudgetBytes: 256 * 1024 * 1024,
@@ -54,7 +55,12 @@ function store(over: Partial<LoggingConfig> = {}): LogStore {
   return new LogStore(logConfig(over), { writerMode: "inline" });
 }
 
-function turn(sessionId: string, inTok = 10, outTok = 5): TurnRecord {
+function turn(
+  sessionId: string,
+  inTok = 10,
+  outTok = 5,
+  at = "2026-09-12T10:00:00.000Z",
+): TurnRecord {
   return {
     sessionId,
     canonicalModel: "bedrock.converse.global.model-x",
@@ -67,12 +73,12 @@ function turn(sessionId: string, inTok = 10, outTok = 5): TurnRecord {
     responseContent: [{ type: "text", text: "hi" }],
     stopReason: "end_turn",
     usage: { inputTokens: inTok, outputTokens: outTok },
-    requestedAt: "2026-09-12T10:00:00.000Z",
-    respondedAt: "2026-09-12T10:00:01.000Z",
+    requestedAt: at,
+    respondedAt: at,
   };
 }
 
-describe("bodies are zstd-compressed at write", () => {
+describe("compression.enabled = true (default)", () => {
   test("a recorded turn is a .json.zst zstd frame, not plaintext JSON", async () => {
     const s = store();
     await s.recordTurn(turn("a"));
@@ -100,21 +106,67 @@ describe("bodies are zstd-compressed at write", () => {
     expect(await s.getTurnBody("a", 1)).toEqual(recorded);
     await s.close();
   });
+});
 
-  test("compression.enabled = true does NOT defer compression (no sweep)", async () => {
-    // The legacy block (still on disk in config.local.jsonc) is accepted and
-    // ignored: the body is compressed immediately, with no delayed sweep step.
-    const s = store({ compression: { enabled: true, minAgeMinutes: 10 } });
-    await s.recordTurn(turn("a"));
+describe("compression.enabled = false", () => {
+  test("a recorded turn is a plain .json body that starts with the JSON object", async () => {
+    const s = store({ compression: { enabled: false, minAgeMinutes: 10 } });
+    const recorded = turn("a");
+    await s.recordTurn(recorded);
     await s.flush();
 
     const rel = (await s.listTurns("a"))[0]?.bodyFile ?? "";
-    expect(rel.endsWith(".json.zst")).toBe(true);
+    expect(rel.endsWith(".json")).toBe(true);
+    expect(rel.endsWith(".zst")).toBe(false);
     const bytes = readFileSync(join(root, rel));
-    expect([...bytes.subarray(0, 4)]).toEqual(ZSTD_MAGIC);
-    // No plaintext body is left behind for a later sweep to pick up.
-    const onDisk = readdirSync(join(root, "sessions", "a"));
-    expect(onDisk.every((f) => f.endsWith(".json.zst"))).toBe(true);
+    expect(bytes.subarray(0, 1).toString("utf-8")).toBe("{");
+    expect(JSON.parse(bytes.toString("utf-8"))).toEqual(
+      recorded as unknown as Record<string, unknown>,
+    );
     await s.close();
+  });
+
+  test("getTurnBody reads an uncompressed body back to the original record", async () => {
+    const s = store({ compression: { enabled: false, minAgeMinutes: 10 } });
+    const recorded = turn("a", 3, 4);
+    await s.recordTurn(recorded);
+    await s.flush();
+
+    expect(await s.getTurnBody("a", 1)).toEqual(recorded);
+    await s.close();
+  });
+
+  test("exportSessionTurns includes an uncompressed body", async () => {
+    const s = store({ compression: { enabled: false, minAgeMinutes: 10 } });
+    await s.recordTurn(turn("a"));
+    await s.flush();
+
+    const entries = await s.exportSessionTurns("all");
+    expect(entries).toHaveLength(1);
+    expect(JSON.parse(entries[0]?.content ?? "")).toMatchObject({ sessionId: "a" });
+    await s.close();
+  });
+});
+
+describe("a config flip leaves both body forms readable", () => {
+  test("compressed and uncompressed bodies in one session directory both load", async () => {
+    const compressed = store();
+    await compressed.recordTurn(turn("a", 1, 1, "2026-09-12T10:00:00.000Z"));
+    await compressed.flush();
+    await compressed.close();
+
+    const plain = store({ compression: { enabled: false, minAgeMinutes: 10 } });
+    await plain.recordTurn(turn("a", 2, 2, "2026-09-12T10:00:02.000Z"));
+    await plain.flush();
+
+    const rels = (await plain.listTurns("a")).map((t) => t.bodyFile ?? "");
+    expect(rels.some((r) => r.endsWith(".json.zst"))).toBe(true);
+    expect(rels.some((r) => r.endsWith(".json"))).toBe(true);
+    const onDisk = readdirSync(join(root, "sessions", "a"));
+    expect(onDisk).toHaveLength(2);
+
+    expect(await plain.getTurnBody("a", 1)).toMatchObject({ sessionId: "a" });
+    expect(await plain.getTurnBody("a", 2)).toMatchObject({ sessionId: "a" });
+    await plain.close();
   });
 });

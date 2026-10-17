@@ -86,20 +86,20 @@ const ALLOWLIST: readonly AllowEntry[] = [
   },
   {
     file: "src/server.ts",
-    lines: "173,597,643,722,1655-1751,1758-1761,1763",
+    lines: "173,598,644,723,1656-1761,1766-1772",
     funcs: 3,
     reason:
-      "Lines 173 and 597 are bun lcov TERMINATOR ARTIFACTS, not code: 173 is the bare `);` " +
-      "closing the Response.json(...) ternary whose line 172 executed 78x, and 597 is the " +
-      "`}` closing the ZipLimitError catch whose throw on line 596 executed 43x — a line " +
+      "Lines 173 and 598 are bun lcov TERMINATOR ARTIFACTS, not code: 173 is the bare `);` " +
+      "closing the Response.json(...) ternary whose line 172 executed 78x, and 598 is the " +
+      "`}` closing the ZipLimitError catch whose throw on line 597 executed 43x — a line " +
       "carrying only a terminator cannot be reached independently, so no test can cover it. " +
-      "Line 643 is unreachable BY CONSTRUCTION: the enclosing branch needs mode.enabled with " +
+      "Line 644 is unreachable BY CONSTRUCTION: the enclosing branch needs mode.enabled with " +
       "the dev sentinel, which requires AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY present " +
       "(bedrock-mode.ts:71), and config validation guarantees primaryRegion matches a " +
       "regions entry (config.ts:843) — so all three terms of the throw condition are always " +
-      'false. Line 722 is a defense-in-depth guard in the count_tokens exec ("Filtered ' +
+      'false. Line 723 is a defense-in-depth guard in the count_tokens exec ("Filtered ' +
       'above; kept for the type checker"): the model list is filtered to countTokensPath- ' +
-      "capable targets before dispatch, so the throw is unreachable. Lines 1655-1763 are " +
+      "capable targets before dispatch, so the throw is unreachable. Lines 1656-1772 are " +
       "main() and the import.meta.main boot guard — the server's process entrypoint; main " +
       "is not exported and binds a port, so it is reachable only as a child process " +
       "(exercised behaviourally in server-coverage.test.ts), which carries no in-process " +
@@ -116,10 +116,10 @@ const ALLOWLIST: readonly AllowEntry[] = [
   },
   {
     file: "src/logging/writer-worker.ts",
-    lines: "96",
+    lines: "107",
     reason:
       'The closing brace of the `case "close"` block in the worker\'s message switch. Its ' +
-      "body (lines 94-95) DOES execute (94 hit 43x, 95 hit 6x in a normal run) yet bun's lcov " +
+      "body (lines 105-106) DOES execute yet bun's lcov " +
       "reports the trailing brace 0 — a bun line-attribution artifact, not uncovered code.",
   },
   {

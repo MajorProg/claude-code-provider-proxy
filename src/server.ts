@@ -469,8 +469,9 @@ async function dispatchMessages(
   // definitions WITH their schemas, and injected instruction envelopes lifted out
   // of the conversation — so the prompt library distinguishes a tool-schema or
   // `<system-reminder>` change from a system-prompt one. Computed only while
-  // capture is active (it scans the whole conversation on the request path).
-  const promptSurface = store.isEnabled()
+  // any capture module is active (it scans the whole conversation on the
+  // request path).
+  const promptSurface = store.captureActive()
     ? computePromptSurface({
         system: parsed.system,
         tools: parsed.tools,
@@ -564,7 +565,7 @@ async function dispatchChat(
       messages: Array.isArray(raw.messages) ? raw.messages : [],
       // The chat page offers no tools, so the tool part of the surface is
       // genuinely empty; injected instruction envelopes are still extracted.
-      ...(store.isEnabled()
+      ...(store.captureActive()
         ? {
             promptSurface: computePromptSurface({
               system: body.system,
@@ -1684,7 +1685,15 @@ async function main(): Promise<void> {
     `Discovery complete: ${runtime.catalogManager.current().models.length} models loaded.`,
   );
   if (runtime.logStore.isEnabled()) {
-    console.log(`Logging enabled: writing to ${runtime.config.logging.dir} (viewer at /logs).`);
+    const capture = runtime.config.logging.capture;
+    const modules = [
+      capture.systemPrompts ? "system prompts" : null,
+      capture.chatTurns ? "chat turns" : null,
+    ].filter((m): m is string => m !== null);
+    console.log(
+      `Logging enabled: writing to ${runtime.config.logging.dir} (viewer at /logs; ` +
+        `capture: ${modules.length > 0 ? modules.join(" + ") : "nothing (all modules off)"}).`,
+    );
   }
 
   const serializeReload = createSerializer();

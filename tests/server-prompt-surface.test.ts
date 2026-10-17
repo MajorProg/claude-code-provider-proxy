@@ -72,7 +72,13 @@ function makeConfig(): ProxyConfig {
         },
       },
     },
-    logging: { enabled: true, dir: root, systemDir: "system", sessionDir: "sessions" },
+    logging: {
+      enabled: true,
+      dir: root,
+      systemDir: "system",
+      sessionDir: "sessions",
+      capture: { systemPrompts: true, chatTurns: true },
+    },
     chatPage: { enabled: true },
   });
 }

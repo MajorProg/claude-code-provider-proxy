@@ -754,7 +754,15 @@ export function captureTurn(
   response: Response,
   signal?: AbortSignal,
 ): Response {
-  if (!store.isEnabled() || !response.ok) return response;
+  if (!store.isEnabled()) return response;
+  // No turn to record — either chat-turn capture is off, or the request failed
+  // and there is no response body to store. Either way the instruction surface
+  // WAS used for this request, so it still belongs in the prompt library (which
+  // is never subject to body retention). Nothing per-turn reaches disk.
+  if (!response.ok || !store.capturesTurns()) {
+    if (ctx.promptSurface) store.recordPromptSurface(ctx.promptSurface);
+    return response;
+  }
   const contentType = response.headers.get("content-type") ?? "";
   const budget = budgetFor(store);
 

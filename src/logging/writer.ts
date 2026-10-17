@@ -64,7 +64,10 @@ const MAX_SEEN_SURFACES = 512;
 const PRUNE_TICK_MS = 6 * 60 * 60 * 1000;
 
 /** Extension of a zstd-compressed, self-contained turn payload. */
-const TURN_EXT = ".json.zst";
+const TURN_EXT_ZST = ".json.zst";
+
+/** Extension of an UNcompressed turn payload (`compression.enabled: false`). */
+const TURN_EXT_JSON = ".json";
 
 /** Directory used when a session id cannot be sanitized to a safe segment. */
 const UNKNOWN_SESSION = "unknown";
@@ -117,12 +120,22 @@ export interface TurnJobMeta {
 }
 
 /** One job as it crosses into a writer core (in-thread or across the worker). */
-export interface WireJob {
+export type WireJob = WireTurnJob | WirePromptJob;
+
+export interface WireTurnJob {
+  readonly kind: "turn";
   /** Correlation id assigned by the main thread (flow control + ack). */
   readonly id: number;
   readonly meta: TurnJobMeta;
   /** UTF-8 JSON of the self-contained turn file, or null when the body is shed. */
   readonly body: Uint8Array | null;
+}
+
+/** A prompt-library sighting: no turn row, no body, nothing to compress. */
+export interface WirePromptJob {
+  readonly kind: "prompt";
+  readonly id: number;
+  readonly surface: PromptSurface;
 }
 
 /** Main thread -> writer worker. */
@@ -134,6 +147,7 @@ export type WriterRequest =
       readonly meta: TurnJobMeta;
       readonly body: ArrayBuffer | null;
     }
+  | { readonly type: "prompt"; readonly id: number; readonly surface: PromptSurface }
   | { readonly type: "flush"; readonly id: number }
   | { readonly type: "prune"; readonly id: number }
   | { readonly type: "close"; readonly id: number };
@@ -161,7 +175,10 @@ export interface WriterStats {
   readonly shedCount: number;
   /** Index batches committed by the core. */
   readonly flushCount: number;
-  /** Index rows committed (body written, or shed when over the per-turn cap). */
+  /**
+   * Committed work units: turn rows (body written, or shed when over the
+   * per-turn cap) plus prompt-library sightings.
+   */
   readonly writtenCount: number;
   /** Body bytes currently in flight (queued, not yet processed). */
   readonly inFlightBytes: number;
@@ -174,6 +191,11 @@ export interface WriterStats {
  */
 export interface TurnWriter {
   write(job: WriterJob): void;
+  /**
+   * Record one prompt-library sighting with no turn. Used when system-prompt
+   * capture is on and chat-turn capture is off; enqueue-only like {@link write}.
+   */
+  writePrompt(surface: PromptSurface): void;
   flush(): Promise<void>;
   close(): Promise<void>;
   /** Prune bodies past `retentionDays`; resolves to the files deleted. */
@@ -209,9 +231,10 @@ function sessionDirOf(config: WriterConfig, sessionId: string): string {
 }
 
 /** Deterministic turn-file name: zero-padded seq + a filename-safe timestamp. */
-function bodyFileName(seq: number, requestedAt: string): string {
+function bodyFileName(seq: number, requestedAt: string, compressed: boolean): string {
   const seqStr = String(seq).padStart(5, "0");
-  return `${seqStr}-${requestedAt.replace(/[:.]/g, "-")}${TURN_EXT}`;
+  const ext = compressed ? TURN_EXT_ZST : TURN_EXT_JSON;
+  return `${seqStr}-${requestedAt.replace(/[:.]/g, "-")}${ext}`;
 }
 
 /** Write bytes atomically: temp file, then rename over the target. */
@@ -280,7 +303,12 @@ function buildMeta(job: WriterJob, bodyState: BodyState): TurnJobMeta {
 function buildWireJob(id: number, job: WriterJob, shed: boolean): WireJob {
   const dropBody = shed || job.bodyState === "shed";
   const bodyState: BodyState = dropBody ? "shed" : job.bodyState;
-  return { id, meta: buildMeta(job, bodyState), body: dropBody ? null : encodeTurn(job.turn) };
+  return {
+    kind: "turn",
+    id,
+    meta: buildMeta(job, bodyState),
+    body: dropBody ? null : encodeTurn(job.turn),
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -311,6 +339,8 @@ export class WriterCore {
   readonly #onCommit: WriterCoreOptions["onCommit"];
   #turns: TurnRow[] = [];
   #batchIds: number[] = [];
+  /** Prompt-only jobs staged for this batch (no turn row accompanies them). */
+  #promptJobs = 0;
   #prompts = new Map<string, PromptVersionWrite>();
   #seen = new Map<string, { createdAt: string; seenCount: number }>();
   #flushCount = 0;
@@ -340,6 +370,15 @@ export class WriterCore {
    */
   apply(job: WireJob): boolean {
     const now = new Date().toISOString();
+    if (job.kind === "prompt") {
+      // Modular capture: the prompt library is recorded even when chat-turn
+      // capture is off. There is no turn row and no body — just the version
+      // sighting, committed with whatever else this batch carries.
+      this.#recordPrompt(job.surface, now);
+      this.#batchIds.push(job.id);
+      this.#promptJobs += 1;
+      return false;
+    }
     const { meta } = job;
     let bodyFile: string | null = null;
     let bodyBytes: number | null = null;
@@ -411,24 +450,27 @@ export class WriterCore {
     const turns = this.#turns;
     const ids = this.#batchIds;
     const prompts = [...this.#prompts.values()];
+    const committed = turns.length + this.#promptJobs;
     this.#turns = [];
     this.#batchIds = [];
+    this.#promptJobs = 0;
     this.#prompts = new Map();
     try {
       this.#db.commitFlush(turns, prompts);
       this.#flushCount += 1;
       // The ids are reported only after the rows are durable (inserted, or
       // spooled for replay by IndexDb), so a caller may safely retire them.
-      this.#onCommit?.(this.#flushCount, turns.length, ids);
+      this.#onCommit?.(this.#flushCount, committed, ids);
     } catch (err) {
       logger.error("turn writer batch commit failed", { error: errorMessage(err) });
     }
   }
 
   /**
-   * Prune bodies older than `retentionDays`: mark them `pruned` in the index and
-   * delete the files. Prompt versions and index rows are kept forever. Returns
-   * the number of files deleted; a no-op when retention is disabled.
+   * Prune TURN BODIES older than `retentionDays`: mark them `pruned` in the
+   * index and delete the files. Prompt versions and index rows are kept
+   * FOREVER — the prompt library is never aged out, by design. Returns the
+   * number of files deleted; a no-op when retention is disabled.
    */
   prune(): number {
     const days = this.#config.retentionDays;
@@ -474,12 +516,15 @@ export class WriterCore {
     data: Uint8Array,
   ): { readonly file: string; readonly bytes: number } | null {
     try {
-      const compressed = zstd.zstdCompressSync(data, { level: this.#config.zstdLevel });
+      const compressed = this.#config.compress;
+      const stored = compressed
+        ? zstd.zstdCompressSync(data, { level: this.#config.zstdLevel })
+        : data;
       const dir = sessionDirOf(this.#config, meta.sessionId);
       mkdirSync(dir, { recursive: true });
-      const file = join(dir, bodyFileName(meta.seq, meta.requestedAt));
-      writeFileAtomic(file, compressed);
-      return { file: relative(resolve(this.#config.dir), file), bytes: compressed.byteLength };
+      const file = join(dir, bodyFileName(meta.seq, meta.requestedAt, compressed));
+      writeFileAtomic(file, stored);
+      return { file: relative(resolve(this.#config.dir), file), bytes: stored.byteLength };
     } catch (err) {
       logger.error("turn writer failed to write body file", {
         session: meta.sessionId,
@@ -591,11 +636,21 @@ export class InlineWriter implements TurnWriter {
       this.#inFlightBytes >= this.#config.inFlightBudgetBytes ||
       this.#depth >= DEFAULT_MAX_QUEUE_DEPTH;
     const wire = buildWireJob(this.#nextId++, job, shed);
-    const bytes = wire.body?.byteLength ?? 0;
+    const bytes = wire.kind === "turn" ? (wire.body?.byteLength ?? 0) : 0;
     if (shed) this.#shedCount += 1;
     else this.#inFlightBytes += bytes;
     this.#depth += 1;
     this.#chain = this.#chain.then(() => this.#consume(wire, bytes));
+  }
+
+  writePrompt(surface: PromptSurface): void {
+    if (this.#state !== "open") {
+      logger.warn("turn writer is not open; dropping prompt sighting");
+      return;
+    }
+    const wire: WireJob = { kind: "prompt", id: this.#nextId++, surface };
+    this.#depth += 1;
+    this.#chain = this.#chain.then(() => this.#consume(wire, 0));
   }
 
   async flush(): Promise<void> {
@@ -638,7 +693,8 @@ export class InlineWriter implements TurnWriter {
       this.#core.apply(wire);
     } catch (err) {
       logger.error("turn writer failed to apply job", {
-        seq: wire.meta.seq,
+        kind: wire.kind,
+        ...(wire.kind === "turn" ? { seq: wire.meta.seq } : {}),
         error: errorMessage(err),
       });
     } finally {
@@ -731,10 +787,26 @@ export class WorkerWriter implements TurnWriter {
       this.#inFlightBytes >= this.#config.inFlightBudgetBytes ||
       this.#uncommitted.size >= DEFAULT_MAX_QUEUE_DEPTH;
     const wire = buildWireJob(this.#nextId++, job, shed);
-    const bytes = wire.body?.byteLength ?? 0;
+    const bytes = wire.kind === "turn" ? (wire.body?.byteLength ?? 0) : 0;
     if (shed) this.#shedCount += 1;
     else this.#inFlightBytes += bytes;
     const env: Envelope = { wire, bytes, bodySent: false };
+    this.#queued.push(env);
+    this.#uncommitted.set(wire.id, env);
+    this.#pump();
+  }
+
+  writePrompt(surface: PromptSurface): void {
+    if (this.#fallback !== null) {
+      this.#fallback.writePrompt(surface);
+      return;
+    }
+    if (this.#state !== "open") {
+      logger.warn("turn writer is not open; dropping prompt sighting");
+      return;
+    }
+    const wire: WireJob = { kind: "prompt", id: this.#nextId++, surface };
+    const env: Envelope = { wire, bytes: 0, bodySent: false };
     this.#queued.push(env);
     this.#uncommitted.set(wire.id, env);
     this.#pump();
@@ -900,12 +972,21 @@ export class WorkerWriter implements TurnWriter {
     while (this.#queued.length > 0 && this.#inflight.size < DEFAULT_MAX_OUTSTANDING) {
       const env = this.#queued.shift();
       if (!env) break;
-      this.#inflight.set(env.wire.id, env);
-      const body = env.wire.body;
-      const buffer = body ? (body.buffer as ArrayBuffer) : null;
+      const wire = env.wire;
+      this.#inflight.set(wire.id, env);
+      if (wire.kind === "prompt") {
+        // No body, nothing transferable: the surface is structured-cloned.
+        worker.postMessage({
+          type: "prompt",
+          id: wire.id,
+          surface: wire.surface,
+        } satisfies WriterRequest);
+        continue;
+      }
+      const buffer = wire.body ? (wire.body.buffer as ArrayBuffer) : null;
       if (buffer) env.bodySent = true;
       worker.postMessage(
-        { type: "job", id: env.wire.id, meta: env.wire.meta, body: buffer } satisfies WriterRequest,
+        { type: "job", id: wire.id, meta: wire.meta, body: buffer } satisfies WriterRequest,
         buffer ? [buffer] : [],
       );
     }
@@ -1000,15 +1081,21 @@ export class WorkerWriter implements TurnWriter {
     });
     const rebuilt: Envelope[] = [];
     for (const env of survivors) {
-      const bodyLost = env.bodySent && env.wire.body !== null;
+      const wire = env.wire;
+      // A prompt sighting carries no body, so a crash can always re-send it
+      // intact. Only a transferred turn body is lost.
+      const bodyLost = wire.kind === "turn" && env.bodySent && wire.body !== null;
       if (bodyLost) this.#shedCount += 1;
-      rebuilt.push({
-        wire: bodyLost
-          ? { id: env.wire.id, meta: { ...env.wire.meta, bodyState: "shed" }, body: null }
-          : env.wire,
-        bytes: bodyLost ? 0 : env.bytes,
-        bodySent: false,
-      });
+      let next: WireJob = wire;
+      if (bodyLost && wire.kind === "turn") {
+        next = {
+          kind: "turn",
+          id: wire.id,
+          meta: { ...wire.meta, bodyState: "shed" },
+          body: null,
+        };
+      }
+      rebuilt.push({ wire: next, bytes: bodyLost ? 0 : env.bytes, bodySent: false });
     }
     this.#inflight.clear();
     this.#queued = rebuilt;

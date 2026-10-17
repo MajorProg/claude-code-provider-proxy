@@ -316,6 +316,10 @@ export interface SessionSummary {
  * One unit of deferred work handed to the writer. Built on the request path
  * (which does NO disk I/O, sqlite, or compression) and consumed by the writer,
  * which owns the compression, the turn file and the SQLite rows.
+ *
+ * A prompt-library sighting with no turn travels separately (see
+ * `TurnWriter.writePrompt`), because capture is modular: the library can be
+ * recorded while chat-turn capture is off, leaving no turn row and no body.
  */
 export interface WriterJob {
   readonly turn: TurnRecord;
@@ -351,4 +355,6 @@ export interface WriterConfig {
   readonly indexFlushMs: number;
   /** zstd compression level for turn bodies (3 measured best; never 19). */
   readonly zstdLevel: number;
+  /** Compress turn bodies at write (`logging.compression.enabled`). */
+  readonly compress: boolean;
 }

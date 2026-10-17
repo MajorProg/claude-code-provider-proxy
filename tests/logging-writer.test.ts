@@ -56,6 +56,7 @@ function config(over: Partial<WriterConfig> = {}): WriterConfig {
     // Large enough that the batch only commits when we flush explicitly.
     indexFlushMs: 60_000,
     zstdLevel: 3,
+    compress: true,
     ...over,
   };
 }
@@ -295,6 +296,33 @@ describe("InlineWriter: prompt versions", () => {
 
     db.close();
     await w.close();
+  });
+});
+
+describe("InlineWriter: prompt-only jobs (chat-turn capture off)", () => {
+  const surface = computePromptSurface({ system: "sys", tools: [], messages: [] });
+
+  test("writePrompt records the version and no turn row or session", async () => {
+    const w = new InlineWriter(config());
+    w.writePrompt(surface);
+    await w.flush();
+
+    const db = reader();
+    expect(db.listPromptVersions().map((v) => v.hash)).toEqual([surface.hash]);
+    expect(db.listSessions()).toEqual([]);
+    db.close();
+    await w.close();
+  });
+
+  test("writePrompt after close is dropped, like write", async () => {
+    const w = new InlineWriter(config());
+    await w.close();
+    w.writePrompt(surface);
+    await w.flush();
+
+    const db = reader();
+    expect(db.listPromptVersions()).toEqual([]);
+    db.close();
   });
 });
 

@@ -5,11 +5,16 @@
  * is deliberately thin: the WRITE side is enqueue-only and the READ side is
  * served entirely from the SQLite index.
  *
- * Write path (recordTurn / recordSystemPrompt): NO compression, NO file write,
- * NO SQLite on the caller's thread — those are the exact costs the old per-turn
- * `_summary.json` rewrite paid on every request. Each call builds a small job and
- * hands it to a {@link TurnWriter}, which owns zstd compression, the per-turn
- * body file and the batched `index.db` commit. A WorkerWriter runs that work on
+ * Capture is MODULAR (`logging.capture`): the prompt library (system prompts +
+ * tool schemas + injected envelopes) and per-turn chat capture are independent
+ * switches, both master-gated by `logging.enabled`.
+ *
+ * Write path (recordTurn / recordSystemPrompt / recordPromptSurface): NO
+ * compression, NO file write, NO SQLite on the caller's thread — those are the
+ * exact costs the old per-turn `_summary.json` rewrite paid on every request.
+ * Each call builds a small job and hands it to a {@link TurnWriter}, which owns
+ * zstd compression, the per-turn body file and the batched `index.db` commit. A
+ * WorkerWriter runs that work on
  * a dedicated thread (bun:sqlite is synchronous and would otherwise stall the
  * event loop); an InlineWriter runs it on the calling thread (tests / fallback).
  *
@@ -84,6 +89,30 @@ interface ZstdApi {
 
 const zstd = Bun as unknown as ZstdApi;
 
+/**
+ * Decode one stored body file. The stored EXTENSION is authoritative: a
+ * `.json.zst` body is a zstd frame, anything else is plain JSON (written when
+ * `logging.compression.enabled` was off). Both forms coexist, so flipping the
+ * switch never strands previously written bodies.
+ */
+function decodeBody(file: string, buf: Uint8Array): Uint8Array {
+  return file.endsWith(".zst") ? zstd.zstdDecompressSync(buf) : buf;
+}
+
+/**
+ * Remove every prompt-library link from a turn record. Used when the
+ * `systemPrompts` module is off: the writer derives a version hash from any
+ * surviving `promptSurface`, so merely not persisting the surface is not
+ * enough — the link itself must be gone or the turn would point at a version
+ * the library never stored.
+ */
+function withoutPromptLink(turn: TurnRecord): TurnRecord {
+  const { promptSurface, promptVersion, ...rest } = turn;
+  void promptSurface;
+  void promptVersion;
+  return { ...rest, systemHash: null };
+}
+
 /** Options for {@link LogStore}. */
 export interface LogStoreOptions {
   /**
@@ -102,6 +131,10 @@ export interface LogStoreOptions {
 export class LogStore {
   /** `logging.enabled`: a disabled store never opens the index or a writer. */
   private readonly enabled: boolean;
+  /** `logging.capture.systemPrompts`: record the deduped prompt library. */
+  private readonly captureSystem: boolean;
+  /** `logging.capture.chatTurns`: record per-turn rows and body files. */
+  private readonly captureTurns: boolean;
   /**
    * PC8 backstop (ms) on the streaming log-capture branch, from LoggingConfig.
    * The log branch is a follower (cancelled when the client branch ends); this
@@ -132,6 +165,8 @@ export class LogStore {
 
   constructor(config: LoggingConfig, opts: LogStoreOptions = {}) {
     this.enabled = config.enabled;
+    this.captureSystem = config.capture.systemPrompts;
+    this.captureTurns = config.capture.chatTurns;
     this.captureTimeoutMs = config.captureTimeoutMs;
     this.maxTurnBytes = config.maxTurnBytes;
     this.inFlightBudgetBytes = config.inFlightBudgetBytes;
@@ -144,6 +179,7 @@ export class LogStore {
       inFlightBudgetBytes: config.inFlightBudgetBytes,
       indexFlushMs: config.indexFlushMs,
       zstdLevel: config.zstdLevel,
+      compress: config.compression.enabled,
     };
 
     let reader: IndexDb | null = null;
@@ -174,9 +210,24 @@ export class LogStore {
     this.writer = writer;
   }
 
-  /** Whether recording is active (config-enabled AND not stopped/closed). */
+  /** Whether the store itself is active (config-enabled AND not stopped/closed). */
   isEnabled(): boolean {
     return this.enabled && !this.stopRequested && !this.closed;
+  }
+
+  /** Whether the deduped prompt library is being recorded. */
+  capturesPrompts(): boolean {
+    return this.captureSystem && this.isEnabled();
+  }
+
+  /** Whether per-turn records and body files are being recorded. */
+  capturesTurns(): boolean {
+    return this.captureTurns && this.isEnabled();
+  }
+
+  /** Whether ANY capture module is active (worth building a prompt surface). */
+  captureActive(): boolean {
+    return this.capturesPrompts() || this.capturesTurns();
   }
 
   /**
@@ -225,17 +276,24 @@ export class LogStore {
    */
   async recordTurn(turn: TurnRecord): Promise<void> {
     const writer = this.writer;
-    if (!writer || !this.isEnabled()) return;
+    if (!writer || !this.capturesTurns()) return;
     try {
-      const surface =
-        turn.promptSurface ??
-        (turn.systemHash !== null ? this.systemSurfaces.get(turn.systemHash) : undefined) ??
-        null;
-      const seq = this.bumpSeq(turn.sessionId);
+      // The prompt library is a SEPARATE module: when it is off, the turn is
+      // still recorded but carries no prompt-version link (and the writer is
+      // never handed a surface to persist). The link fields ride INSIDE the
+      // turn record, so they must be stripped — leaving `promptSurface` on the
+      // record would still mint a version hash the library never stored.
+      const base = this.captureSystem ? turn : withoutPromptLink(turn);
+      const surface = this.captureSystem
+        ? (base.promptSurface ??
+          (base.systemHash !== null ? this.systemSurfaces.get(base.systemHash) : undefined) ??
+          null)
+        : null;
+      const seq = this.bumpSeq(base.sessionId);
       const withVersion: TurnRecord =
-        surface !== null && turn.promptVersion === undefined
-          ? { ...turn, promptVersion: surface.hash }
-          : turn;
+        surface !== null && base.promptVersion === undefined
+          ? { ...base, promptVersion: surface.hash }
+          : base;
       const job: WriterJob = {
         turn: withVersion,
         seq,
@@ -260,10 +318,10 @@ export class LogStore {
    * to it, and returns the hash. This is the legacy fallback path for callers that
    * do not compute the full (system + tool-schema + injected) surface themselves.
    *
-   * Returns null when logging is disabled or there is no system content.
+   * Returns null when prompt capture is off or there is no system content.
    */
   async recordSystemPrompt(system: unknown): Promise<string | null> {
-    if (!this.isEnabled()) return null;
+    if (!this.capturesPrompts()) return null;
     if (system === undefined || system === null) return null;
     const serialized = JSON.stringify(system);
     if (serialized === '""' || serialized === "[]") return null;
@@ -273,6 +331,17 @@ export class LogStore {
     const surface = computePromptSurface({ system, tools: undefined, messages: undefined });
     this.rememberSystemSurface(surface);
     return surface.hash;
+  }
+
+  /**
+   * Record one FULL prompt-surface sighting with no turn. This is the write that
+   * keeps the prompt library alive when chat-turn capture is off: the surface is
+   * deduplicated by hash, so repeated requests under one instruction surface
+   * cost one stored copy and only advance its `seenCount`. Enqueue-only.
+   */
+  recordPromptSurface(surface: PromptSurface): void {
+    if (!this.capturesPrompts()) return;
+    this.writer?.writePrompt(surface);
   }
 
   /**
@@ -357,7 +426,7 @@ export class LogStore {
     if (abs === null) return null;
     try {
       const buf = await readFile(abs);
-      const raw = zstd.zstdDecompressSync(new Uint8Array(buf));
+      const raw = decodeBody(meta.bodyFile, new Uint8Array(buf));
       return JSON.parse(new TextDecoder().decode(raw)) as unknown;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
@@ -483,7 +552,7 @@ export class LogStore {
           if (abs === null) continue;
           try {
             const buf = await readFile(abs);
-            const raw = zstd.zstdDecompressSync(new Uint8Array(buf));
+            const raw = decodeBody(turn.bodyFile, new Uint8Array(buf));
             out.push({
               name: turn.bodyFile.replace(/\.zst$/, ""),
               content: new TextDecoder().decode(raw),

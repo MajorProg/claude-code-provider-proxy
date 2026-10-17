@@ -64,7 +64,10 @@ afterAll(() => {
   mintShouldFail = false;
 });
 
-const DISABLED_STORE = { isEnabled: () => false } as unknown as LogStore;
+const DISABLED_STORE = {
+  isEnabled: () => false,
+  captureActive: () => false,
+} as unknown as LogStore;
 
 /** A dev-mode Bedrock config (credential "dev"), external providers absent. */
 function devConfig(): ProxyConfig {

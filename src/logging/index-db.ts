@@ -320,6 +320,8 @@ const SQL_STATS_TOOLS = `SELECT j.value AS tool, COUNT(DISTINCT t.turn_id) AS co
   WHERE t.prompt_version = ? AND t.tool_calls IS NOT NULL AND json_valid(t.tool_calls)
   GROUP BY j.value ORDER BY count DESC, tool ASC`;
 
+// Retention targets TURN BODIES only — it selects from `turns` and touches no
+// prompt-library table. Keep it that way: prompt versions are permanent.
 const SQL_SELECT_PRUNABLE = `SELECT turn_id AS turnId, body_file AS bodyFile
   FROM turns
   WHERE body_file IS NOT NULL AND body_state IN ('full', 'truncated') AND requested_at < ?`;
@@ -874,9 +876,16 @@ export class IndexDb {
   /* ------------------------------ retention ----------------------------- */
 
   /**
-   * Mark bodies older than `days` as `pruned`, returning the file paths the
+   * Mark TURN BODIES older than `days` as `pruned`, returning the file paths the
    * caller must delete from disk. `days <= 0` keeps everything (retention off).
    * Already-shed/pruned rows are skipped; the index row survives regardless.
+   *
+   * INVARIANT — retention applies to turn bodies ONLY. The prompt library
+   * (`prompt_versions`, `prompt_version_content`, `prompt_parts`) is NEVER
+   * pruned, deleted or aged out by any code path: system prompts and tool
+   * schemas are strategic records, and `retentionDays` must never touch them.
+   * The only DELETE in this module targets `failover_events` (re-inserted per
+   * turn), and this sweep's SQL selects exclusively from `turns`.
    */
   pruneBodiesOlderThan(days: number, now: Date = new Date()): PruneResult {
     if (!(days > 0)) return { files: [], pruned: 0 };
