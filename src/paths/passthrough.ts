@@ -231,22 +231,24 @@ function hoistInlineToolBlocks(body: JsonObject): JsonObject {
  * the external Anthropic-compatible providers.
  *
  * A JSON-Schema `pattern` is compiled by the *provider*, not by us. `\0` (NUL)
- * is a legal ECMAScript escape but not a legal Rust-regex one, and DeepSeek
- * rejects the entire request when it meets one:
+ * is a legal ECMAScript escape but not a legal escape in the provider's engine,
+ * and DeepSeek rejects the entire request when it meets one:
  *
  *   400 Invalid schema for function 'mcp__control-mcp__agent_mint':
  *       "^\\/[^\\0]+$" is not a "regex"
  *
  * `\x00` means the same thing and is accepted (measured against
- * api.deepseek.com), so this rewrites the escape rather than dropping the
- * pattern — a value-level, semantics-preserving repair. Only `\0` not followed
- * by a digit is touched, so an octal-looking `\012` is left exactly as sent
- * rather than being silently reinterpreted.
+ * api.deepseek.com; `\012`-style octal escapes are rejected there too), so this
+ * rewrites the escape rather than dropping the pattern — a value-level,
+ * semantics-preserving repair. Only `\0` not followed by a digit is touched, so
+ * an octal-looking `\012` is left exactly as sent rather than being silently
+ * reinterpreted into a different character.
  *
- * Nothing else is rewritten: a pattern with a lookaround or a backreference is
- * a genuinely different expression upstream, and guessing a replacement would
- * change validation semantics. Those are the MCP server's bug to fix, and
- * `chimera-control-mcp`'s schema test now guards its own surface against them.
+ * Nothing else is rewritten. Other constructs are either accepted by that
+ * validator (a lookahead was measured to pass) or are genuinely different
+ * expressions upstream, where guessing a replacement would change validation
+ * semantics. Those are the MCP server's bug to fix, and `chimera-control-mcp`'s
+ * schema test guards its own surface against them.
  */
 function rewriteNulEscapes(value: unknown, onRewrite: () => void): unknown {
   if (Array.isArray(value)) {
