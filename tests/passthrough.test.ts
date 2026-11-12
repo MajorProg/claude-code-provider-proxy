@@ -405,3 +405,142 @@ describe("withModel inline-tool normalization (external Anthropic providers)", (
     expect((out.messages as Record<string, unknown>[])[0]?.content).toEqual([block]);
   });
 });
+
+/**
+ * A `pattern` is compiled by the provider, not by us. DeepSeek rejects a whole
+ * request when it meets an escape its engine cannot parse — measured with
+ * `agent.mint`'s `^\/[^\0]+$` (`400 … is not a "regex"`) — so Path P rewrites
+ * the semantics-preserving `\0` → `\x00` form for external targets.
+ */
+describe("withModel tool-pattern normalization (external Anthropic providers)", () => {
+  const agentMint = {
+    name: "agent_mint",
+    description: "mint identities",
+    input_schema: {
+      type: "object",
+      properties: {
+        out: { type: "string", pattern: "^\\/[^\\0]+$", description: "absolute directory" },
+      },
+      required: ["out"],
+    },
+  };
+
+  test("rewrites a bare \\0 escape in a tool pattern to \\x00", () => {
+    const body = { model: "orig", tools: [agentMint], messages: [{ role: "user", content: "hi" }] };
+    const out = withModel(body, "resolved", { externalAnthropic: true });
+
+    const tools = out.tools as Record<string, unknown>[];
+    const schema = tools[0]?.input_schema as Record<string, unknown>;
+    const props = schema.properties as Record<string, Record<string, unknown>>;
+    expect(props.out?.pattern).toBe("^\\/[^\\x00]+$");
+    // TC9: the caller's parsed body still carries the original pattern.
+    expect((agentMint.input_schema.properties.out as Record<string, unknown>).pattern).toBe(
+      "^\\/[^\\0]+$",
+    );
+  });
+
+  test("rewrites nested patterns (items, anyOf) and counts every occurrence", () => {
+    const body = {
+      model: "orig",
+      tools: [
+        {
+          name: "t",
+          input_schema: {
+            type: "object",
+            properties: {
+              list: {
+                type: "array",
+                items: { type: "string", pattern: "^[^\\0]*$" },
+              },
+              choice: {
+                anyOf: [
+                  { type: "string", pattern: "^a\\0$" },
+                  { type: "string", pattern: "^b\\0$" },
+                ],
+              },
+            },
+          },
+        },
+      ],
+    };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    const schema = (out.tools as Record<string, unknown>[])[0]?.input_schema as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const props = schema.properties as Record<string, Record<string, unknown>>;
+    expect((props.list?.items as Record<string, unknown>).pattern).toBe("^[^\\x00]*$");
+    const branches = (props.choice?.anyOf as Record<string, unknown>[]) ?? [];
+    expect(branches.map((b) => b.pattern)).toEqual(["^a\\x00$", "^b\\x00$"]);
+  });
+
+  test("leaves an already-portable \\x00 pattern untouched (same refs)", () => {
+    const tools = [
+      {
+        name: "t",
+        input_schema: { type: "object", properties: { p: { pattern: "^\\/[^\\x00]+$" } } },
+      },
+    ];
+    const out = withModel({ model: "orig", tools }, "x", { externalAnthropic: true });
+    expect(out.tools).toBe(tools);
+  });
+
+  test("does not reinterpret an octal-looking \\012 escape", () => {
+    const tools = [
+      { name: "t", input_schema: { type: "object", properties: { p: { pattern: "^a\\012$" } } } },
+    ];
+    const out = withModel({ model: "orig", tools }, "x", { externalAnthropic: true });
+    expect(out.tools).toBe(tools);
+  });
+
+  test("is inert without tools, for a non-array tools field, and for native targets", () => {
+    const messages = [{ role: "user", content: "hi" }];
+    const noTools = withModel({ model: "orig", messages }, "x", { externalAnthropic: true });
+    expect(noTools.tools).toBeUndefined();
+
+    const malformed = withModel({ model: "orig", tools: "nope", messages }, "x", {
+      externalAnthropic: true,
+    });
+    expect(malformed.tools).toBe("nope");
+
+    // Native Anthropic/Bedrock targets keep the original expression.
+    const nativeBody = { model: "orig", tools: [agentMint], messages };
+    const native = withModel(nativeBody, "x");
+    expect(native.tools).toBe(nativeBody.tools);
+    const nativeSchema = (native.tools as Record<string, unknown>[])[0]?.input_schema as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect((nativeSchema.properties as Record<string, Record<string, unknown>>).out?.pattern).toBe(
+      "^\\/[^\\0]+$",
+    );
+  });
+
+  test("preserves non-object tool entries and non-string pattern values", () => {
+    const tools = ["nope", 7, { name: "t", input_schema: { properties: { p: { pattern: 42 } } } }];
+    const out = withModel({ model: "orig", tools }, "x", { externalAnthropic: true });
+    expect(out.tools).toEqual(tools);
+  });
+
+  test("repairs a definition that arrived inline before it is hoisted", () => {
+    const body = {
+      model: "orig",
+      messages: [
+        {
+          role: "system",
+          content: [
+            { type: "tool_addition", tool: { type: "tool_definition", definition: agentMint } },
+          ],
+        },
+      ],
+    };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    const schema = (out.tools as Record<string, unknown>[])[0]?.input_schema as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect((schema.properties as Record<string, Record<string, unknown>>).out?.pattern).toBe(
+      "^\\/[^\\x00]+$",
+    );
+  });
+});

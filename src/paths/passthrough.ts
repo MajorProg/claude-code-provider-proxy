@@ -12,6 +12,7 @@
  */
 import { BadRequestError } from "../errors.ts";
 import { type HeaderReader, buildAnthropicHeaders, postJson } from "../http/upstream.ts";
+import { logger } from "../logging/logger.ts";
 import type { RouteTarget } from "../router.ts";
 import { keepAliveTee } from "../stream/keepalive-tee.ts";
 import {
@@ -226,6 +227,79 @@ function hoistInlineToolBlocks(body: JsonObject): JsonObject {
 }
 
 /**
+ * Deep-rewrite the one non-portable regex escape that fails whole requests on
+ * the external Anthropic-compatible providers.
+ *
+ * A JSON-Schema `pattern` is compiled by the *provider*, not by us. `\0` (NUL)
+ * is a legal ECMAScript escape but not a legal Rust-regex one, and DeepSeek
+ * rejects the entire request when it meets one:
+ *
+ *   400 Invalid schema for function 'mcp__control-mcp__agent_mint':
+ *       "^\\/[^\\0]+$" is not a "regex"
+ *
+ * `\x00` means the same thing and is accepted (measured against
+ * api.deepseek.com), so this rewrites the escape rather than dropping the
+ * pattern — a value-level, semantics-preserving repair. Only `\0` not followed
+ * by a digit is touched, so an octal-looking `\012` is left exactly as sent
+ * rather than being silently reinterpreted.
+ *
+ * Nothing else is rewritten: a pattern with a lookaround or a backreference is
+ * a genuinely different expression upstream, and guessing a replacement would
+ * change validation semantics. Those are the MCP server's bug to fix, and
+ * `chimera-control-mcp`'s schema test now guards its own surface against them.
+ */
+function rewriteNulEscapes(value: unknown, onRewrite: () => void): unknown {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((child) => {
+      const rewritten = rewriteNulEscapes(child, onRewrite);
+      if (rewritten !== child) changed = true;
+      return rewritten;
+    });
+    return changed ? next : value;
+  }
+
+  if (!isPlainObject(value)) return value;
+
+  let changed = false;
+  const next: JsonObject = {};
+  for (const [key, child] of Object.entries(value)) {
+    let out = child;
+    if (key === "pattern" && typeof child === "string") {
+      const replaced = child.replace(/\\0(?![0-9])/g, "\\x00");
+      if (replaced !== child) {
+        onRewrite();
+        out = replaced;
+      }
+    } else {
+      out = rewriteNulEscapes(child, onRewrite);
+    }
+    if (out !== child) changed = true;
+    next[key] = out;
+  }
+  return changed ? next : value;
+}
+
+/**
+ * Apply `rewriteNulEscapes` to every tool schema in the request, for external
+ * Anthropic-compatible targets only. Returns the original body when nothing
+ * was rewritten, so the caller's single-clone accounting (PC6) still holds.
+ */
+function normalizeExternalToolPatterns(body: JsonObject): JsonObject {
+  const tools = body.tools;
+  if (!Array.isArray(tools)) return body;
+
+  let rewrites = 0;
+  const next = rewriteNulEscapes(tools, () => {
+    rewrites += 1;
+  });
+  if (rewrites === 0) return body;
+
+  logger.debug("rewrote non-portable \\0 escapes in tool schema patterns", { rewrites });
+  return { ...body, tools: next };
+}
+
+/**
  * Rewrite the `model` field and strip request fields the passthrough targets
  * reject (see `stripUnsupportedFields`).
  *
@@ -242,7 +316,10 @@ export function withModel(
   options: { readonly externalAnthropic?: boolean } = {},
 ): Record<string, unknown> {
   let stripped = stripUnsupportedFields(body);
-  if (options.externalAnthropic) stripped = hoistInlineToolBlocks(stripped);
+  if (options.externalAnthropic) {
+    // Hoist first, so definitions that arrived inline are repaired too.
+    stripped = normalizeExternalToolPatterns(hoistInlineToolBlocks(stripped));
+  }
   if (stripped !== body) {
     // `stripped` is already a fresh, non-shared clone — safe to mutate in place.
     stripped.model = invocationId;
