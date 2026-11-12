@@ -42,6 +42,33 @@ import {
  */
 const UNSUPPORTED_TOP_LEVEL_FIELDS = ["context_management", "output_config"] as const;
 
+/** True for a plain (non-null, non-array) object. */
+function isPlainObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Remove `defer_loading` (top level and nested under `custom`) from one tool
+ * schema. Returns the same object when there is nothing to strip, so callers can
+ * use identity to decide whether the request changed.
+ */
+function stripToolLoadingHints(tool: JsonObject): JsonObject {
+  let t = tool;
+
+  if ("defer_loading" in t) {
+    const { defer_loading: _dropped, ...rest } = t;
+    t = rest;
+  }
+
+  const custom = t.custom;
+  if (isPlainObject(custom) && "defer_loading" in custom) {
+    const { defer_loading: _dropped, ...customRest } = custom;
+    t = { ...t, custom: customRest };
+  }
+
+  return t;
+}
+
 /**
  * Strip request fields the upstream native-Anthropic route rejects but that are
  * safe to omit.
@@ -73,33 +100,129 @@ function stripUnsupportedFields(body: Record<string, unknown>): Record<string, u
   if (Array.isArray(tools)) {
     let toolsChanged = false;
     const sanitized = tools.map((tool) => {
-      if (typeof tool !== "object" || tool === null || Array.isArray(tool)) return tool;
-      let t = tool as Record<string, unknown>;
-
-      if ("defer_loading" in t) {
-        const { defer_loading: _dropped, ...rest } = t;
-        t = rest;
-        toolsChanged = true;
-      }
-
-      const custom = t.custom;
-      if (
-        typeof custom === "object" &&
-        custom !== null &&
-        !Array.isArray(custom) &&
-        "defer_loading" in (custom as Record<string, unknown>)
-      ) {
-        const { defer_loading: _dropped, ...customRest } = custom as Record<string, unknown>;
-        t = { ...t, custom: customRest };
-        toolsChanged = true;
-      }
-
-      return t;
+      if (!isPlainObject(tool)) return tool;
+      const cleaned = stripToolLoadingHints(tool);
+      if (cleaned !== tool) toolsChanged = true;
+      return cleaned;
     });
     if (toolsChanged) next = { ...next, tools: sanitized };
   }
 
   return next;
+}
+
+/**
+ * Content-block types Claude Code's inline-tools / mid-conversation-tool-changes
+ * betas use to deliver tool updates mid-conversation.
+ */
+const INLINE_TOOL_BLOCK_TYPES = new Set(["tool_addition", "tool_removal"]);
+
+/**
+ * Normalize Claude Code's inline tool changes for third-party Anthropic-
+ * compatible providers (DeepSeek, z.ai).
+ *
+ * With the `inline-tools-2026-09-15` / `mid-conversation-tool-changes-2026-07-01`
+ * betas active, Claude Code inserts a synthetic `role: "system"` message whose
+ * content is an array of `tool_addition` / `tool_removal` blocks:
+ *
+ *   { type: "tool_addition", tool: { type: "tool_definition", definition: {...} } }
+ *   { type: "tool_removal",  tool: { type: "tool_reference", name: "..." } }
+ *
+ * Native Anthropic implements that shape; the external Anthropic-compatible
+ * providers implement only part of it (measured against api.deepseek.com):
+ *   - `tool_addition` + `tool_definition` → 422 `unknown variant
+ *     `tool_definition`, expected `tool_reference``;
+ *   - `tool_addition` + `tool_reference` → accepted, but only when the named
+ *     tool is already declared in `tools[]` (otherwise 400 "references unknown
+ *     tool");
+ *   - `tool_removal` → not a known content block at all (422).
+ *
+ * Rewrite to the subset they do support — the same shape Claude Code itself
+ * falls back to when the inline-tools beta is refused: hoist every inline
+ * definition into `tools[]`, point each addition at it by reference, and drop
+ * removals (there is no per-turn tool set upstream to prune; the tool simply
+ * stays declared for the rest of the request).
+ *
+ * Native Anthropic and Bedrock traffic must NOT be normalized here — they
+ * implement the original shape — so callers gate this on `externalAnthropic`.
+ */
+function hoistInlineToolBlocks(body: JsonObject): JsonObject {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return body;
+
+  const definitions = new Map<string, JsonObject>();
+  let changed = false;
+  const outbound: unknown[] = [];
+
+  for (const message of messages) {
+    if (!isPlainObject(message) || !Array.isArray(message.content)) {
+      outbound.push(message);
+      continue;
+    }
+
+    const kept: unknown[] = [];
+    let messageChanged = false;
+    for (const block of message.content) {
+      if (
+        !isPlainObject(block) ||
+        typeof block.type !== "string" ||
+        !INLINE_TOOL_BLOCK_TYPES.has(block.type)
+      ) {
+        kept.push(block);
+        continue;
+      }
+
+      changed = true;
+      messageChanged = true;
+      const tool = isPlainObject(block.tool) ? block.tool : undefined;
+      const definition = isPlainObject(tool?.definition) ? tool.definition : undefined;
+      const name =
+        typeof definition?.name === "string"
+          ? definition.name
+          : typeof tool?.name === "string"
+            ? tool.name
+            : undefined;
+
+      if (block.type === "tool_addition") {
+        // Definition-carrying blocks are hoisted into `tools[]`; reference-only
+        // additions just need the tool to be declared there.
+        if (definition && name !== undefined && !definitions.has(name)) {
+          definitions.set(name, definition);
+        }
+        // An unnamed addition cannot be resolved upstream — drop it.
+        if (name !== undefined) {
+          kept.push({ ...block, tool: { type: "tool_reference", name } });
+        }
+      }
+
+      // `tool_removal`: unsupported upstream (422); dropping it keeps the tool
+      // declared for this request only, which is the closest representable shape.
+    }
+
+    // A carrier message that held nothing but inline tool changes has no payload
+    // left, and an empty content array is itself invalid upstream.
+    if (kept.length === 0 && message.content.length > 0) continue;
+    outbound.push(messageChanged ? { ...message, content: kept } : message);
+  }
+
+  if (!changed) return body;
+
+  const existing = Array.isArray(body.tools) ? body.tools : [];
+  const declared = new Set(
+    existing.map((tool) =>
+      isPlainObject(tool) && typeof tool.name === "string" ? tool.name : undefined,
+    ),
+  );
+  const hoisted: unknown[] = [];
+  for (const [name, definition] of definitions) {
+    if (!declared.has(name)) hoisted.push(stripToolLoadingHints(definition));
+  }
+
+  const tools =
+    hoisted.length > 0 || Array.isArray(body.tools) ? [...existing, ...hoisted] : undefined;
+  return tools === undefined
+    ? { ...body, messages: outbound }
+    : { ...body, messages: outbound, tools };
 }
 
 /**
@@ -116,8 +239,10 @@ function stripUnsupportedFields(body: Record<string, unknown>): Record<string, u
 export function withModel(
   body: Record<string, unknown>,
   invocationId: string,
+  options: { readonly externalAnthropic?: boolean } = {},
 ): Record<string, unknown> {
-  const stripped = stripUnsupportedFields(body);
+  let stripped = stripUnsupportedFields(body);
+  if (options.externalAnthropic) stripped = hoistInlineToolBlocks(stripped);
   if (stripped !== body) {
     // `stripped` is already a fresh, non-shared clone — safe to mutate in place.
     stripped.model = invocationId;
@@ -146,7 +271,7 @@ export async function handlePassthroughMessages(
   signal?: AbortSignal,
 ): Promise<Response> {
   const streaming = parsed.stream === true;
-  const outboundBody = JSON.stringify(withModel(parsed, route.invocationId));
+  const outboundBody = JSON.stringify(withModel(parsed, route.invocationId, route));
   const headers = buildAnthropicHeaders(inbound, bearer, authStyle);
   const url = streaming ? route.streamPath : route.path;
 
@@ -198,7 +323,7 @@ export async function handlePassthroughCountTokens(
     throw new BadRequestError("count_tokens is not supported for this model");
   }
 
-  const outboundBody = JSON.stringify(withModel(parsed, route.invocationId));
+  const outboundBody = JSON.stringify(withModel(parsed, route.invocationId, route));
   const headers = buildAnthropicHeaders(inbound, bearer, authStyle);
   const upstream = await postJson(route.countTokensPath, headers, outboundBody, {
     ...(signal ? { signal } : {}),

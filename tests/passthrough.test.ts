@@ -192,4 +192,216 @@ describe("withModel (PC6 targeted rewrite + TC9 no caller mutation)", () => {
     expect("defer_loading" in custom).toBe(false);
     expect(custom.other).toBe(1);
   });
+
+  test("ignores non-object entries in tools[]", () => {
+    const body = { model: "orig", tools: ["nope", 42, null] };
+    const out = withModel(body, "x");
+    expect(out.tools).toEqual(["nope", 42, null]);
+  });
+});
+
+/**
+ * Claude Code's inline-tools beta delivers mid-conversation tool changes in a
+ * synthetic `role: "system"` message. Third-party Anthropic-compatible providers
+ * (DeepSeek, z.ai) accept only part of that shape, so Path P rewrites it when
+ * the target is external — see `hoistInlineToolBlocks` in passthrough.ts.
+ */
+describe("withModel inline-tool normalization (external Anthropic providers)", () => {
+  const definition = {
+    name: "late_tool",
+    description: "added mid-conversation",
+    input_schema: { type: "object", properties: {} },
+    defer_loading: true,
+  };
+
+  const carrier = (content: unknown[]) => ({ role: "system", content });
+
+  test("hoists tool_definition into tools[] and rewrites the addition by reference", () => {
+    const body = {
+      model: "orig",
+      messages: [
+        { role: "user", content: "hi" },
+        carrier([{ type: "tool_addition", tool: { type: "tool_definition", definition } }]),
+      ],
+    };
+    const out = withModel(body, "resolved", { externalAnthropic: true });
+
+    const tools = out.tools as Record<string, unknown>[];
+    expect(tools).toHaveLength(1);
+    expect(tools[0]?.name).toBe("late_tool");
+    expect(tools[0] && "defer_loading" in tools[0]).toBe(false);
+
+    const messages = out.messages as Record<string, unknown>[];
+    expect(messages).toHaveLength(2);
+    expect(messages[1]?.content).toEqual([
+      { type: "tool_addition", tool: { type: "tool_reference", name: "late_tool" } },
+    ]);
+
+    // TC9: the caller's parsed body is untouched.
+    const sent = body.messages[1]?.content[0] as Record<string, unknown>;
+    expect((sent.tool as Record<string, unknown>).type).toBe("tool_definition");
+    expect(body).not.toHaveProperty("tools");
+  });
+
+  test("preserves cache_control on the rewritten addition", () => {
+    const block = {
+      type: "tool_addition",
+      tool: { type: "tool_definition", definition },
+      cache_control: { type: "ephemeral" },
+    };
+    const out = withModel({ model: "orig", messages: [carrier([block])] }, "x", {
+      externalAnthropic: true,
+    });
+    expect((out.messages as Record<string, unknown>[])[0]?.content).toEqual([
+      {
+        type: "tool_addition",
+        tool: { type: "tool_reference", name: "late_tool" },
+        cache_control: { type: "ephemeral" },
+      },
+    ]);
+  });
+
+  test("drops tool_removal and the carrier message left empty", () => {
+    const body = {
+      model: "orig",
+      messages: [
+        { role: "user", content: "hi" },
+        carrier([{ type: "tool_removal", tool: { type: "tool_reference", name: "gone" } }]),
+      ],
+    };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    expect((out.messages as unknown[]).length).toBe(1);
+    // Nothing was hoisted and there was no tools[] — the field stays absent.
+    expect(out.tools).toBeUndefined();
+  });
+
+  test("keeps sibling text blocks when a carrier also holds text", () => {
+    const body = {
+      model: "orig",
+      messages: [
+        carrier([
+          { type: "text", text: "tool update" },
+          { type: "tool_removal", tool: { type: "tool_reference", name: "gone" } },
+        ]),
+      ],
+    };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    expect((out.messages as Record<string, unknown>[])[0]?.content).toEqual([
+      { type: "text", text: "tool update" },
+    ]);
+  });
+
+  test("keeps an existing tools[] and does not redeclare a hoisted name", () => {
+    const body = {
+      model: "orig",
+      tools: [{ name: "late_tool", description: "already declared" }],
+      messages: [
+        carrier([{ type: "tool_addition", tool: { type: "tool_definition", definition } }]),
+      ],
+    };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    const tools = out.tools as Record<string, unknown>[];
+    expect(tools).toHaveLength(1);
+    expect(tools[0]?.description).toBe("already declared");
+    expect((out.messages as Record<string, unknown>[])[0]?.content).toEqual([
+      { type: "tool_addition", tool: { type: "tool_reference", name: "late_tool" } },
+    ]);
+  });
+
+  test("keeps an existing tools[] unchanged when every addition is already declared", () => {
+    const body = {
+      model: "orig",
+      tools: [{ name: "late_tool" }],
+      messages: [
+        carrier([{ type: "tool_addition", tool: { type: "tool_reference", name: "late_tool" } }]),
+      ],
+    };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    expect(out.tools).toEqual([{ name: "late_tool" }]);
+    expect((out.messages as Record<string, unknown>[])[0]?.content).toEqual([
+      { type: "tool_addition", tool: { type: "tool_reference", name: "late_tool" } },
+    ]);
+  });
+
+  test("drops unnamed additions and definitions without a usable name", () => {
+    const body = {
+      model: "orig",
+      messages: [
+        carrier([
+          { type: "tool_addition" },
+          {
+            type: "tool_addition",
+            tool: { type: "tool_definition", definition: { description: "x" } },
+          },
+          { type: "tool_addition", tool: { type: "tool_definition" } },
+        ]),
+      ],
+    };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    expect(out.messages).toEqual([]);
+    expect(out.tools).toBeUndefined();
+  });
+
+  test("hoists each name once (first definition wins)", () => {
+    const body = {
+      model: "orig",
+      messages: [
+        carrier([
+          { type: "tool_addition", tool: { type: "tool_definition", definition } },
+          {
+            type: "tool_addition",
+            tool: {
+              type: "tool_definition",
+              definition: { ...definition, description: "second", input_schema: {} },
+            },
+          },
+        ]),
+      ],
+    };
+    const tools = withModel(body, "x", { externalAnthropic: true }).tools as Record<
+      string,
+      unknown
+    >[];
+    expect(tools).toHaveLength(1);
+    expect(tools[0]?.description).toBe("added mid-conversation");
+  });
+
+  test("leaves the request untouched for native Anthropic / Bedrock targets", () => {
+    const body = {
+      model: "orig",
+      messages: [
+        carrier([
+          { type: "tool_addition", tool: { type: "tool_definition", definition } },
+          { type: "tool_removal", tool: { type: "tool_reference", name: "gone" } },
+        ]),
+      ],
+    };
+    const out = withModel(body, "resolved");
+    expect(out.messages).toBe(body.messages);
+    expect(out).not.toHaveProperty("tools");
+  });
+
+  test("leaves string content and non-object messages alone", () => {
+    const messages = ["nope", null, 7, { role: "user", content: "plain" }];
+    const out = withModel({ model: "orig", messages }, "x", { externalAnthropic: true });
+    expect(out.messages).toBe(messages);
+  });
+
+  test("no inline blocks means no rewrite at all", () => {
+    const messages = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
+    const out = withModel({ model: "orig", messages }, "x", { externalAnthropic: true });
+    expect(out.messages).toBe(messages);
+  });
+
+  test("ignores a non-array messages field", () => {
+    const out = withModel({ model: "orig", messages: "nope" }, "x", { externalAnthropic: true });
+    expect(out.messages).toBe("nope");
+  });
+
+  test("ignores unknown block types inside a carrier", () => {
+    const block = { type: "mystery" };
+    const body = { model: "orig", messages: [carrier([block])] };
+    const out = withModel(body, "x", { externalAnthropic: true });
+    expect((out.messages as Record<string, unknown>[])[0]?.content).toEqual([block]);
+  });
 });

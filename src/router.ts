@@ -48,6 +48,14 @@ export interface RouteTarget {
   /** OpenAI strict function-calling opt-in (TC3); only set for external openai providers. */
   readonly strictTools?: boolean;
   /**
+   * True for a *third-party* Anthropic-compatible provider (an external
+   * `type: "anthropic"` entry such as DeepSeek or z.ai), false/absent for the
+   * native Anthropic and Bedrock passthrough targets. Path P uses this to
+   * normalize Claude Code extensions those providers implement only partially
+   * (see `passthrough.ts` §inline tools) without touching native traffic.
+   */
+  readonly externalAnthropic?: boolean;
+  /**
    * z.ai OpenAI-wire controls; only set for external openai providers whose
    * endpoint is api.z.ai (see ExternalProviderConfig.zaiWire). Drives the
    * mantle translator's z.ai-specific request fields.
@@ -178,6 +186,7 @@ function routeExternal(config: ProxyConfig, id: CanonicalId): RouteTarget {
       countTokensPath: provider.countTokens ? `${origin}/v1/messages/count_tokens` : undefined,
       invocationId: id.nativeModelId,
       isAnthropic: true,
+      externalAnthropic: true,
       credentials: usable,
     });
   }
